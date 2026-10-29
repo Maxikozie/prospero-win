@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
+#define _POSIX_C_SOURCE 200809L    /* clock_gettime */
 #include "pw_pad_ps5.h"
 #include <limits.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 
 enum { PW_PAD_INTERCEPTED=0x80000000u };
 _Static_assert(sizeof(PwPadPs5Data)==120,"ScePad data ABI");
@@ -196,6 +198,86 @@ int pw_pad_ps5_close(PwPadPs5 *pad)
         if(pad->terminate_rc<0)status=PW_ERR_STATE;
     }
     return status;
+}
+
+void pw_pad_players_init(PwPadPlayers *players)
+{
+    if(!players)return;
+    memset(players,0,sizeof(*players));
+    for(int i=0;i<PW_PAD_PLAYERS;i++){players->slot[i].user_id=-1;players->slot[i].pad_handle=-1;}
+    for(int i=0;i<PW_PAD_PS5_USERS;i++)players->failed[i]=-1;
+}
+
+static int signed_in(const int32_t ids[PW_PAD_PS5_USERS],int32_t user)
+{
+    for(int i=0;i<PW_PAD_PS5_USERS;i++)if(ids[i]==user)return 1;
+    return 0;
+}
+
+/* Another user's pad: the user service and scePadInit are the title pad's. */
+static int open_player(PwPadPs5 *pad,const PwPadPs5 *title_pad,int32_t user)
+{
+    memset(pad,0,sizeof(*pad));pad->ops=title_pad->ops;pad->user_id=user;pad->pad_handle=-1;
+    pad->close_rc=INT_MIN;pad->terminate_rc=INT_MIN;pad->trigger_rc=INT_MIN;
+    if(pw_pad_init(&pad->core,title_pad->core.map,title_pad->core.map_count)!=PW_OK)goto failed;
+    pad->pad_handle=pad->ops.pad_open(user,0,0,NULL);
+    if(pad->pad_handle<0)goto failed;
+    pad->opened=1;centre_analog(pad);
+    if(pad->ops.pad_set_vibration_mode)
+        pad->ops.pad_set_vibration_mode(pad->pad_handle,PW_PAD_PS5_VIBRATION_COMPATIBLE);
+    return 1;
+failed:
+    pad->user_id=-1;pad->pad_handle=-1;return 0;
+}
+
+int pw_pad_players_scan(PwPadPlayers *players,const PwPadPs5 *title_pad)
+{
+    int open=0;
+    if(!players || !title_pad)return 0;
+    int32_t ids[PW_PAD_PS5_USERS];int listed=0;
+    for(int i=0;i<PW_PAD_PS5_USERS;i++)ids[i]=-1;
+    players->login_ns=0;
+    /* The sign-in list is asked on the thread that presents frames: its
+     * time is kept for the title to log when it is slow. */
+    if(title_pad->opened && title_pad->ops.login_users) {
+        struct timespec t0,t1;
+        clock_gettime(CLOCK_MONOTONIC,&t0);
+        listed=title_pad->ops.login_users(ids)>=0;
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+        players->login_ns=(uint64_t)((t1.tv_sec-t0.tv_sec)*1000000000LL+(t1.tv_nsec-t0.tv_nsec));
+    }
+    if(listed) {
+        for(int i=0;i<PW_PAD_PLAYERS;i++) {
+            PwPadPs5 *pad=&players->slot[i];
+            if(pad->opened && !signed_in(ids,pad->user_id)) {
+                (void)pw_pad_ps5_close(pad);pad->user_id=-1;
+            }
+        }
+        /* One who signed out may be tried again when they sign back in. */
+        for(int f=0;f<PW_PAD_PS5_USERS;f++)
+            if(players->failed[f]>=0 && !signed_in(ids,players->failed[f]))players->failed[f]=-1;
+        for(int u=0;u<PW_PAD_PS5_USERS;u++) {
+            int32_t user=ids[u];int known=user<0 || user==title_pad->user_id;
+            for(int i=0;!known && i<PW_PAD_PLAYERS;i++)
+                known=players->slot[i].opened && players->slot[i].user_id==user;
+            for(int f=0;!known && f<PW_PAD_PS5_USERS;f++)known=players->failed[f]==user;
+            for(int i=0;!known && i<PW_PAD_PLAYERS;i++)
+                if(!players->slot[i].opened) {
+                    int failed=!open_player(&players->slot[i],title_pad,user);known=1;
+                    for(int f=0;failed && f<PW_PAD_PS5_USERS;f++)
+                        if(players->failed[f]<0){players->failed[f]=user;failed=0;}
+                }
+        }
+    }
+    for(int i=0;i<PW_PAD_PLAYERS;i++)open+=players->slot[i].opened!=0;
+    return open;
+}
+
+void pw_pad_players_close(PwPadPlayers *players)
+{
+    if(!players)return;
+    for(int i=0;i<PW_PAD_PLAYERS;i++)
+        if(players->slot[i].opened){(void)pw_pad_ps5_close(&players->slot[i]);players->slot[i].user_id=-1;}
 }
 
 int pw_pad_ps5_vibrate(PwPadPs5 *pad,uint8_t large,uint8_t small)

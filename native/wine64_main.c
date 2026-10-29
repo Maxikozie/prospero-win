@@ -1043,6 +1043,17 @@ int main(int argc, char **argv)
     int (*post_input)(const PwWineInput *) = NULL;
     void (*set_pad)(const PwWinePad *) = NULL;
     int (*rumble)(uint32_t *, uint32_t *) = NULL;
+    /* xinput mode without a player2 preset: the other signed-in users'
+     * DualSenses are XInput controllers 1..3 (patch 0471), once the game
+     * has asked xinput for one of them. players_fed[i] is set while slot
+     * i feeds controller i+1. */
+    static PwPadPlayers players;
+    static uint8_t players_fed[PW_PAD_PLAYERS];
+    void (*set_pad_at)(uint32_t, const PwWinePad *) = NULL;
+    int (*rumble_at)(uint32_t, uint32_t *, uint32_t *) = NULL;
+    uint32_t (*pads_wanted)(void) = NULL;
+    uint64_t players_from = 0;   /* the tick a game first asked for controllers 1..3 */
+    int players_open = 0;
     /* [display] menu: L3+R3 opens the menu, DXVK's HUD draws it (patch 0973). */
     void (*set_menu)(const struct pw_title_menu *) = NULL;
     static PwGameMenu game_menu;
@@ -1290,6 +1301,18 @@ int main(int argc, char **argv)
                 (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_pad");
             rumble = (int (*)(uint32_t *, uint32_t *))
                 (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_rumble");
+            /* A player2 preset gives the second user keys instead (#427),
+             * so its pad never drives a controller as well. */
+            if (!player2) {
+                set_pad_at = (void (*)(uint32_t, const PwWinePad *))
+                    (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_pad_at");
+                rumble_at = (int (*)(uint32_t, uint32_t *, uint32_t *))
+                    (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_rumble_at");
+                pads_wanted = (uint32_t (*)(void))
+                    (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_pads_wanted");
+                /* Without the controllers the game asked for, no players. */
+                if (!pads_wanted) set_pad_at = NULL;
+            }
         }
         if (game && game->display.menu) {
             set_menu = (void (*)(const struct pw_title_menu *))
@@ -1301,6 +1324,7 @@ int main(int argc, char **argv)
         if (pad_status == PW_OK)
             pad_status = pw_pad_ps5_open(&pad, &pad_ops, pad_open_map,
                                          sizeof(pad_open_map) / sizeof(pad_open_map[0]));
+        pw_pad_players_init(&players);
         if (player2 && pad_status == PW_OK)
             pad2_status = pw_pad_ps5_open_other(&pad2, &pad, -1, pad_open_map,
                                                 sizeof(pad_open_map) / sizeof(pad_open_map[0]));
@@ -1470,6 +1494,7 @@ int main(int argc, char **argv)
          * closed them stay theirs until they are let go. Closing the game
          * below still reads the real pad. */
         const PwPadPs5 *seen = &pad;
+        int menu_open = 0;
         if (pad_read && (set_menu || osk_status == PW_OK)) {
             uint32_t held = pad.core.previous_buttons, pressed = pad.core.pressed_edges,
                      released = pad.core.released_edges;
@@ -1481,6 +1506,7 @@ int main(int argc, char **argv)
 
                 pw_game_menu_tick(&game_menu, held, pressed, released, &shown, &view);
                 set_menu(&shown);
+                menu_open = shown.open != 0;
                 held = view.held;
                 pressed = view.pressed;
                 released = view.released;
@@ -1518,6 +1544,53 @@ int main(int argc, char **argv)
             connected = pw_wine_script_pad(&state, connected, &script_pad, scripted);
 #endif
             if (pad_read || scripted) set_pad(connected ? &state : NULL);
+        }
+        /* XInput controllers 1..3: the other signed-in users' DualSenses,
+         * each with its own rumble, once the game has asked xinput for one
+         * of them; the sink is asked once a second until then. A user who
+         * signs in during the game is found within two seconds. Only an
+         * open slot is fed; one that closes reads as disconnected once.
+         * While the menu is open they read idle, as controller 0 does. */
+        if (set_pad_at && pad_status == PW_OK && !players_from && tick % PW_WINE64_TICKS_PER_S == 0) {
+            uint32_t wanted = pads_wanted();
+            if (wanted & 0xeu) {
+                PS5LOG_LOG("PW_WINE64 players wanted=%#x", (unsigned)wanted);
+                players_from = tick;
+            }
+        }
+        if (players_from) {
+            if (tick == players_from || tick % (2 * PW_WINE64_TICKS_PER_S) == 0) {
+                int open = pw_pad_players_scan(&players, &pad);
+                if (open != players_open || tick == players_from) PS5LOG_LOG("PW_WINE64 players=%d", open);
+                /* sceUserServiceGetLoginUserIdList ran on this, the frame thread. */
+                if (players.login_ns > 1000000u)
+                    PS5LOG_LOG("PW_WINE64 players login_users_us=%u", (unsigned)(players.login_ns / 1000u));
+                players_open = open;
+            }
+            for (uint32_t i = 0; i < PW_PAD_PLAYERS; i++) {
+                PwPadPs5 *player = &players.slot[i];
+                PwPadPs5 idle;
+                PwWinePad state;
+                uint32_t left, right;
+                if (!player->opened) {
+                    if (players_fed[i]) set_pad_at(i + 1, NULL);
+                    players_fed[i] = 0;
+                    continue;
+                }
+                const PwPadPs5 *read = pw_pad_ps5_read(player) == PW_OK ? player : NULL;
+                if (read && menu_open) {
+                    idle = *player;
+                    idle.core.previous_buttons = idle.core.pressed_edges = idle.core.released_edges = 0;
+                    idle.left_stick.x = idle.left_stick.y = 0x80;
+                    idle.right_stick.x = idle.right_stick.y = 0x80;
+                    idle.l2 = idle.r2 = 0;
+                    read = &idle;
+                }
+                set_pad_at(i + 1, pw_wine_game_pad(read, &state) ? &state : NULL);
+                players_fed[i] = 1;
+                if (rumble_at && rumble_at(i + 1, &left, &right) == 1)
+                    (void)pw_pad_ps5_vibrate(player, (uint8_t)(left >> 8), (uint8_t)(right >> 8));
+            }
         }
         if (pad_read) {
             size_t count = pw_wine_game_inputs(&game_input, seen->core.pressed_edges,
@@ -1654,12 +1727,15 @@ int main(int argc, char **argv)
             };
             close_requested = now;
             if (rumble && pad_status == PW_OK) (void)pw_pad_ps5_vibrate(&pad, 0, 0);
+            for (uint32_t i = 0; set_pad_at && i < PW_PAD_PLAYERS; i++)
+                if (players.slot[i].opened) (void)pw_pad_ps5_vibrate(&players.slot[i], 0, 0);
             for (size_t i = 0; post_input && i < sizeof(alt_f4) / sizeof(alt_f4[0]); i++)
                 (void)post_input(&alt_f4[i]);
             PS5LOG_LOG("PW_WINE64 close requested by=%s", combo_ticks ? "combo" : "deadline");
         }
         if (close_requested && now - close_requested >= (uint64_t)PW_WINE64_CLOSE_WAIT_S * 1000000000u) {
             PS5LOG_LOG("PW_WINE64 close timeout: leaving the game");
+            pw_pad_players_close(&players);
             restart_title(NULL, launch.cycle + 1u, "close-timeout");
             break;
         }

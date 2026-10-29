@@ -4,7 +4,7 @@
 #include "../src/pw_pad.h"
 #include <stdint.h>
 
-enum { PW_PAD_PS5_BATCH=64,PW_PAD_PS5_USERS=4 };
+enum { PW_PAD_PS5_BATCH=64,PW_PAD_PS5_USERS=4,PW_PAD_PLAYERS=PW_PAD_PS5_USERS-1 };
 /* The touchpad's click, and the x that splits it in halves: touches report
  * x from 0 to 1919 across the pad. */
 enum { PW_PAD_PS5_TOUCHPAD=0x100000,PW_PAD_PS5_TOUCH_MIDDLE=960 };
@@ -112,5 +112,24 @@ int pw_pad_ps5_close(PwPadPs5 *);
  * (kept in trigger_rc, INT_MIN until the first try) leaves the result
  * alone. */
 int pw_pad_ps5_vibrate(PwPadPs5 *,uint8_t large,uint8_t small);
+
+/* The other signed-in users' DualSenses, for a game's local multiplayer
+ * through XInput: slot i is controller i+1, the title's own pad being
+ * controller 0. A user keeps their slot while signed in; one who signs in
+ * takes the first free slot. Each pad is opened in the compatible
+ * vibration mode, and read and vibrated as the title's is. failed holds
+ * the users whose pad did not open, -1 for none; login_ns is how long the
+ * last scan's sign-in list call took (0 without one). */
+typedef struct PwPadPlayers {
+    PwPadPs5 slot[PW_PAD_PLAYERS];int32_t failed[PW_PAD_PS5_USERS];uint64_t login_ns;
+} PwPadPlayers;
+void pw_pad_players_init(PwPadPlayers *);
+/* Opens the pads of users who signed in and closes those of users who
+ * signed out, with the open title pad's ops; the user service and
+ * scePadInit stay the title pad's. Returns the number of open slots. A
+ * user whose pad failed to open is not tried again while they stay signed
+ * in. A failed sign-in list, or no login_users op, changes nothing. */
+int pw_pad_players_scan(PwPadPlayers *,const PwPadPs5 *title_pad);
+void pw_pad_players_close(PwPadPlayers *);
 
 #endif
