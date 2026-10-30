@@ -1,0 +1,93 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: win32u: orbis: make the PS5 driver's win32 surfaces headless surfaces
+
+On the PS4 the GPU driver, mesa-ps4's RADV, presents through
+VK_EXT_headless_surface: its WSI (wsi_orbis.c) opens the video output when
+a swapchain is created and scans the swapchain images out. It has no
+VK_KHR_display, so patch 0460's display-plane surface cannot be created
+there. Under __ORBIS__ (or WINE_PS5_HEADLESS_SURFACE, for a host test of
+the same path) the PS5 user driver maps VK_KHR_win32_surface to
+VK_EXT_headless_surface and creates a headless surface, after asking the
+title to hand over the video output (pw_wine_release_display), which must
+be closed before the swapchain opens it (milestone e1 measured a title
+close followed by RADV's open of port 255). Patch 0460's path is
+unchanged on the PS5.
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 9e44e099ca..0e9a8ebac3 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -802,8 +802,46 @@ static BOOL ps5_SetCursorPos( INT x, INT y )
+ 
+ #ifdef SONAME_LIBVULKAN
+ 
++/* On the PS4 (Orbis) the GPU driver, mesa-ps4's RADV, presents through
++ * VK_EXT_headless_surface: its WSI (wsi_orbis.c) opens the video output when
++ * the swapchain is created and scans the swapchain images out. There is no
++ * VK_KHR_display, so the win32 surface is a headless one. A host build
++ * defines WINE_PS5_HEADLESS_SURFACE to test the same path on a PC. */
++#if defined(__ORBIS__) && !defined(WINE_PS5_HEADLESS_SURFACE)
++#define WINE_PS5_HEADLESS_SURFACE
++#endif
++
+ static int (*release_display)(void);
+ 
++#ifdef WINE_PS5_HEADLESS_SURFACE
++
++static VkResult ps5_vulkan_surface_create( struct client_surface *client, const struct vulkan_instance *instance,
++                                           VkSurfaceKHR *handle )
++{
++    VkHeadlessSurfaceCreateInfoEXT info = {.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
++    VkResult res;
++
++    /* The video output has one owner: the title lets go of it before the
++     * driver's swapchain opens it (a second open fails). */
++    if (release_display && release_display())
++    {
++        ERR( "the title kept the video output\n" );
++        return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
++    }
++    res = instance->p_vkCreateHeadlessSurfaceEXT( instance->host.instance, &info, NULL, handle );
++    TRACE( "%s: headless surface 0x%s, res %d\n", debugstr_client_surface( client ),
++           wine_dbgstr_longlong( *handle ), res );
++    return res;
++}
++
++static void ps5_map_instance_extensions( struct vulkan_instance_extensions *extensions )
++{
++    if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_headless_surface = 1;
++    if (extensions->has_VK_EXT_headless_surface) extensions->has_VK_KHR_win32_surface = 1;
++}
++
++#else  /* WINE_PS5_HEADLESS_SURFACE */
++
+ static VkResult ps5_vulkan_surface_create( struct client_surface *client, const struct vulkan_instance *instance,
+                                            VkSurfaceKHR *handle )
+ {
+@@ -862,18 +900,20 @@ failed:
+     return res < VK_SUCCESS ? res : VK_ERROR_INITIALIZATION_FAILED;
+ }
+ 
+-static VkBool32 ps5_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device,
+-                                                              uint32_t index )
+-{
+-    return VK_TRUE;
+-}
+-
+ static void ps5_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_display = 1;
+     if (extensions->has_VK_KHR_display) extensions->has_VK_KHR_win32_surface = 1;
+ }
+ 
++#endif  /* WINE_PS5_HEADLESS_SURFACE */
++
++static VkBool32 ps5_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device,
++                                                              uint32_t index )
++{
++    return VK_TRUE;
++}
++
+ static void ps5_map_device_extensions( struct vulkan_device_extensions *extensions )
+ {
+ }

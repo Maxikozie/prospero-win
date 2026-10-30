@@ -4,7 +4,10 @@
 stub takes what only the exporter provides plus --also, refuses names the
 exporter lacks, data and thread-local symbols; the importer relinked against
 the stub imports exactly those, and the bind table lists one slot per such
-import with its exporter, and refuses a data import with --no-data."""
+import with its exporter, and refuses a data import with --no-data. With two
+exporters (winevulkan from ntdll and win32u) a name goes to the first that
+defines it, --also names only to the first, one stub each, NEEDED in that
+order, and the table names each slot's exporter."""
 import os
 import shutil
 import subprocess
@@ -31,6 +34,17 @@ extern int sdk_call(int);
 extern void *my_alloc(unsigned long);
 int shared_helper(int x) { return x * 3; }
 int entry(int x) { return wine_only(x) + sdk_call(x) + shared_helper(x) + (my_alloc(1) != 0); }
+"""
+SECOND = r"""
+int second_only(int x) { return x + 4; }
+int wine_only(int x) { return x + 5; }
+void *second_alloc(unsigned long n) { (void)n; return 0; }
+"""
+TWO_IMPORTER = r"""
+extern int wine_only(int);
+extern int second_only(int);
+extern void *my_alloc(unsigned long);
+int entry2(int x) { return wine_only(x) + second_only(x) + (my_alloc(1) != 0); }
 """
 DATA_IMPORTER = r"""
 extern int exported_data;
@@ -121,6 +135,48 @@ def main():
         check(slots == ["my_alloc", "wine_only"], f"one slot per sibling import: {slots}")
         check(all(line.split()[3] == "exporter" for line in lines if line.startswith("slot ")), "slots name the exporter")
 
+        # Two exporters in priority order.
+        second = build("second", SECOND, "-soname", "second.so")
+        first2 = build("first2", TWO_IMPORTER)
+        two_s = os.path.join(tmp, "two_{exporter}.s")
+        names2 = os.path.join(tmp, "names2.txt")
+        proc = run(sys.executable, STUB, "--first-link", first2, "--exporter", f"exporter={exporter}",
+                   "--exporter", f"second={second}", "--toolchain", toolchain, "--also", "my_alloc",
+                   "--out", two_s, "--list", names2, ok=False)
+        check(proc.returncode == 0, f"two-exporter stubs generated ({proc.stderr.strip()})")
+        stub_names = {}
+        for exp in ("exporter", "second"):
+            path = two_s.replace("{exporter}", exp)
+            stub_names[exp] = [l.split()[1] for l in open(path).read().splitlines() if l.startswith("\t.globl")] \
+                if os.path.exists(path) else None
+        check(stub_names == {"exporter": ["my_alloc", "wine_only"], "second": ["second_only"]},
+              f"a name in both goes to the first exporter: {stub_names}")
+        proc = run(sys.executable, STUB, "--first-link", first2, "--exporter", f"exporter={exporter}",
+                   "--exporter", f"second={second}", "--toolchain", toolchain, "--also", "second_alloc",
+                   "--out", two_s, ok=False)
+        check(proc.returncode == 1 and "second_alloc: not defined" in proc.stderr,
+              "--also names come from the first exporter only")
+        proc = run(sys.executable, STUB, "--first-link", first2, "--exporter", f"exporter={exporter}",
+                   "--exporter", f"second={second}", "--toolchain", toolchain, "--out", stub_s, ok=False)
+        check(proc.returncode == 1 and "{exporter}" in proc.stderr, "several exporters need {exporter} in --out")
+        so = {}
+        for exp in ("exporter", "second"):
+            obj = os.path.join(tmp, f"two_{exp}.o")
+            run(cc, "-c", two_s.replace("{exporter}", exp), "-o", obj)
+            so[exp] = os.path.join(tmp, f"two_{exp}.stub.so")
+            run(ld, "-shared", "-soname", f"{exp}.so", "-o", so[exp], obj)
+        importer2 = build("importer2", TWO_IMPORTER, so["exporter"], so["second"])
+        needed2 = [l.split("[", 1)[1].rstrip("]") for l in run("llvm-readelf", "-d", importer2).stdout.splitlines()
+                   if "(NEEDED)" in l]
+        check(needed2[:2] == ["exporter.so", "second.so"], f"NEEDED in priority order: {needed2}")
+        table2 = os.path.join(tmp, "importer2.bind.txt")
+        proc = run(sys.executable, TABLE, "--elf", importer2, "--exporter", f"exporter={so['exporter']}",
+                   "--exporter", f"second={so['second']}", "--out", table2, "--no-data", ok=False)
+        slots2 = sorted((l.split()[4], l.split()[3]) for l in open(table2).read().splitlines() if l.startswith("slot "))
+        check(proc.returncode == 0 and slots2 == [("my_alloc", "exporter"), ("second_only", "second"),
+                                                  ("wine_only", "exporter")],
+              f"each slot names its exporter: {slots2}")
+
         data_importer = build("dataimp", DATA_IMPORTER, exporter)
         proc = run(sys.executable, TABLE, "--elf", data_importer, "--exporter", f"exporter={exporter}",
                    "--out", os.path.join(tmp, "data.bind.txt"), "--no-data", ok=False)
@@ -130,7 +186,7 @@ def main():
     if failures:
         print(f"orbis prx imports: {len(failures)} failure(s)")
         return 1
-    print("orbis prx imports passed: stub selection and refusals, NEEDED, slot table, data refusal")
+    print("orbis prx imports passed: stub selection and refusals, NEEDED, slot table, data refusal, two exporters")
     return 0
 
 

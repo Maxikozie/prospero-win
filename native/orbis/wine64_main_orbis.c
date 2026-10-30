@@ -179,6 +179,7 @@ static void *forward_fd(void *arg)
             if (line && buffer[line - 1] == '\r') buffer[line - 1] = 0;
             LOG("%s %s", forward->tag, buffer);
             if (forward->tag[0] == 'S' && buffer[0]) {
+                pw_ms_stdout(buffer);
                 pthread_mutex_lock(&stdout_lock);
                 snprintf(last_stdout, sizeof(last_stdout), "%s", buffer);
                 pthread_mutex_unlock(&stdout_lock);
@@ -528,8 +529,13 @@ int main(int argc, char **argv)
                     pw_prx_lookup(start.descriptor, "pw_wine_set_present_sink");
             int (*post_input)(const void *) =
                 (int (*)(const void *))(uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_post_input");
-            LOG("PW_WINE64 present_sink=%d post_input=%d", set_present != NULL, post_input != NULL);
+            /* win32u's Vulkan driver asks for the display before its first surface (patch 0461). */
+            void (*set_release)(int (*)(void *), void *) =
+                (void (*)(int (*)(void *), void *))(uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_display_release");
+            LOG("PW_WINE64 present_sink=%d post_input=%d display_release=%d", set_present != NULL, post_input != NULL,
+                set_release != NULL);
             if (set_present) set_present(pw_ms_present, NULL);
+            if (set_release) set_release(pw_ms_release_display, NULL);
             pw_ms_set_input(post_input);
         }
         {
@@ -549,6 +555,7 @@ int main(int argc, char **argv)
         add_env("WINE_PS5_SERVER_DIRECT", "0");
         add_env("WINE_PS5_MUTEX_SHARED", "0");
         add_env("WINE_PS5_SYNC_SHARED", "0");
+        pw_ms_environment(add_env);
         load_env_file(PW_ROOT "/env.txt");
         config.extra_env = env_pairs;
         config.extra_env_count = env_count;
@@ -577,10 +584,11 @@ int main(int argc, char **argv)
             next_alive = now + 1000000000ull;
         }
         pw_diagnostics_tick(now);
+        pw_ms_service();
         if (!reported && now - hello_ns > (uint64_t)PW_WATCHDOG_S * 1000000000ull) {
             LOG("PW_WINE64 watchdog: no exit after %d s", PW_WATCHDOG_S);
             report("timeout", "watchdog");
         }
-        usleep(100000);
+        usleep(20000);
     }
 }

@@ -20,11 +20,17 @@ Linking against the exporter's whole dynamic table instead would also bind
 libc internals (measured: win32u then took musl's __musl_current_locale TLS
 variable and __tls_get_addr from ntdll).
 
-The build assembles the output and links it with ld.lld -shared -soname
+Several exporters (winevulkan imports from ntdll and win32u) are given in
+priority order as --exporter NAME=ELF, one each: a name goes to the first
+exporter that defines it, the --also names to the first exporter, and each
+exporter gets its own stub, --out with "{exporter}" replaced by its NAME. A
+single --exporter ELF (no NAME=) keeps the old form: --out names the stub.
+
+The build assembles each output and links it with ld.lld -shared -soname
 EXPORTER.so; create-fself only reads the stub's symbol names (NIDs are
 hashes of them) and its soname.
 
-Usage: orbis_import_stub.py --first-link IMPORTER.elf --exporter EXPORTER.elf
+Usage: orbis_import_stub.py --first-link IMPORTER.elf --exporter [NAME=]EXPORTER.elf...
        --toolchain OO_PS4_TOOLCHAIN [--also NAME,...] --out STUB.s [--list NAMES.txt]
 """
 import argparse
@@ -70,25 +76,27 @@ def sdk_exports(toolchain, only=None):
     return names
 
 
-def choose(first, exporter, sdk, also, needed_sdk):
-    """(names, errors). sdk: every stub library's exports; needed_sdk: those of
+def choose(first, exporters, sdk, also, needed_sdk):
+    """({exporter name: names}, errors). exporters: [(name, dyn table)] in
+    priority order; sdk: every stub library's exports; needed_sdk: those of
     the stub libraries the importer NEEDs, the ones create-fself searches."""
     errors = []
     wanted = {n for n, (_, defined) in first.items() if not defined and n not in sdk and n}
     wanted |= set(also)
-    names = []
+    chosen = {name: [] for name, _table in exporters}
     for name in sorted(wanted):
-        kind, defined = exporter.get(name, ("", False))
+        candidates = exporters[:1] if name in also else exporters
+        found = [(exp, table[name][0]) for exp, table in candidates if table.get(name, ("", False))[1]]
         if name in needed_sdk:
             errors.append(f"{name}: an SDK stub library the importer needs exports it too, "
                           "and create-fself would import it from there")
-        elif not defined:
-            errors.append(f"{name}: not defined by the exporter")
-        elif kind != "FUNC":
-            errors.append(f"{name}: a {kind} symbol, not a function")
+        elif not found:
+            errors.append(f"{name}: not defined by the exporter" + ("s" if len(candidates) > 1 else ""))
+        elif found[0][1] != "FUNC":
+            errors.append(f"{name}: a {found[0][1]} symbol, not a function")
         else:
-            names.append(name)
-    return names, errors
+            chosen[found[0][0]].append(name)
+    return chosen, errors
 
 
 def assembly(names):
@@ -103,23 +111,34 @@ def assembly(names):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--first-link", required=True, type=Path)
-    ap.add_argument("--exporter", required=True, type=Path)
+    ap.add_argument("--exporter", required=True, action="append",
+                    help="[NAME=]EXPORTER.elf, repeated in priority order")
     ap.add_argument("--toolchain", required=True, type=Path)
     ap.add_argument("--also", default="")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--list", type=Path)
     args = ap.parse_args()
     also = [n for n in args.also.split(",") if n]
-    names, errors = choose(dyn_table(args.first_link), dyn_table(args.exporter), sdk_exports(args.toolchain),
-                           also, sdk_exports(args.toolchain, set(needed(args.first_link))))
+    exporters = []
+    for spec in args.exporter:
+        name, _, elf = spec.rpartition("=")
+        exporters.append((name or Path(elf).name.split(".", 1)[0], Path(elf)))
+    if len(exporters) > 1 and "{exporter}" not in str(args.out):
+        print("orbis_import_stub: several exporters need {exporter} in --out", file=sys.stderr)
+        return 1
+    chosen, errors = choose(dyn_table(args.first_link), [(name, dyn_table(elf)) for name, elf in exporters],
+                            sdk_exports(args.toolchain), also,
+                            sdk_exports(args.toolchain, set(needed(args.first_link))))
     for error in errors:
         print(f"orbis_import_stub: {error}", file=sys.stderr)
     if errors:
         return 1
-    args.out.write_text(assembly(names))
+    for name, elf in exporters:
+        out = Path(str(args.out).replace("{exporter}", name))
+        out.write_text(assembly(chosen[name]))
+        print(f"{out.name}: {len(chosen[name])} import(s) from {elf.name}")
     if args.list:
-        args.list.write_text("\n".join(names) + "\n")
-    print(f"{args.out.name}: {len(names)} import(s) from {args.exporter.name}")
+        args.list.write_text("".join(f"{n}\n" for name, _elf in exporters for n in chosen[name]))
     return 0
 
 

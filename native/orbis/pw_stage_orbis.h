@@ -25,7 +25,7 @@
 #include <stddef.h>
 
 #define PW_STAGE_MAX 16
-#define PW_STAGE_FIELDS 384
+#define PW_STAGE_FIELDS 512
 #define PW_STAGE_FILE_MAX 16384
 
 typedef struct PwStageOps {

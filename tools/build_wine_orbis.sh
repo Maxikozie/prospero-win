@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u${PROSPERO_RADV_ARCHIVE:+ libvulkan}"
+modules="ntdll wineserver win32u${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -140,7 +140,8 @@ fi
 # Configure for a FreeBSD 12 host (the target triple's OS: Wine takes its
 # FreeBSD signal, thread and server code) without the desktop libraries;
 # FreeType is found by its flags (its soname is the name win32u dlopens);
-# Vulkan comes back with milestone e.
+# so is Vulkan (milestone e): win32u dlopens "libvulkan.so", which pw_wine_dl
+# loads as libvulkan.prx beside ntdll.prx, and winevulkan is built.
 configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
 --enable-archs=i386,x86_64 --disable-tests --without-x \
 --without-fontconfig --without-alsa --without-pulse \
@@ -148,7 +149,7 @@ configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
 --without-v4l2 --without-wayland --without-opengl --without-oss \
 --without-pcap --without-pcsclite --without-sane --without-krb5 --without-gphoto \
 --without-netapi --without-inotify --without-capi --without-cups --without-gssapi \
---without-ffmpeg --without-vulkan --without-gnutls --without-unwind \
+--without-ffmpeg --without-gnutls --without-unwind \
 ac_cv_func_thr_kill2=yes $(for h in capi cdrom errqueue filter fs hdreg hidraw input ioctl ipx irda major \
 memfd ntsync param rtnetlink serial types ucdrom userfaultfd videodev2 wireless; do \
 printf 'ac_cv_header_linux_%s_h=no ' "$h"; done) \
@@ -178,7 +179,7 @@ if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.orbis-stamp" 2>/dev/null)" !=
     # shellcheck disable=SC2086
     (cd "$build" && "$tree/configure" $configure_args CC="$cc" CFLAGS="$cflags" \
         FREETYPE_CFLAGS="-I$ft/src/include" FREETYPE_LIBS="$ft/libfreetype.a" \
-        ac_cv_lib_soname_freetype=libfreetype.so \
+        ac_cv_lib_soname_freetype=libfreetype.so ac_cv_lib_soname_vulkan=libvulkan.so \
         --with-wine-tools="$host_tools" > "$work/configure.log" 2>&1) ||
         fail "configure failed; see $work/configure.log"
     echo "$stamp" > "$build/.orbis-stamp"
@@ -187,6 +188,8 @@ python3 "$root/tools/orbis_libc_stubs.py" --config "$build/include/config.h" ||
     fail "configure took an ENOSYS stub of the SDK's libc for a real function; declare it absent in configure_args"
 grep -q '^#define SONAME_LIBFREETYPE "libfreetype.so"' "$build/include/config.h" ||
     fail "configure did not take FreeType (see $work/configure.log): win32u would draw no text"
+grep -q '^#define SONAME_LIBVULKAN "libvulkan.so"' "$build/include/config.h" ||
+    fail "configure did not take Vulkan (see $work/configure.log): win32u would have no Vulkan driver"
 
 # The shims, compiled once: the heap and direct memory (ntdll's ELF link
 # takes them), then the loader, compat, cwd, threads, sink and exit units.
@@ -226,7 +229,8 @@ dmem="$obj/pw_wine_dmem.o $obj/pw_wine_dmem_ps5.o"
 # line, which the PRX link reads back.
 : > "$work/make.log"
 status=0
-for step in "dlls/ntdll/ntdll.so|$heap $dmem" "dlls/win32u/win32u.so|" "server/wineserver|$heap"; do
+for step in "dlls/ntdll/ntdll.so|$heap $dmem" "dlls/win32u/win32u.so|" "server/wineserver|$heap" \
+        "dlls/winevulkan/winevulkan.so|"; do
     target=${step%%|*}; objects=${step#*|}
     case " $modules " in *" $(basename "${target%.so}") "*) ;; *) continue ;; esac
     (cd "$build" && rm -f "$target")
@@ -270,7 +274,8 @@ exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --w
 # --no-rosegment keeps lld from making a separate read-only segment of the
 # rodata as orbis-porting-kit does for executables.
 # A module that imports from a sibling PRX (win32u from ntdll) names the
-# exporter as its 4th argument. A first link shows what the module cannot
+# exporter as its 4th argument (several, comma-separated in priority order:
+# winevulkan's "ntdll,win32u"). A first link shows what the module cannot
 # get elsewhere (Wine's own symbols, the exporter's __wrap_* hooks);
 # tools/orbis_import_stub.py turns that, plus the dlfcn and malloc families
 # (the importer's heap and look-ups are the exporter's, as on the PS5), into
@@ -304,37 +309,48 @@ ld_prx() { # ld_prx NAME OUT ARGS...
         --no-as-needed)
 }
 link_prx() {
-    name=$1; objects=; exporter=${4:-}
+    name=$1; objects=; exporters=$(printf '%s' "${4:-}" | tr ',' ' ')
     [ "$2" = - ] || objects=$(link_objects "$2")
     log=$prx/$name.link.log
     [ -n "$objects$3" ] || { echo "no ELF link of $2 in make.log" > "$log"; prx_status=1; return; }
     : > "$log"
-    if [ -n "$exporter" ]; then
+    bind_args=
+    if [ -n "$exporters" ]; then
+        # One stub per exporter (winevulkan: ntdll, then win32u), in the
+        # order given: NEEDED follows it, and a name goes to the first
+        # exporter that defines it.
+        stub_args=
+        for exporter in $exporters; do stub_args="$stub_args --exporter $exporter=$prx/$exporter.shared.elf"; done
         # shellcheck disable=SC2086
         ld_prx "$name" "$prx/obj/$name.first.elf" $objects $3 >> "$log" 2>&1 || { prx_status=1; return; }
+        # shellcheck disable=SC2086
         python3 "$root/tools/orbis_import_stub.py" --first-link "$prx/obj/$name.first.elf" \
-            --exporter "$prx/$exporter.shared.elf" --toolchain "$OO_PS4_TOOLCHAIN" --also "$import_also" \
-            --out "$prx/obj/${name}_${exporter}_stub.s" --list "$prx/$name.imports.txt" >> "$log" 2>&1 ||
+            $stub_args --toolchain "$OO_PS4_TOOLCHAIN" --also "$import_also" \
+            --out "$prx/obj/${name}_{exporter}_stub.s" --list "$prx/$name.imports.txt" >> "$log" 2>&1 ||
             { prx_status=1; return; }
-        "$cc" -c "$prx/obj/${name}_${exporter}_stub.s" -o "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 &&
-            ld.lld -m elf_x86_64 -shared -soname "$exporter.so" -o "$prx/obj/$exporter.stub.so" \
-                "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 || { prx_status=1; return; }
-        objects="$objects $prx/obj/$exporter.stub.so"
+        for exporter in $exporters; do
+            "$cc" -c "$prx/obj/${name}_${exporter}_stub.s" -o "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 &&
+                ld.lld -m elf_x86_64 -shared -soname "$exporter.so" -o "$prx/obj/$name.$exporter.stub.so" \
+                    "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 || { prx_status=1; return; }
+            objects="$objects $prx/obj/$name.$exporter.stub.so"
+            bind_args="$bind_args --exporter $exporter=$prx/obj/$name.$exporter.stub.so"
+        done
     fi
     # shellcheck disable=SC2086
     ld_prx "$name" "$prx/$name.shared.elf" $objects $3 >> "$log" 2>&1 || { prx_status=1; return; }
     llvm-readelf --dyn-syms "$prx/$name.shared.elf" | grep -q 'GLOBAL DEFAULT .* module_start$' ||
         { echo "module_start is not a default-visibility export" >> "$log"; prx_status=1; return; }
-    if [ -n "$exporter" ]; then
+    if [ -n "$exporters" ]; then
+        # shellcheck disable=SC2086
         python3 "$root/tools/orbis_bind_table.py" --elf "$prx/$name.shared.elf" \
-            --exporter "$exporter=$prx/obj/$exporter.stub.so" --out "$prx/sce_module/$name.bind.txt" \
+            $bind_args --out "$prx/sce_module/$name.bind.txt" \
             --no-data >> "$log" 2>&1 || { prx_status=1; return; }
-        cp "$prx/obj/$exporter.stub.so" "$prx/stubs/$exporter.so"
+        for exporter in $exporters; do cp "$prx/obj/$name.$exporter.stub.so" "$prx/stubs/$exporter.so"; done
     fi
     (cd "$prx" && "$fself" -in="$name.shared.elf" -out="$name.oelf" --lib="sce_module/$name.prx" \
         -libname="$name" -library-path="$prx/stubs" --paid 0x3800000000000011) >> "$log" 2>&1 ||
         { prx_status=1; return; }
-    [ -z "$exporter" ] || rm -f "$prx/stubs/$exporter.so"
+    for exporter in $exporters; do rm -f "$prx/stubs/$exporter.so"; done
     chmod 755 "$prx/sce_module/$name.prx"
 }
 desc() {
@@ -409,6 +425,19 @@ case " $modules " in *" win32u "*)
     ;;
 esac
 
+case " $modules " in *" winevulkan "*)
+    # winevulkan's Unix side (milestone e): Wine's Vulkan thunks, which take
+    # the driver from win32u (__wine_get_vulkan_driver, its one import from
+    # there) and everything else from ntdll; loaded by ntdll as the PE
+    # winevulkan.dll's unix library.
+    [ -f "$prx/ntdll.shared.elf" ] && [ -f "$prx/win32u.shared.elf" ] ||
+        fail "winevulkan imports from ntdll and win32u: build both in the same run"
+    desc winevulkan __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    # shellcheck disable=SC2086
+    link_prx winevulkan dlls/winevulkan/winevulkan.so "$prx/obj/winevulkan_desc.o $exit_wraps $import_wraps" \
+        ntdll,win32u
+    ;;
+esac
 case " $modules " in *" libvulkan "*)
     # RADV (milestone e), which win32u's dlopen("libvulkan.so") loads through
     # pw_wine_dl beside ntdll.prx: module_start runs its constructors (ACO's

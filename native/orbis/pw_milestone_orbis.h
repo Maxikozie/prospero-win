@@ -12,8 +12,12 @@
  *       -> PS4WINE d4 winemine frames=N board_opened=0|1 refused=N fb=ok ...
  *   d   d4's click, then the DualShock 4 drives the pointer until OPTIONS
  *       -> PS4WINE d winemine frames=N inputs=N refused=N board_opened=0|1 fb=ok ...
+ *   e1  RADV's libvulkan.prx driven by the title, the display handed over,
+ *       hello.exe -> PS4WINE e1 vk ...
+ *   e2  winevulkan's slots, the display, vk64.exe (Wine's Vulkan, then a
+ *       Win32 swapchain) -> PS4WINE e2 vk64 ... and PS4WINE e3 vkclear ...
  *
- * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default d).
+ * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
  * on with the next stage; each has a time limit a watchdog thread enforces
  * (on overrun: an H record, the lines with what is known, idle). The Wine
@@ -60,6 +64,16 @@ void pw_ms_emit_lines(void);
 int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t height, uint32_t stride);
 /* ntdll's pw_wine_post_input, for the scripted input of d4. */
 void pw_ms_set_input(int (*post)(const void *event));
+/* ntdll's display release (pw_wine_set_display_release): closes the
+ * title's VideoOut, on the main thread (pw_ms_service); 0 once closed. */
+int pw_ms_release_display(void *context);
+/* The title's main loop: performs a release asked for from another thread. */
+void pw_ms_service(void);
+/* Each line the Wine program writes to stdout. */
+void pw_ms_stdout(const char *line);
+/* The plan's defaults for Wine's environment (RADV's variables in the e
+ * plans), added before <root>/env.txt is read. */
+void pw_ms_environment(void (*add)(const char *name, const char *value));
 /* "module+0xoffset" for an address, "?" outside every loaded module. */
 const char *pw_orbis_module_of(uint64_t address, char *out, size_t size);
 

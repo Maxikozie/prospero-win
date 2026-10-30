@@ -166,6 +166,17 @@ const char *pw_orbis_module_of(uint64_t address, char *out, size_t size)
     return out;
 }
 
+/* Whether a loaded module's name is NAME: the module list names them with
+ * the extension ("ntdll.prx", measured in the second e2 launch), so NAME
+ * and NAME.prx both match. Before that, the plain comparison never matched
+ * an app PRX: d1's early_autoload=0 came from it and does not show that the
+ * loader leaves a NEEDED app module unloaded. */
+static int module_named(const char *module, const char *name)
+{
+    size_t n = strlen(name);
+    return !strncmp(module, name, n) && (!module[n] || !strcmp(module + n, ".prx"));
+}
+
 /* Whether a module of this name is loaded (the loader may load a NEEDED
  * application module by itself). */
 static int module_loaded(const char *name)
@@ -175,7 +186,7 @@ static int module_loaded(const char *name)
     if (sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &count) != 0) return -1;
     for (size_t i = 0; i < count; i++) {
         Module m;
-        if (!module_info(handles[i], &m) && !strcmp(m.name, name)) return 1;
+        if (!module_info(handles[i], &m) && module_named(m.name, name)) return 1;
     }
     return 0;
 }
@@ -188,7 +199,7 @@ static int32_t module_handle(const char *name)
     if (sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &count) != 0) return -1;
     for (size_t i = 0; i < count; i++) {
         Module m;
-        if (!module_info(handles[i], &m) && !strcmp(m.name, name)) return handles[i];
+        if (!module_info(handles[i], &m) && module_named(m.name, name)) return handles[i];
     }
     return -1;
 }
@@ -229,10 +240,15 @@ static void slot_note(Slots *s, const char *symbol, const char *kind, uint64_t v
     }
 }
 
-/* Each slot of <name>.bind.txt against what sceKernelDlsym says the
- * exporter exports: bound (equal), zero, lazy (still inside the importer:
- * a PLT entry), other; nosym when the exporter's look-up fails. */
-static void check_slots(const char *name, const Module *importer, int32_t exporter, Slots *s, const char *watch)
+/* An exporter of a slot table's "from" column (NULL name: every slot). */
+typedef struct Exporter { const char *name; int32_t handle; } Exporter;
+
+/* Each slot of <name>.bind.txt against what sceKernelDlsym says its
+ * exporter (by the slot's "from") exports: bound (equal), zero, lazy (still
+ * inside the importer: a PLT entry), other; nosym when the look-up fails or
+ * no exporter of that name was given. */
+static void check_slots_from(const char *name, const Module *importer, const Exporter *exporters, size_t count,
+                             Slots *s, const char *watch)
 {
     static char text[32768];
     char path[512];
@@ -260,13 +276,16 @@ static void check_slots(const char *name, const Module *importer, int32_t export
         {
             uint64_t address = importer->low + offset - first_vaddr, value = 0;
             void *expected = NULL;
+            int32_t exporter = -1;
+            for (size_t i = 0; i < count && exporter < 0; i++)
+                if (!exporters[i].name || !strcmp(exporters[i].name, from)) exporter = exporters[i].handle;
             s->total++;
             if (address < importer->low || address + 8 > importer->high) {
                 s->other++;
                 state = "outside";
             } else {
                 memcpy(&value, (const void *)(uintptr_t)address, sizeof(value));
-                if (sceKernelDlsym(exporter, symbol, &expected) != 0 || !expected) s->nosym++;
+                if (exporter < 0 || sceKernelDlsym(exporter, symbol, &expected) != 0 || !expected) s->nosym++;
                 if (expected && value == (uint64_t)(uintptr_t)expected) { s->bound++; state = "bound"; }
                 else if (!value) { s->zero++; state = "zero"; }
                 else if (value >= importer->low && value < importer->high) { s->lazy++; state = "lazy"; }
@@ -277,6 +296,12 @@ static void check_slots(const char *name, const Module *importer, int32_t export
             if (watch && !strcmp(symbol, watch)) snprintf(s->watch_state, sizeof(s->watch_state), "%s", state);
         }
     }
+}
+
+static void check_slots(const char *name, const Module *importer, int32_t exporter, Slots *s, const char *watch)
+{
+    const Exporter one = { NULL, exporter };
+    check_slots_from(name, importer, &one, 1, s, watch);
 }
 
 static const char *slot_state(const Slots *s)
@@ -1071,6 +1096,10 @@ static void stage_vk_caps(char *fields, size_t size)
 
 /* The title's VideoOut closed and the GDI present sink stopped: from here
  * the display is RADV's (wsi_orbis.c opens port 255 at swapchain creation). */
+static pthread_t main_thread;
+static volatile int release_request, release_result;
+static char release_state[24] = "-";
+
 static int release_display(void)
 {
     int rc;
@@ -1078,8 +1107,33 @@ static int release_display(void)
     rc = video_open ? pw_videoout_orbis_close(&video) : 0;
     if (!rc) video_open = 0;
     pthread_mutex_unlock(&present_lock);
+    snprintf(release_state, sizeof(release_state), rc ? "fail:0x%x" : "ok", (unsigned)rc);
     step("display released rc=0x%x", (unsigned)rc);
     return rc;
+}
+
+/* ntdll's display release (pw_wine_set_display_release), called by win32u
+ * before its first surface (patch 0461). The port is closed on the thread
+ * that opened it, the title's main thread (pw_ms_service), as the PS5 title
+ * does: a close from another thread is not measured. 0 once closed. */
+int pw_ms_release_display(void *context)
+{
+    (void)context;
+    if (pthread_equal(pthread_self(), main_thread)) return release_display();
+    __atomic_store_n(&release_request, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 500 && __atomic_load_n(&release_request, __ATOMIC_ACQUIRE); i++) pause_ms(10);
+    if (__atomic_load_n(&release_request, __ATOMIC_ACQUIRE)) {
+        snprintf(release_state, sizeof(release_state), "timeout");
+        return -1;
+    }
+    return release_result;
+}
+
+void pw_ms_service(void)
+{
+    if (!__atomic_load_n(&release_request, __ATOMIC_ACQUIRE)) return;
+    release_result = release_display();
+    __atomic_store_n(&release_request, 0, __ATOMIC_RELEASE);
 }
 
 static void stage_release(char *fields, size_t size)
@@ -1099,6 +1153,106 @@ static void stage_vk_present(char *fields, size_t size)
     pw_vk_present(shot, fields, size);
 }
 
+/* ---- e2 + e3: winevulkan, win32u's surface, the hand-over through Wine ------------------- */
+
+static int e2_lines_plan(void);
+
+/* winevulkan.prx's slots against both its exporters (ntdll, then win32u for
+ * __wine_get_vulkan_driver). */
+static void stage_wv_bind(char *fields, size_t size)
+{
+    int result;
+    int32_t ntdll = load("ntdll", &result), win32u, wv;
+    Exporter exporters[2];
+    Module m;
+    Slots s;
+
+    if (ntdll <= 0) { snprintf(fields, size, "wv_load=nontdll wv_bound=-"); return; }
+    if ((win32u = load("win32u", &result)) <= 0) { snprintf(fields, size, "wv_load=nowin32u wv_bound=-"); return; }
+    wv = load("winevulkan", &result);
+    step("wv_bind winevulkan load=0x%x result=%d", (unsigned)wv, result);
+    if (wv <= 0) { snprintf(fields, size, "wv_load=0x%x wv_bound=-", (unsigned)wv); return; }
+    if (module_info(wv, &m)) { snprintf(fields, size, "wv_load=ok wv_bound=nomoduleinfo"); return; }
+    exporters[0] = (Exporter){ "ntdll", ntdll };
+    exporters[1] = (Exporter){ "win32u", win32u };
+    check_slots_from("winevulkan", &m, exporters, 2, &s, "__wine_get_vulkan_driver");
+    slot_step("wv_bind", &s);
+    snprintf(fields, size, "wv_load=ok wv_bound=%u/%u wv_first=%s wv_driver=%s", s.bound, s.total,
+             s.first[0] ? s.first : "-", s.watch_state);
+}
+
+/* The Wine program's own lines (vk64.exe: VK64, VK64S), kept whole: the
+ * title remembers only the last stdout line. */
+static char vk64_line[256], vk64s_line[256];
+
+void pw_ms_stdout(const char *line)
+{
+    if (!strncmp(line, "VK64 ", 5)) snprintf(vk64_line, sizeof(vk64_line), "%s", line + 5);
+    else if (!strncmp(line, "VK64S ", 6)) snprintf(vk64s_line, sizeof(vk64s_line), "%s", line + 6);
+}
+
+/* What RADV reads (libvulkan.prx is given ntdll's environment when win32u
+ * loads it) and a desktop the size of the swapchain, for the Wine stage of
+ * the plans that run Vulkan; <root>/env.txt is read after, and wins. */
+void pw_ms_environment(void (*add)(const char *name, const char *value))
+{
+    static char cache[512], shot[512];
+    if (!e2_lines_plan()) return;
+    snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
+    mkdir(cache, 0777);
+    snprintf(cache, sizeof(cache), "%s/cache/radv", cfg.root);
+    mkdir(cache, 0777);
+    snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
+    add("MESA_SHADER_CACHE_DIR", cache);
+    add("MESA_DISK_CACHE_DATABASE", "1");
+    add("ORBIS_WSI_SHOT_PATH", shot);
+    add("ORBIS_WSI_SHOT", "300");
+    add("WINE_PS5_DESKTOP", "1920x1080");
+}
+
+/* libvulkan.prx's present counters, through ntdll's dlsym of a name any
+ * loaded module's descriptor exports; "ok", or why there are none (the
+ * counters are then zeros). ntdll's handle by name, else by loading its
+ * path again (the first e2 launch read zeros: the name look-up is
+ * unmeasured, the path load is what e1's stages use). */
+static const char *vulkan_stats(struct pw_vulkan_stats *stats)
+{
+    const PwPrxDescriptor *descriptor = NULL;
+    void *(*sym)(void *, const char *);
+    int (*read)(struct pw_vulkan_stats *) = NULL;
+    int32_t ntdll = module_handle("ntdll");
+    Module m;
+    int result;
+
+    memset(stats, 0, sizeof(*stats));
+    stats->size = sizeof(*stats);
+    if (ntdll < 0) ntdll = load("ntdll", &result);
+    if (ntdll <= 0 || module_info(ntdll, &m)) return "nontdll";
+    step("vk_stats ntdll handle=0x%x name=%s", (unsigned)ntdll, m.name);
+    if (pw_prx_find_descriptor(m.segments, m.count, &descriptor) != PW_PRX_OK) return "nodescriptor";
+    if (!(sym = (void *(*)(void *, const char *))(uintptr_t)pw_prx_lookup(descriptor, "dlsym"))) return "nodlsym";
+    if (!(read = (int (*)(struct pw_vulkan_stats *))(uintptr_t)sym(NULL, "pw_vulkan_stats"))) return "nosym";
+    return read(stats) ? "readfailed" : "ok";
+}
+
+/* "key=value ..." with each KEY of RENAME (pairs: from, to) renamed. */
+static void renamed(const char *in, const char *const *rename, size_t pairs, char *out, size_t size)
+{
+    size_t n = 0;
+    out[0] = 0;
+    for (const char *p = in; *p && n + 1 < size;) {
+        const char *end = strchr(p, ' '), *eq = strchr(p, '=');
+        size_t word = end ? (size_t)(end - p) : strlen(p), key = eq && eq < p + word ? (size_t)(eq - p) : word;
+        const char *to = NULL;
+        for (size_t i = 0; i < pairs && !to; i++)
+            if (strlen(rename[2 * i]) == key && !strncmp(p, rename[2 * i], key)) to = rename[2 * i + 1];
+        n += (size_t)snprintf(out + n, size - n, "%s%s%.*s", n ? " " : "", to ? to : "", (int)(to ? word - key : word),
+                              to ? p + key : p);
+        p += word;
+        while (*p == ' ') p++;
+    }
+}
+
 /* ---- the plans -------------------------------------------------------------------- */
 
 static void d1_lines(void);
@@ -1106,6 +1260,7 @@ static void d2_lines(void);
 static void d4_lines(void);
 static void d_lines(void);
 static void e1_lines(void);
+static void e2_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1144,13 +1299,24 @@ static const PwMsStage e1_stages[] = {
     { "vk_present", 60, stage_vk_present, "present=fault gpu_hang=-" },
     { "hello", 0, NULL, "hello=fault" },
 };
+/* e2 and e3 from one launch of vk64.exe: winevulkan's slots before Wine
+ * starts, the display open so that win32u's surface hands it over. */
+static const PwMsStage e2_stages[] = {
+    { "w32u_bind", 20, stage_w32u_bind, "w32u_load=fault w32u_bound=fault" },
+    { "wv_bind", 20, stage_wv_bind, "wv_load=fault wv_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "vk64", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
     { "d4", d4_stages, sizeof(d4_stages) / sizeof(d4_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d4_lines },
     { "d", d_stages, sizeof(d_stages) / sizeof(d_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d_lines },
     { "e1", e1_stages, sizeof(e1_stages) / sizeof(e1_stages[0]), "C:\\hello.exe", 1, e1_lines },
+    { "e2", e2_stages, sizeof(e2_stages) / sizeof(e2_stages[0]), "C:\\vk64.exe", 0, e2_lines },
 };
+
+static int e2_lines_plan(void) { return plan && plan->lines == e2_lines; }
 
 const char *pw_ms_select(const char *name)
 {
@@ -1233,6 +1399,7 @@ void pw_ms_start(const PwMsConfig *config)
 
     if (!plan) pw_ms_select(NULL);
     cfg = *config;
+    main_thread = pthread_self();
     start_ns = cfg.now_ns();
     snprintf(dir, sizeof(dir), "%s/%s", cfg.root, plan->name);
     mkdir(dir, 0777);
@@ -1309,6 +1476,23 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", d4_board_opened < 0 ? 0 : d4_board_opened,
                  (unsigned)d4_before, (unsigned)d4_after, d4_refused, d4_posted);
         pthread_mutex_unlock(&present_lock);
+    } else if (plan->lines == e2_lines) {
+        /* vk64.exe's two lines, its frames and hang renamed app_*: frames, the
+         * swapchain and the lost-device count are what reached the driver. */
+        static const char *const rename[] = { "frames", "app_frames", "swapchain", "app_swapchain", "hang", "app_hang" };
+        struct pw_vulkan_stats vk;
+        char shot[512], second[300];
+        struct stat st;
+        const char *counted = vulkan_stats(&vk);
+        int fb;
+        snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
+        fb = stat(shot, &st) == 0 && st.st_size == (off_t)PW_VIDEOOUT_ORBIS_WIDTH * PW_VIDEOOUT_ORBIS_HEIGHT * 4;
+        renamed(vk64s_line[0] ? vk64s_line : "surface=-", rename, 3, second, sizeof(second));
+        snprintf(fields, sizeof(fields), "exit=%s %s %s frames=%llu swapchain=%ux%u gpu_hang=%d device_lost=%u fb=%s "
+                 "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, vk64_line[0] ? vk64_line : "inst=-", second,
+                 (unsigned long long)vk.presents, vk.width, vk.height,
+                 strstr(vk64s_line, "hang=1") != NULL || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none",
+                 release_state, (unsigned long long)gdi_dropped, counted);
     } else if (plan->c_line) {
         /* hello.exe: milestone c's regression (d1, e1). */
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
@@ -1441,6 +1625,26 @@ static void e1_lines(void)
         { "swapchain", PRESENT }, { "fps", PRESENT }, { "fb", PRESENT }, { "reopen", PRESENT }, { "hello", HELLO },
     };
     emit_line("PS4WINE e1 vk", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* e2: winevulkan and Wine's Vulkan under vk64.exe; e3: win32u's surface,
+ * the hand-over, the Win32 swapchain's frames. */
+static void e2_lines(void)
+{
+    enum { W32U, WV, DISPLAY, VK64 };
+    static const LineKey e2_keys[] = {
+        { "inst", VK64 }, { "api", VK64 }, { "exts_dxvk", VK64 }, { "dev", VK64 }, { "submit", VK64 },
+        { "wv_bound", WV }, { "w32u_bound", W32U }, { "wv_driver", WV }, { "wv_first", WV }, { "exts", VK64 },
+        { "device", VK64 }, { "exit", VK64 },
+    };
+    static const LineKey e3_keys[] = {
+        { "release", VK64 }, { "surface", VK64 }, { "present", VK64 }, { "frames", VK64 }, { "gpu_hang", VK64 },
+        { "swapchain", VK64 }, { "fb", VK64 }, { "app_frames", VK64 }, { "app_swapchain", VK64 }, { "fmt", VK64 },
+        { "device_lost", VK64 }, { "gdi_dropped", VK64 }, { "vk_stats", VK64 }, { "display", DISPLAY },
+        { "exit", VK64 },
+    };
+    emit_line("PS4WINE e2 vk64", e2_keys, sizeof(e2_keys) / sizeof(e2_keys[0]));
+    emit_line("PS4WINE e3 vkclear", e3_keys, sizeof(e3_keys) / sizeof(e3_keys[0]));
 }
 
 void pw_ms_emit_lines(void)
