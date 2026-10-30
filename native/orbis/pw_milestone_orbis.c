@@ -607,6 +607,7 @@ static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t frames, drawn;
 static uint32_t frame_width, frame_height;
 static uint32_t *last_drawn;   /* a copy of the last frame with any pixel drawn */
+static uint32_t present_scale, present_x0, present_y0;   /* desktop -> 1920x1080 */
 static int fb_saved = -1;      /* -1 not yet, 0 saved, else failed */
 
 /* BGRA from the driver, integer-scaled and centred on the 1920x1080
@@ -627,6 +628,9 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     if (!scale) scale = 1;
     x0 = (W - width * scale) / 2;
     y0 = (H - height * scale) / 2;
+    present_scale = scale;
+    present_x0 = x0;
+    present_y0 = y0;
     dst = pw_videoout_orbis_back(&video);
     for (size_t i = 0; i < (size_t)W * H; i++) dst[i] = 0xff000000u;   /* opaque black around the desktop */
     for (uint32_t y = 0; y < height; y++) {
@@ -670,10 +674,83 @@ static void save_last_drawn(void)
     pthread_mutex_unlock(&present_lock);
 }
 
+/* ---- d4: winemine and a scripted click ------------------------------------------- */
+
+/* The click and the cell it opens, in desktop coordinates, from the host
+ * reference run (tools/test_wine_ps5_driver.sh --click 80,153 winemine):
+ * winemine's window at 0,0 of the 800x600 desktop, its 9x9 board's cells
+ * 16 px from 8,81; the middle cell (4,4) spans 72..87 x 145..160, and the
+ * first click is always safe, so it opens: its pixel 74,150 goes from the
+ * closed cell's 0,128,0 to the open cell's 0,0,0, clear of the digit and of
+ * the pointer drawn down and right of 80,153. */
+enum { D4_CLICK_X = 80, D4_CLICK_Y = 153, D4_PROBE_X = 74, D4_PROBE_Y = 150 };
+
+static int (*post_input)(const void *event);
+static volatile int d4_board_opened = -1, d4_refused, d4_posted;
+static uint32_t d4_before, d4_after;
+
+void pw_ms_set_input(int (*post)(const void *event)) { post_input = post; }
+
+/* A desktop pixel of the last drawn frame as 0xRRGGBB, or 0xffffffff. */
+static uint32_t desktop_pixel(uint32_t x, uint32_t y)
+{
+    uint32_t v = 0xffffffffu;
+    pthread_mutex_lock(&present_lock);
+    if (last_drawn && present_scale && x < frame_width && y < frame_height) {
+        uint32_t rgba = last_drawn[(size_t)(present_y0 + y * present_scale) * PW_VIDEOOUT_ORBIS_WIDTH +
+                                   present_x0 + x * present_scale];
+        v = (rgba & 0xffu) << 16 | (rgba & 0xff00u) | (rgba >> 16 & 0xffu);
+    }
+    pthread_mutex_unlock(&present_lock);
+    return v;
+}
+
+static void pause_ms(unsigned ms)
+{
+    struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000 };
+    nanosleep(&t, NULL);
+}
+
+static void post(uint32_t type, uint32_t code, int32_t x, int32_t y, uint32_t down)
+{
+    struct { uint32_t type, code; int32_t x, y; uint32_t down; } event = { type, code, x, y, down };  /* PwWineInput */
+    if (!post_input || post_input(&event)) d4_refused++;
+    else d4_posted++;
+    pause_ms(50);
+}
+
+/* Waits for winemine's first frame, clicks the middle cell as the host run
+ * did (relative motion since patch 0670: to the corner, then by the point),
+ * waits for the cell to change, then ends the Wine stage itself: winemine
+ * does not exit. */
+static void *d4_script(void *arg)
+{
+    uint64_t until;
+    (void)arg;
+    for (until = cfg.now_ns() + 90000000000ull; cfg.now_ns() < until && (!post_input || !drawn);) pause_ms(100);
+    pause_ms(3000);
+    d4_before = desktop_pixel(D4_PROBE_X, D4_PROBE_Y);
+    step("d4 before click: frames=%llu drawn=%llu probe=%06x post_input=%d", (unsigned long long)frames,
+         (unsigned long long)drawn, (unsigned)d4_before, post_input != NULL);
+    post(2, 0, -100000, -100000, 0);   /* PW_WINE_INPUT_MOUSE_MOVE */
+    post(2, 0, D4_CLICK_X, D4_CLICK_Y, 0);
+    post(3, 0, 0, 0, 1);               /* PW_WINE_INPUT_MOUSE_BUTTON, left */
+    post(3, 0, 0, 0, 0);
+    for (until = cfg.now_ns() + 10000000000ull; cfg.now_ns() < until; pause_ms(100))
+        if ((d4_after = desktop_pixel(D4_PROBE_X, D4_PROBE_Y)) != d4_before) break;
+    d4_board_opened = d4_after != d4_before && d4_after != 0xffffffffu;
+    pause_ms(2000);
+    step("d4 after click: frames=%llu probe=%06x board_opened=%d", (unsigned long long)frames, (unsigned)d4_after,
+         d4_board_opened);
+    pw_ms_wine_end("running", "", -1);
+    return NULL;
+}
+
 /* ---- the plans -------------------------------------------------------------------- */
 
 static void d1_lines(void);
 static void d2_lines(void);
+static void d4_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -693,14 +770,19 @@ static const PwMsStage d2_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "gdi", 0, NULL, "exit=fault" },
 };
+static const PwMsStage d4_stages[] = {
+    { "display", 15, stage_display, "display=fault" },
+    { "winemine", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
+    { "d4", d4_stages, sizeof(d4_stages) / sizeof(d4_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d4_lines },
 };
 
 const char *pw_ms_select(const char *name)
 {
-    plan = &plans[1];   /* the newest milestone */
+    plan = &plans[2];   /* the newest milestone */
     for (size_t i = 0; name && i < sizeof(plans) / sizeof(plans[0]); i++)
         if (!strcmp(plans[i].name, name)) plan = &plans[i];
     return plan->name;
@@ -822,13 +904,26 @@ void pw_ms_wine_begin(void)
 {
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
+    if (plan->lines == d4_lines) {
+        pthread_t thread;
+        if (!pthread_create(&thread, NULL, d4_script, NULL)) pthread_detach(thread);
+    }
 }
 
 void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_connected)
 {
     char fields[PW_STAGE_FIELDS];
 
-    if (plan == &plans[0]) {
+    if (plan->lines == d4_lines) {
+        save_last_drawn();
+        pthread_mutex_lock(&present_lock);
+        snprintf(fields, sizeof(fields), "exit=%s frames=%llu drawn=%llu frame=%ux%u fb=%s board_opened=%d "
+                 "probe_before=%06x probe_after=%06x refused=%d posted=%d", exit_text, (unsigned long long)frames,
+                 (unsigned long long)drawn, frame_width, frame_height,
+                 fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", d4_board_opened < 0 ? 0 : d4_board_opened,
+                 (unsigned)d4_before, (unsigned)d4_after, d4_refused, d4_posted);
+        pthread_mutex_unlock(&present_lock);
+    } else if (plan == &plans[0]) {
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
         snprintf(fields, sizeof(fields), "hello=%s", ok ? "ok" : exit_text);
     } else {
@@ -919,6 +1014,17 @@ static void d2_lines(void)
     emit_line(head, d2_keys, sizeof(d2_keys) / sizeof(d2_keys[0]));
     snprintf(head, sizeof(head), "PS4WINE d3 fonts n=%s", value(GDI, "fonts", fonts, sizeof(fonts)));
     emit_line(head, d3_keys, sizeof(d3_keys) / sizeof(d3_keys[0]));
+}
+
+static void d4_lines(void)
+{
+    enum { DISPLAY, MINE };
+    static const LineKey keys[] = {
+        { "frames", MINE }, { "board_opened", MINE }, { "refused", MINE }, { "fb", MINE }, { "drawn", MINE },
+        { "frame", MINE }, { "probe_before", MINE }, { "probe_after", MINE }, { "posted", MINE }, { "exit", MINE },
+        { "display", DISPLAY },
+    };
+    emit_line("PS4WINE d4 winemine", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void pw_ms_emit_lines(void)

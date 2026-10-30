@@ -12,7 +12,7 @@
  * title idles: on the PS4 a process that exits is reported as a crash.
  *
  * Before Wine, a milestone plan's stages run (pw_milestone_orbis.h; the
- * plan from PS4WINE_MILESTONE in <root>/env.txt, default d2): d1 cross-PRX
+ * plan from PS4WINE_MILESTONE in <root>/env.txt, default d4): d1 cross-PRX
  * binding, the title's VideoOut, the DS4, then hello.exe; d2 win32u's and
  * FreeType's slots, the display, then gdi64.exe with its frames on
  * VideoOut. Each stage is recorded in a progress file, the Wine program is
@@ -526,8 +526,11 @@ int main(int argc, char **argv)
             void (*set_present)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *) =
                 (void (*)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *))(uintptr_t)
                     pw_prx_lookup(start.descriptor, "pw_wine_set_present_sink");
-            LOG("PW_WINE64 present_sink=%d", set_present != NULL);
+            int (*post_input)(const void *) =
+                (int (*)(const void *))(uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_post_input");
+            LOG("PW_WINE64 present_sink=%d post_input=%d", set_present != NULL, post_input != NULL);
             if (set_present) set_present(pw_ms_present, NULL);
+            pw_ms_set_input(post_input);
         }
         {
             /* The same cross-check through the kernel's own lookup. */

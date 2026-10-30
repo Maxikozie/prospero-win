@@ -8,8 +8,10 @@
  *       -> PS4WINE d1 bind=import|thunk|none ... hello=ok ...
  *   d2  win32u's and libfreetype's ntdll slots, the display, gdi64.exe with
  *       its frames on VideoOut -> PS4WINE d2 gdi ... and PS4WINE d3 fonts ...
+ *   d4  the display, winemine and a scripted click on its board
+ *       -> PS4WINE d4 winemine frames=N board_opened=0|1 refused=N fb=ok ...
  *
- * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default d2).
+ * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default d4).
  * Title stages run under a fault handler that records the fault and goes
  * on with the next stage; each has a time limit a watchdog thread enforces
  * (on overrun: an H record, the lines with what is known, idle). The Wine
@@ -54,6 +56,8 @@ void pw_ms_emit_lines(void);
 /* The present sink for ntdll's pw_wine_set_present_sink: BGRA frames from
  * the user driver, shown on the title's VideoOut (d2). */
 int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t height, uint32_t stride);
+/* ntdll's pw_wine_post_input, for the scripted input of d4. */
+void pw_ms_set_input(int (*post)(const void *event));
 /* "module+0xoffset" for an address, "?" outside every loaded module. */
 const char *pw_orbis_module_of(uint64_t address, char *out, size_t size);
 

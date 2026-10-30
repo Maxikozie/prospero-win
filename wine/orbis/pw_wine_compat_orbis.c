@@ -153,6 +153,7 @@ int fstatat(int fd, const char *path, struct stat *out, int flags)
 #include <sys/types.h>
 
 extern int __real_dup(int fd);
+#include "pw_wine_dup_orbis.h"
 extern int pw_cwd_fd_path(int fd, char *path, size_t size);
 
 int __wrap_dup(int fd)
@@ -163,6 +164,14 @@ int __wrap_dup(int fd)
 
     if (d >= 0) return d;
     if ((d = fcntl(fd, F_DUPFD, 3)) >= 0) return d;
+    /* A real duplicate for every kind of descriptor: passed to ourselves
+     * with SCM_RIGHTS (pw_wine_dup_orbis.c). */
+    if ((d = pw_orbis_dup_by_passing(fd)) >= 0) {
+        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "wine-orbis: dup refused (errno %d); descriptors are duplicated by passing them\n", saved);
+        return d;
+    }
+    /* Last resort, files only: reopened by path (own offset and flags). */
     if (!pw_cwd_fd_path(fd, path, sizeof(path))) {
         off_t at = lseek(fd, 0, SEEK_CUR);
         flags = fcntl(fd, F_GETFL);

@@ -7,7 +7,10 @@
  * (A-Z, 0-9 and space) is typed once as virtual-key presses, and a left
  * click is made at $PW_INPUT_CLICK ("x,y" on the desktop). The pointer then
  * visits each point of $PW_INPUT_MOVES ("x,y;x,y;..."), one every 300 ms so
- * that the game can set its cursor. When $PW_FRAME_DIR is set it receives
+ * that the game can set its cursor. Motion is relative since patch 0670
+ * (the server clips it to the screen), so each point is reached from the
+ * top-left corner: one move far up and left, then one by the point's
+ * coordinates. When $PW_FRAME_DIR is set it receives
  * every frame as NNNN.ppm, which shows where the driver drew the cursor.
  * When $PW_SINK_PROCESS is set, only a process whose command line contains
  * it presents frames and takes input, because explorer and services load
@@ -27,9 +30,10 @@ static unsigned long frames;
 static uint32_t last_width,last_height;
 static const char *text;
 static size_t typed;       /* events handed out: two per character */
-static int clicked;        /* click events handed out: move, down, up */
+static int clicked;        /* click events handed out: to the corner, to the point, down, up */
 static int moved;          /* points of PW_INPUT_MOVES visited */
 static uint64_t moved_ms;  /* when the last one was */
+static int at_corner;      /* the next PW_INPUT_MOVES event is the move from the corner */
 static int fds[2]={-1,-1};
 
 int pw_wine_present(const void *bgra,uint32_t width,uint32_t height,uint32_t stride);
@@ -105,6 +109,12 @@ int pw_wine_present(const void *bgra,uint32_t width,uint32_t height,uint32_t str
         snprintf(name,sizeof(name),"%s/%04lu.ppm",dir,frames);
         write_ppm(name,bgra,width,height,stride);
     }
+    /* The driver drains the wake pipe and waits on it: the frame that makes
+     * scripted input due must wake it, or a click alone never comes. */
+    {
+        const char *after=getenv("PW_INPUT_AFTER");
+        if(fds[1]!=-1 && frames==(unsigned long)(after?atol(after):1) && write(fds[1],"x",1)<0){}
+    }
     if(!path)return 0;
     snprintf(name,sizeof(name),"%s.tmp",path);
     write_ppm(name,bgra,width,height,stride);
@@ -118,8 +128,9 @@ int pw_wine_next_input(struct input *event)
     const char *moves=getenv("PW_INPUT_MOVES");
     int x,y;
     if(!is_target() || frames<(unsigned long)(after?atol(after):1))return 0;
-    if(click && clicked<3 && sscanf(click,"%d,%d",&x,&y)==2) {
-        *event=clicked==0?(struct input){2,0,x,y,0}:(struct input){3,0,0,0,clicked==1};
+    if(click && clicked<4 && sscanf(click,"%d,%d",&x,&y)==2) {
+        *event=clicked==0?(struct input){2,0,-100000,-100000,0}:clicked==1?(struct input){2,0,x,y,0}:
+               (struct input){3,0,0,0,clicked==2};
         clicked++;
         return 1;
     }
@@ -131,12 +142,17 @@ int pw_wine_next_input(struct input *event)
         typed++;
         return 1;
     }
-    if(!moves || now_ms()-moved_ms<300)return 0;
+    if(!moves || (!at_corner && now_ms()-moved_ms<300))return 0;
     const char *point=moves;
     for(int i=0;i<moved && point;i++)if((point=strchr(point,';')))point++;
     if(!point || sscanf(point,"%d,%d",&x,&y)!=2)return 0;
+    if(!at_corner) {
+        at_corner=1;
+        *event=(struct input){2,0,-100000,-100000,0};
+        return 1;
+    }
     fprintf(stderr,"ps5 driver sink: move %d to %d,%d after frame %lu\n",moved,x,y,frames);
-    moved++;moved_ms=now_ms();
+    at_corner=0;moved++;moved_ms=now_ms();
     *event=(struct input){2,0,x,y,0};
     return 1;
 }

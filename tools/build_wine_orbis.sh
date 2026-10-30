@@ -198,7 +198,7 @@ for unit in pw_wine_heap pw_wine_heap_libc pw_wine_dmem pw_wine_dmem_ps5 \
         pw_wine_threads pw_wine_threads_libc pw_wine_sink pw_wine_cwd pw_wine_cwd_libc; do
     compile_shim "$root/wine/ps5/$unit.c"
 done
-for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis; do
+for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis pw_wine_dup_orbis; do
     compile_shim "$root/wine/orbis/$unit.c"
 done
 heap="$obj/pw_wine_heap.o $obj/pw_wine_heap_libc.o"
@@ -343,7 +343,7 @@ case " $modules " in *" ntdll "*)
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
             pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
-            pw_wine_dl_orbis; do
+            pw_wine_dl_orbis pw_wine_dup_orbis; do
         shims="$shims $obj/$unit.o"
     done
     link_prx ntdll dlls/ntdll/ntdll.so "$heap $dmem $shims $prx/obj/ntdll_desc.o $cwd_wraps $exit_wraps"
@@ -354,7 +354,7 @@ case " $modules " in *" wineserver "*)
         pw_wineserver_call_direct pw_wineserver_try_fast_mutex pw_wineserver_mutex_backend \
         pw_wineserver_sync_backend pw_cwd_share_changes pw_wine_set_exit_hook pw_wine_setenv
     link_prx wineserver server/wineserver "$heap $obj/pw_wine_compat.o $obj/pw_wine_compat_libc.o \
-        $obj/pw_wine_compat_orbis.o $obj/pw_wine_threads.o $obj/pw_wine_threads_libc.o \
+        $obj/pw_wine_compat_orbis.o $obj/pw_wine_dup_orbis.o $obj/pw_wine_threads.o $obj/pw_wine_threads_libc.o \
         $obj/pw_wine_cwd.o $obj/pw_wine_cwd_libc.o $obj/pw_wine_exit_orbis.o $obj/pw_wine_env_orbis.o $obj/pw_wine_stdio_orbis.o \
         $prx/obj/wineserver_desc.o $cwd_wraps $exit_wraps"
     ;;

@@ -51,6 +51,7 @@ $(eval $(call test_rule,test_pw_wine_dmem_ps5,tests/test_pw_wine_dmem_ps5.c wine
 $(eval $(call test_rule,test_pw_wine_dmem_orbis,tests/test_pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c,-std=gnu11 -pthread -DPW_WINE_HEAP_SLOTS=16 -D__ORBIS__))
 $(eval $(call test_rule,test_pw_wine_exit_orbis,tests/test_pw_wine_exit_orbis.c wine/orbis/pw_wine_exit_orbis.c,-std=gnu11 -pthread -Wl$(comma)--wrap=exit -Wl$(comma)--wrap=_exit -Wl$(comma)--wrap=abort))
 $(eval $(call test_rule,test_pw_wine_stdio_orbis,tests/test_pw_wine_stdio_orbis.c wine/orbis/pw_wine_stdio_orbis.c,-std=gnu11 -Wl$(comma)--wrap=write -Wl$(comma)--wrap=writev))
+$(eval $(call test_rule,test_pw_wine_dup_orbis,tests/test_pw_wine_dup_orbis.c wine/orbis/pw_wine_dup_orbis.c,-std=gnu11 -pthread -Iwine/orbis))
 $(eval $(call test_rule,test_pw_stage_orbis,tests/test_pw_stage_orbis.c native/orbis/pw_stage_orbis.c,-std=gnu11 -Inative/orbis))
 $(eval $(call test_rule,test_pw_wine_prx,tests/test_pw_wine_prx.c wine/ps5/pw_wine_prx.c,-I.))
 $(eval $(call test_rule,test_pw_wine_threads,tests/test_pw_wine_threads.c wine/ps5/pw_wine_threads.c,-pthread))
@@ -154,7 +155,7 @@ $(eval $(call test_rule,test_pw_qpc_clock,tests/test_pw_qpc_clock.c,))
 $(eval $(call test_rule,test_pw_key_shared,tests/test_pw_key_shared.c,))
 
 TESTS := test_pw_qpc_clock test_pw_key_shared test_pw_diagnostics test_pw_x86_hostexec test_pw_app_profile test_pw_profile_catalog test_pw_present \
-	test_pw_wine_heap test_pw_wine_dmem test_pw_wine_dmem_ps5 test_pw_wine_dmem_orbis test_pw_wine_exit_orbis test_pw_wine_stdio_orbis test_pw_stage_orbis test_pw_wine_prx test_pw_wine_start test_pw_wine_launch test_pw_script_input test_pw_game_profile test_pw_prefix_temp test_pw_tsc_calibrate test_pw_wine_prefix_cpu test_vk_command_stream test_vk_spsc test_vk_replay test_vk_wire test_vk_codec \
+	test_pw_wine_heap test_pw_wine_dmem test_pw_wine_dmem_ps5 test_pw_wine_dmem_orbis test_pw_wine_exit_orbis test_pw_wine_stdio_orbis test_pw_stage_orbis test_pw_wine_dup_orbis test_pw_wine_prx test_pw_wine_start test_pw_wine_launch test_pw_script_input test_pw_game_profile test_pw_prefix_temp test_pw_tsc_calibrate test_pw_wine_prefix_cpu test_vk_command_stream test_vk_spsc test_vk_replay test_vk_wire test_vk_codec \
 	test_pw_wine_library test_pw_wine_display test_pw_hid test_pw_hid_ps5 test_pw_spinner test_pw_wine_dl test_pw_wine_sink \
 	test_pw_wine_threads test_pw_wine_compat test_pw_wine_cwd test_pw_wine_cwd_listing test_pw_wine_cwd_lexical test_pw_ws2_32_libc test_pw_launcher_render test_pw_pad test_pw_game_menu test_pw_osk test_pw_osk_ps5 \
 	test_pw_guest_fp test_pw_vm test_pw_x86_block test_pw_x86_flat test_pw_x86_cache test_pw_x86_code_pages test_pw_wow_smc_pages test_pw_wow_thread_budget test_pw_wow_tsc_clock test_pw_wow_call_top \
