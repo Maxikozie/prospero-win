@@ -157,7 +157,9 @@ def raw_syscalls(elf):
         if m:
             current = m.group(1)
             continue
-        if re.search(r"\bsyscall\b", line) and current and current not in DISPATCHERS:
+        # The mnemonic, not a call to libc's syscall() (an ENOSYS stub on the
+        # console): "callq 0x... <syscall>" is not a raw system call.
+        if re.match(r"^\s*[0-9a-f]+:\s+syscall\b", line) and current and current not in DISPATCHERS:
             found.add(current)
     return sorted(found)
 

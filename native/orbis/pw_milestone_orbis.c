@@ -4,8 +4,10 @@
 #include "pw_stage_orbis.h"
 #include "pw_videoout_orbis.h"
 #include "pw_pad_orbis.h"
+#include "pw_vk_stage_orbis.h"
 #include "pw_wine_prx.h"
 #include "pw_wine_display.h"
+#include "pw_wine_exit_orbis.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -45,7 +47,12 @@ static const PwMsPlan *plan;
 static PwMsConfig cfg;
 static PwStageRun run;
 static char progress_path[256];
-static sigjmp_buf stage_jump;
+/* setjmp/longjmp, not sigsetjmp/siglongjmp: libc.a has no sigsetjmp, so the
+ * link took libkernel's (FreeBSD's jmp_buf) beside musl's siglongjmp, and the
+ * first recovery jumped to garbage (e1 launch 1: rip 0x20, rsp 0x1). musl's
+ * pair is one implementation; the handlers run with SA_NODEFER, so there is
+ * no blocked signal to restore. */
+static jmp_buf stage_jump;
 static volatile int stage_active = -1;
 static volatile int recovering;
 static volatile uint64_t stage_deadline;
@@ -171,6 +178,19 @@ static int module_loaded(const char *name)
         if (!module_info(handles[i], &m) && !strcmp(m.name, name)) return 1;
     }
     return 0;
+}
+
+/* The handle of a loaded module of this name, or -1. */
+static int32_t module_handle(const char *name)
+{
+    int32_t handles[64];
+    size_t count = 0;
+    if (sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &count) != 0) return -1;
+    for (size_t i = 0; i < count; i++) {
+        Module m;
+        if (!module_info(handles[i], &m) && !strcmp(m.name, name)) return handles[i];
+    }
+    return -1;
 }
 
 static int32_t load(const char *name, int *result)
@@ -614,6 +634,7 @@ static volatile uint64_t input_pending_ns;
 static uint64_t lat_n, lat_sum_ns, lat_max_ns, present_n, present_sum_ns;
 static uint32_t present_scale, present_x0, present_y0;   /* desktop -> 1920x1080 */
 static int fb_saved = -1;      /* -1 not yet, 0 saved, else failed */
+static uint64_t gdi_dropped;   /* frames the driver sent after the display was handed over */
 
 /* BGRA from the driver, integer-scaled and centred on the 1920x1080
  * buffer as R,G,B,A. The last frame with any pixel drawn is copied aside
@@ -628,8 +649,13 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     int any = 0;
 
     (void)context;
-    if (!video_open || !bgra || !width || !height || width > W || height > H) return -1;
+    if (!bgra || !width || !height || width > W || height > H) return -1;
     pthread_mutex_lock(&present_lock);
+    if (!video_open) {
+        gdi_dropped++;
+        pthread_mutex_unlock(&present_lock);
+        return -1;
+    }
     if (pending) {
         uint64_t lat = t0 - pending;
         input_pending_ns = 0;
@@ -893,12 +919,193 @@ static void *d_script(void *arg)
     return NULL;
 }
 
+/* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
+
+static void *(*ntdll_dlopen)(const char *, int);
+static void *(*ntdll_dlsym)(void *, const char *);
+static int32_t ntdll_module = -1;
+
+/* An exit() inside a module during a title stage (RADV calls exit() on
+ * fatal errors) ends the stage, not the title: the stage is marked, the
+ * lines go out and the thread idles, as a hang does. The Wine stage
+ * replaces this hook with the title's own. */
+static void stage_exit_hook(void *context, int status, const char *kind)
+{
+    char detail[64];
+    int stage = stage_active;
+
+    (void)context;
+    snprintf(detail, sizeof(detail), "exit=%d kind=%s", status, kind);
+    if (stage >= 0) pw_stage_mark(&run, (unsigned)stage, 'F', detail);
+    else cfg.emit(detail);
+    pw_ms_emit_lines();
+    for (;;) sleep(60);
+}
+
+/* What RADV reads from its environment (its own: libvulkan.prx is given
+ * ntdll's when pw_wine_dl loads it), then <root>/env.txt, which may replace
+ * any of them. */
+static void vk_environment(int (*set)(const char *, const char *))
+{
+    char path[512], text[4096], *line, *next;
+    FILE *file;
+    size_t got;
+
+    snprintf(path, sizeof(path), "%s/cache", cfg.root);
+    mkdir(path, 0777);
+    snprintf(path, sizeof(path), "%s/cache/radv", cfg.root);
+    mkdir(path, 0777);
+    set("MESA_SHADER_CACHE_DIR", path);
+    set("MESA_DISK_CACHE_DATABASE", "1");
+    snprintf(path, sizeof(path), "%s/shot.raw", cfg.root);
+    set("ORBIS_WSI_SHOT_PATH", path);
+    set("ORBIS_WSI_SHOT", "300");
+    snprintf(path, sizeof(path), "%s/env.txt", cfg.root);
+    if (!(file = fopen(path, "rb"))) return;
+    got = fread(text, 1, sizeof(text) - 1, file);
+    fclose(file);
+    text[got] = 0;
+    for (line = text; line && *line; line = next) {
+        char *eq;
+        if ((next = strchr(line, '\n'))) *next++ = 0;
+        line[strcspn(line, "\r")] = 0;
+        if (*line == '#' || !(eq = strchr(line, '='))) continue;
+        *eq = 0;
+        set(line, eq + 1);
+    }
+}
+
+/* ntdll as the Wine stage starts it: module_start, adopted by its loader
+ * (a bare name is then found beside it), RADV's variables in its
+ * environment and the stage exit hook. Once per process. */
+static int ntdll_ready(char *why, size_t size)
+{
+    char path[512];
+    const PwPrxDescriptor *descriptor = NULL;
+    int (*start)(size_t, const void *);
+    void *(*adopt)(const char *, int32_t);
+    int (*set)(const char *, const char *);
+    void (*set_hook)(PwWineExitHook, void *);
+    Module m;
+    int result;
+
+    if (ntdll_dlopen) return 0;
+    if ((ntdll_module = load("ntdll", &result)) <= 0) {
+        snprintf(why, size, "ntdll:0x%x", (unsigned)ntdll_module);
+        return -1;
+    }
+    if (module_info(ntdll_module, &m) || pw_prx_find_descriptor(m.segments, m.count, &descriptor) != PW_PRX_OK) {
+        snprintf(why, size, "ntdll:nodescriptor");
+        return -1;
+    }
+    start = (int (*)(size_t, const void *))(uintptr_t)pw_prx_lookup(descriptor, "module_start");
+    adopt = (void *(*)(const char *, int32_t))(uintptr_t)pw_prx_lookup(descriptor, "pw_wine_dl_adopt");
+    set = (int (*)(const char *, const char *))(uintptr_t)pw_prx_lookup(descriptor, "pw_wine_setenv");
+    set_hook = (void (*)(PwWineExitHook, void *))(uintptr_t)pw_prx_lookup(descriptor, "pw_wine_set_exit_hook");
+    if (!start || !adopt || !set || !set_hook) { snprintf(why, size, "ntdll:noexports"); return -1; }
+    start(0, NULL);
+    snprintf(path, sizeof(path), "%s/ntdll.prx", cfg.module_dir);
+    if (!adopt(path, ntdll_module)) { snprintf(why, size, "ntdll:adopt"); return -1; }
+    vk_environment(set);
+    set_hook(stage_exit_hook, NULL);
+    ntdll_dlsym = (void *(*)(void *, const char *))(uintptr_t)pw_prx_lookup(descriptor, "dlsym");
+    ntdll_dlopen = (void *(*)(const char *, int))(uintptr_t)pw_prx_lookup(descriptor, "dlopen");
+    if (!ntdll_dlopen || !ntdll_dlsym) { ntdll_dlopen = NULL; snprintf(why, size, "ntdll:nodlfcn"); return -1; }
+    return 0;
+}
+
+static void vk_step(const char *line) { step("%s", line); }
+
+/* libvulkan.prx through ntdll's dlopen, as win32u opens it. */
+static int vk_ready(char *why, size_t size)
+{
+    PwVkHost host = { NULL, NULL, vk_step, NULL };
+    if (ntdll_ready(why, size)) return -1;
+    host.dlopen = ntdll_dlopen;
+    host.dlsym = ntdll_dlsym;
+    host.now_ns = cfg.now_ns;
+    return pw_vk_open(&host, why, size);
+}
+
+static void stage_vk_load(char *fields, size_t size)
+{
+    unsigned long long dmem_before, flex_before;
+    uint64_t t0 = cfg.now_ns();
+    int32_t handle;
+    char why[96];
+    Module m;
+    Slots s;
+
+    pw_vk_memory(&dmem_before, &flex_before);
+    if (vk_ready(why, sizeof(why))) {
+        snprintf(fields, size, "vk_load=fail:%s vk_bound=-", why);
+        return;
+    }
+    {
+        unsigned long long dmem_after, flex_after, load_ms = (cfg.now_ns() - t0) / 1000000ull;
+        pw_vk_memory(&dmem_after, &flex_after);
+        /* pw_wine_dl loaded it; its handle by name (loading the same path again returns it too). */
+        if ((handle = module_handle("libvulkan")) < 0) {
+            int result;
+            handle = load("libvulkan", &result);
+        }
+        if (handle <= 0 || module_info(handle, &m)) {
+            snprintf(fields, size, "vk_load=ok vk_bound=nomodule load_ms=%llu", load_ms);
+            return;
+        }
+        check_slots("libvulkan", &m, ntdll_module, &s, NULL);
+        slot_step("vk_load", &s);
+        snprintf(fields, size, "vk_load=ok vk_bound=%u/%u vk_first=%s load_ms=%llu vk_kib=%llu flex_before_mib=%llu "
+                 "flex_after_mib=%llu dmem_load_before_mib=%llu dmem_load_after_mib=%llu", s.bound, s.total,
+                 s.first[0] ? s.first : "-", load_ms, (unsigned long long)((m.high - m.low) >> 10), flex_before,
+                 flex_after, dmem_before, dmem_after);
+    }
+}
+
+static void stage_vk_caps(char *fields, size_t size)
+{
+    char why[96];
+    if (vk_ready(why, sizeof(why))) { snprintf(fields, size, "inst=fail:%s", why); return; }
+    pw_vk_caps(fields, size);
+}
+
+/* The title's VideoOut closed and the GDI present sink stopped: from here
+ * the display is RADV's (wsi_orbis.c opens port 255 at swapchain creation). */
+static int release_display(void)
+{
+    int rc;
+    pthread_mutex_lock(&present_lock);
+    rc = video_open ? pw_videoout_orbis_close(&video) : 0;
+    if (!rc) video_open = 0;
+    pthread_mutex_unlock(&present_lock);
+    step("display released rc=0x%x", (unsigned)rc);
+    return rc;
+}
+
+static void stage_release(char *fields, size_t size)
+{
+    int rc;
+    /* A resumed launch is a new process that has not opened the port. */
+    if (!video_open) { snprintf(fields, size, "release=notopen"); return; }
+    rc = release_display();
+    snprintf(fields, size, "release=%s release_rc=0x%x", rc ? "fail" : "ok", (unsigned)rc);
+}
+
+static void stage_vk_present(char *fields, size_t size)
+{
+    char why[96], shot[512];
+    if (vk_ready(why, sizeof(why))) { snprintf(fields, size, "present=fail:%s gpu_hang=0", why); return; }
+    snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
+    pw_vk_present(shot, fields, size);
+}
+
 /* ---- the plans -------------------------------------------------------------------- */
 
 static void d1_lines(void);
 static void d2_lines(void);
 static void d4_lines(void);
 static void d_lines(void);
+static void e1_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -926,16 +1133,28 @@ static const PwMsStage d_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "play", 0, NULL, "exit=fault" },
 };
+/* e1: RADV in the title, no Wine program until the c regression. vk_caps
+ * runs before the display is opened, so a device that cannot be created
+ * is known without touching VideoOut. */
+static const PwMsStage e1_stages[] = {
+    { "vk_load", 30, stage_vk_load, "vk_load=fault vk_bound=fault" },
+    { "vk_caps", 30, stage_vk_caps, "inst=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "release", 10, stage_release, "release=fault" },
+    { "vk_present", 60, stage_vk_present, "present=fault gpu_hang=-" },
+    { "hello", 0, NULL, "hello=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
     { "d4", d4_stages, sizeof(d4_stages) / sizeof(d4_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d4_lines },
     { "d", d_stages, sizeof(d_stages) / sizeof(d_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d_lines },
+    { "e1", e1_stages, sizeof(e1_stages) / sizeof(e1_stages[0]), "C:\\hello.exe", 1, e1_lines },
 };
 
 const char *pw_ms_select(const char *name)
 {
-    plan = &plans[3];   /* the newest milestone */
+    plan = &plans[sizeof(plans) / sizeof(plans[0]) - 1];   /* the newest milestone */
     for (size_t i = 0; name && i < sizeof(plans) / sizeof(plans[0]); i++)
         if (!strcmp(plans[i].name, name)) plan = &plans[i];
     return plan->name;
@@ -967,7 +1186,7 @@ static void stage_fault(int sig, siginfo_t *info, void *context)
     }
     recovering = 1;
     pw_stage_mark(&run, (unsigned)stage, 'F', detail);
-    siglongjmp(stage_jump, 1);
+    longjmp(stage_jump, 1);
 }
 
 static void set_handlers(void (*handler)(int, siginfo_t *, void *))
@@ -1043,7 +1262,7 @@ void pw_ms_title_stages(void)
         recovering = 0;
         stage_deadline = cfg.now_ns() + (uint64_t)plan->stages[i].limit_s * 1000000000ull;
         stage_active = (int)i;
-        if (sigsetjmp(stage_jump, 1) == 0) plan->stages[i].run(fields, sizeof(fields));
+        if (setjmp(stage_jump) == 0) plan->stages[i].run(fields, sizeof(fields));
         else snprintf(fields, sizeof(fields), "%s", plan->stages[i].fault_fields);
         stage_active = -1;
         stage_deadline = 0;
@@ -1090,7 +1309,8 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", d4_board_opened < 0 ? 0 : d4_board_opened,
                  (unsigned)d4_before, (unsigned)d4_after, d4_refused, d4_posted);
         pthread_mutex_unlock(&present_lock);
-    } else if (plan == &plans[0]) {
+    } else if (plan->c_line) {
+        /* hello.exe: milestone c's regression (d1, e1). */
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
         snprintf(fields, sizeof(fields), "hello=%s", ok ? "ok" : exit_text);
     } else {
@@ -1205,6 +1425,22 @@ static void d_lines(void)
         { "exit", PLAY }, { "display", DISPLAY },
     };
     emit_line("PS4WINE d winemine", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* The gated fields and a few measured ones: one netlog datagram carries
+ * at most ~512 bytes (e1's first passing line, 523 bytes, lost its build=
+ * and stages=). The device name and the memory fields are in the stage
+ * records. */
+static void e1_lines(void)
+{
+    enum { LOAD, CAPS, DISPLAY, RELEASE, PRESENT, HELLO };
+    static const LineKey keys[] = {
+        { "vk_load", LOAD }, { "vk_bound", LOAD }, { "inst", CAPS }, { "api", CAPS }, { "maintenance5", CAPS },
+        { "robustness2", CAPS }, { "gpl", CAPS }, { "dyn_rendering", CAPS }, { "xfb", CAPS }, { "display", DISPLAY },
+        { "release", RELEASE }, { "present", PRESENT }, { "frames", PRESENT }, { "gpu_hang", PRESENT },
+        { "swapchain", PRESENT }, { "fps", PRESENT }, { "fb", PRESENT }, { "reopen", PRESENT }, { "hello", HELLO },
+    };
+    emit_line("PS4WINE e1 vk", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void pw_ms_emit_lines(void)

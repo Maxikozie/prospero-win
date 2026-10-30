@@ -24,6 +24,7 @@ extern int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t start, void *c
 extern int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t rate);
 extern int32_t sceVideoOutSubmitFlip(int32_t handle, int32_t index, uint32_t mode, int64_t argument);
 extern int32_t sceVideoOutIsFlipPending(int32_t handle);
+extern int32_t sceVideoOutClose(int32_t handle);
 
 enum {
     WC_GARLIC = 3,
@@ -87,6 +88,18 @@ int pw_videoout_orbis_flip(PwVideoOutOrbis *vo)
     vo->back = (vo->back + 1) % PW_VIDEOOUT_ORBIS_BUFFERS;
     vo->flips++;
     return 0;
+}
+
+int pw_videoout_orbis_close(PwVideoOutOrbis *vo)
+{
+    struct timespec pause = { 0, 1000000 };
+    int rc;
+
+    if (vo->handle < 0) return 0;
+    for (int i = 0; i < 2000 && sceVideoOutIsFlipPending(vo->handle) > 0; i++) nanosleep(&pause, NULL);
+    rc = sceVideoOutClose(vo->handle);
+    vo->handle = -1;
+    return rc ? fail(vo, "sceVideoOutClose", rc) : 0;
 }
 
 int pw_videoout_orbis_save(const PwVideoOutOrbis *vo, const char *path)

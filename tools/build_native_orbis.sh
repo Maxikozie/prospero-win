@@ -18,7 +18,9 @@
 # Usage:
 #   tools/build_native_orbis.sh [--out DIR] [--netlog-host IP] [--netlog-port N]
 #       [--build-id ID] [--data-root DIR]   (the title's root on /data, default /data/prospero-win)
-# Environment: OO_PS4_TOOLCHAIN, ORBIS_COMPAT (include/ and build/), LLVM_BIN.
+# Environment: OO_PS4_TOOLCHAIN, ORBIS_COMPAT (include/ and build/), LLVM_BIN,
+# PW_VULKAN_INCLUDE (the directory holding vulkan/vulkan.h: the milestone e
+# stages drive libvulkan.prx; mesa-ps4's include/).
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
 done
 : "${OO_PS4_TOOLCHAIN:?set OO_PS4_TOOLCHAIN}"
 : "${ORBIS_COMPAT:?set ORBIS_COMPAT (include/ and build/)}"
+[ -f "${PW_VULKAN_INCLUDE:-}/vulkan/vulkan.h" ] || fail "set PW_VULKAN_INCLUDE to a directory holding vulkan/vulkan.h"
 [ -n "${LLVM_BIN:-}" ] && PATH="$LLVM_BIN:$PATH"
 export PATH OO_PS4_TOOLCHAIN
 export ORBIS_COMPAT_INCLUDE="$ORBIS_COMPAT/include"
@@ -67,13 +70,14 @@ fi
 rm -rf "$out"
 mkdir -p "$out/obj"
 common="-std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
--I$root/include -I$root/src -I$root/native -I$root/native/orbis -I$root/wine/ps5 -I$root/wine/orbis \
+-I$root/include -I$root/src -I$root/native -I$root/native/orbis -I$root/wine/ps5 -I$root/wine/orbis -I$PW_VULKAN_INCLUDE \
 -DPW_BUILD_ID=\"$build_id\" -DPW_ORBIS_NETLOG_HOST=\"$netlog_host\" -DPW_ORBIS_NETLOG_PORT=$netlog_port \
 -DPW_ROOT=\"$data_root\""
 sources="native/orbis/wine64_main_orbis.c native/orbis/orbislog/orbislog.c native/pw_diagnostics.c \
 src/pw_result.c src/pw_wine_start.c wine/ps5/pw_wine_prx.c native/orbis/pw_stage_orbis.c \
 native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/pw_pad_orbis.c \
-native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c"
+native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c \
+native/orbis/pw_vk_stage_orbis.c"
 objects=""
 for source in $sources; do
     object=$out/obj/$(basename "${source%.c}").o
@@ -91,6 +95,11 @@ ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
     -lSceVideoOut -lScePad \
     "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" ||
     fail "the title does not link"
+# libc.a has setjmp/longjmp/siglongjmp but no sigsetjmp: a sigsetjmp would bind to libkernel's
+# (FreeBSD's jmp_buf) and pair with musl's siglongjmp (milestone e1: the stage recovery jumped to 0x20).
+if llvm-nm -D "$out/eboot.elf" | grep -qE ' U (sigsetjmp|siglongjmp)$'; then
+    fail "the title imports sigsetjmp/siglongjmp; use setjmp/longjmp (one libc's pair)"
+fi
 
 # The probe modules, linked as tools/build_wine_orbis.sh links the Wine PRXs:
 # pw_probe_mod (the recipe) and pw_probe_tls (the same with libc's TLS

@@ -181,6 +181,14 @@ revision in `SOURCES.txt`). It is linked for the console by
 layer, both GPL-3.0-or-later, so `libvulkan.prx` as a whole is distributed
 under the GPL, version 3.
 
+On the PS4 (branch `orbis`), `libvulkan.prx` is RADV from
+[mesa-ps4](https://github.com/orbis-ports/mesa-ps4) `1a59cc1` (Mesa, MIT, as above), built
+with `-femulated-tls` and linked whole by `tools/build_wine_orbis.sh` with its zlib 1.3.1
+(Zlib licence), the OpenOrbis SDK's static libc and libc++ (as the other Orbis PRXs) and
+prospero-win's own `wine/orbis/pw_vulkan_radv_orbis.c` (entry points and present counters) and
+`wine/orbis/pw_emutls_orbis.c` (the emulated-TLS runtime, written for this tree; no
+compiler-rt code).
+
 Frame generation (a profile's `[display] framegen`) is
 [PS5 MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) by Mihawk,
 GPL-3.0-or-later, vendored in `third_party/mihawkgen/` at the commit in its

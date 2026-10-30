@@ -37,6 +37,13 @@ int pw_videoout_orbis_open(PwVideoOutOrbis *vo);
 static inline uint32_t *pw_videoout_orbis_back(PwVideoOutOrbis *vo) { return vo->buffers[vo->back]; }
 /* Flips the back buffer (vsync), then waits until no flip is pending. */
 int pw_videoout_orbis_flip(PwVideoOutOrbis *vo);
+/* Hands the display over (milestone e: RADV's WSI opens port 255 for the
+ * swapchain and fails while it is open): waits up to 2 s for the last flip,
+ * then closes the port. The buffers' direct memory stays allocated and
+ * mapped: nx-on-orbis measured that freeing it after the close rebooted the
+ * console once a game started. 0, or the close's status (also in
+ * vo->status/failed); a vo this call closed already is 0. */
+int pw_videoout_orbis_close(PwVideoOutOrbis *vo);
 /* The buffer shown last, to <path> through <path>.tmp, fsync and rename:
  * the readback scripts/ps4/fbshot.sh fetches. 0 on success. */
 int pw_videoout_orbis_save(const PwVideoOutOrbis *vo, const char *path);

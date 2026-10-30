@@ -14,7 +14,7 @@
 #
 # Usage:
 #   tools/build_wine_orbis.sh [--check-patches] [--jobs N] [--work DIR]
-#       [--modules "ntdll wineserver win32u"] [--allow-unbound]
+#       [--modules "ntdll wineserver win32u [libvulkan]"] [--allow-unbound]
 #
 # Environment:
 #   OO_PS4_TOOLCHAIN       the OpenOrbis toolchain (required)
@@ -25,6 +25,11 @@
 #                          .deps/wine/build, from tools/build_wine_runtime.sh)
 #   PROSPERO_WINE_ORBIS_WORK  work directory (default .deps/wine-orbis)
 #   LLVM_BIN               directory of clang/ld.lld/llvm-* 18 (default: PATH)
+#   PROSPERO_RADV_ARCHIVE  mesa-ps4's libvulkan_radeon.a built with -femulated-tls
+#                          (no native TLS: see wine/orbis/pw_emutls_orbis.c); when
+#                          set, libvulkan.prx is built too (milestone e)
+#   PROSPERO_RADV_ZLIB     the zlib archive of that build (libz.a)
+#   PW_VULKAN_INCLUDE      the directory holding vulkan/vulkan.h (mesa-ps4's include/)
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -32,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u"
+modules="ntdll wineserver win32u${PROSPERO_RADV_ARCHIVE:+ libvulkan}"
 allow_unbound=0
 check_only=0
 
@@ -201,6 +206,17 @@ done
 for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis pw_wine_dup_orbis; do
     compile_shim "$root/wine/orbis/$unit.c"
 done
+case " $modules " in *" libvulkan "*)
+    # libvulkan.prx's own units: the entry points and present counters over
+    # RADV, and the emulated-TLS runtime RADV's -femulated-tls build calls.
+    [ -f "${PROSPERO_RADV_ARCHIVE:-}" ] || fail "libvulkan needs PROSPERO_RADV_ARCHIVE (mesa-ps4 built with -femulated-tls)"
+    [ -f "${PROSPERO_RADV_ZLIB:-}" ] || fail "libvulkan needs PROSPERO_RADV_ZLIB (the zlib archive of that build)"
+    [ -f "${PW_VULKAN_INCLUDE:-}/vulkan/vulkan.h" ] || fail "libvulkan needs PW_VULKAN_INCLUDE (vulkan/vulkan.h)"
+    "$cc" $shim_cflags -I"$root/wine/orbis" -I"$PW_VULKAN_INCLUDE" -c "$root/wine/orbis/pw_vulkan_radv_orbis.c" \
+        -o "$obj/pw_vulkan_radv_orbis.o" || fail "cannot compile pw_vulkan_radv_orbis.c"
+    compile_shim "$root/wine/orbis/pw_emutls_orbis.c"
+    ;;
+esac
 heap="$obj/pw_wine_heap.o $obj/pw_wine_heap_libc.o"
 dmem="$obj/pw_wine_dmem.o $obj/pw_wine_dmem_ps5.o"
 
@@ -390,6 +406,23 @@ case " $modules " in *" win32u "*)
     # unlisted directory is not searched).
     mkdir -p "$prx/fonts"
     cp "$tree"/fonts/*.ttf "$prx/fonts/"
+    ;;
+esac
+
+case " $modules " in *" libvulkan "*)
+    # RADV (milestone e), which win32u's dlopen("libvulkan.so") loads through
+    # pw_wine_dl beside ntdll.prx: module_start runs its constructors (ACO's
+    # opcode tables), then ntdll's environment is replayed into its own
+    # (pw_wine_setenv: RADV reads ORBIS_*, MESA_* and RADV_* there). Its exit
+    # and stdio wraps, dlfcn and malloc family are ntdll's, as libfreetype's.
+    # The archive is whole: Mesa's entry points are reached through lookup
+    # tables, not by name.
+    [ -f "$prx/ntdll.shared.elf" ] || fail "libvulkan imports from ntdll: build ntdll in the same run"
+    desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_wine_setenv
+    # shellcheck disable=SC2086
+    link_prx libvulkan - "$prx/obj/libvulkan_desc.o $obj/pw_vulkan_radv_orbis.o $obj/pw_emutls_orbis.o \
+        $obj/pw_wine_env_orbis.o --whole-archive $PROSPERO_RADV_ARCHIVE --no-whole-archive $PROSPERO_RADV_ZLIB \
+        $exit_wraps $import_wraps" ntdll
     ;;
 esac
 
