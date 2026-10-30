@@ -28,7 +28,7 @@ index 37fa946..fdc2188 100644
  
  static struct fd *inotify_fd;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +struct poll_watch;
 +#endif
 +
@@ -39,12 +39,12 @@ index 37fa946..fdc2188 100644
      struct process *client_process;  /* client process that has a cache for this directory */
      int             client_entry;    /* entry in client process cache */
      struct list    kernel_object;    /* list of kernel object pointers */
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    struct poll_watch *poll; /* notifications by polling, where there is no inotify */
 +#endif
  };
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +static void poll_watch_free( struct dir *dir );
 +#endif
 +
@@ -55,7 +55,7 @@ index 37fa946..fdc2188 100644
      if (dir->filter)
          remove_change( dir );
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    poll_watch_free( dir );
 +#endif
 +
@@ -66,7 +66,7 @@ index 37fa946..fdc2188 100644
      return 0;
  }
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* The console has no inotify, no dnotify and no kqueue. A directory that is watched is polled: its entries
 + * (and those below it, when the whole subtree is watched) are listed with their identity, size and times,
 + * the list is compared with the last one, and what differs is reported the way inotify would: a name that
@@ -340,7 +340,7 @@ index 37fa946..fdc2188 100644
      dir->mode = mode;
      dir->uid  = ~(uid_t)0;
      dir->client_process = NULL;
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    dir->poll = NULL;
 +#endif
      set_fd_user( fd, &dir_fd_ops, &dir->obj );

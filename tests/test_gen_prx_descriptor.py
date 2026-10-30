@@ -109,9 +109,14 @@ def main() -> int:
         except ValueError:
             continue
         raise AssertionError(f"accepted {bad}")
+    # The PS4 variant carries the module parameter block the SDK's crtlib.o
+    # would otherwise contribute; the PS5 one does not.
+    orbis = gen_prx_descriptor.render(["answer"], orbis=True)
+    assert ".data.sce_module_param" in orbis and "0x13c13f4bf" in orbis and "0x1000051" in orbis
+    assert ".data.sce_module_param" not in gen_prx_descriptor.render(["answer"])
     with contextlib.redirect_stderr(io.StringIO()) as usage:
         assert gen_prx_descriptor.main(["gen", "out.c"]) == 2
-    assert "Usage: gen_prx_descriptor.py OUTPUT.c NAME..." in usage.getvalue()
+    assert "Usage: gen_prx_descriptor.py [--orbis] OUTPUT.c NAME..." in usage.getvalue()
     script = ROOT / "tools/gen_prx_descriptor.py"
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
@@ -121,6 +126,14 @@ def main() -> int:
         assert not (work / "bad.c").exists()
         subprocess.run([sys.executable, str(script), str(work / "descriptor.c"),
                         "answer", "counter_value"], check=True)
+        subprocess.run([sys.executable, str(script), "--orbis", str(work / "descriptor_orbis.c"),
+                        "answer", "counter_value"], check=True)
+        subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-fPIC", f"-I{ROOT / 'wine/ps5'}", "-c", str(work / "descriptor_orbis.c"),
+                        "-o", str(work / "descriptor_orbis.o")], check=True)
+        sections = subprocess.run(["readelf", "-S", "-W", str(work / "descriptor_orbis.o")],
+                                  capture_output=True, text=True, check=True).stdout
+        assert ".data.sce_module_param" in sections
         (work / "module.c").write_text(MODULE)
         cc = os.environ.get("CC", "cc")
         for variant, flags in (("runtime-init", []), ("no-runtime-init", ["-DNO_RUNTIME_INIT", "-nostartfiles"])):

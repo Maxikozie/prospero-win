@@ -26,7 +26,7 @@ index 06eb740914..1bcf453ee8 100644
  
  #include "config.h"
  
-+#if defined(__PROSPERO__) && !defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) && !defined(WINE_INPROCESS_SERVER)
 +/* A PS5 title cannot create processes: the server runs in-process. */
 +#define WINE_INPROCESS_SERVER 1
 +#endif
@@ -43,7 +43,7 @@ index 06eb740914..1bcf453ee8 100644
      }
  
      if (stat( ".", &st ) == -1) fatal_perror( "stat %s", config_dir );
-+#ifndef __PROSPERO__  /* one user; its file systems do not keep unix owners */
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)  /* one user; its file systems do not keep unix owners */
      if (st.st_uid != getuid()) fatal_error( "'%s' is not owned by you\n", config_dir );
 +#endif
  

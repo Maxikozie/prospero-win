@@ -22,7 +22,7 @@ index 77d9c3f..a4e8292 100644
                  fclose(cpuinfo);
              }
          }
-+#elif defined(__PROSPERO__)
++#elif (defined(__PROSPERO__) || defined(__ORBIS__))
 +        {
 +            /* A title cannot read the console's per-CPU counters (kern.cp_times is refused), and the
 +             * title is the only user process it can see: each CPU is taken to have spent this

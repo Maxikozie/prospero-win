@@ -107,7 +107,7 @@ index 66a009b..c6b6713 100644
      for (i = idx >> pages_vprot_shift; i < (end + pages_vprot_mask) >> pages_vprot_shift; i++)
      {
          if (pages_vprot[i]) continue;
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +        /* A leaf is 1 MiB per 4 GiB of views and anon_mmap_alloc takes it
 +         * from the title's flexible memory: a 256 GiB reservation (a .NET
 +         * runtime's) would cost 64 MiB of it. The Unix heap is in direct

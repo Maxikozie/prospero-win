@@ -184,7 +184,7 @@ index 86f8a96..02689a3 100644
              obj_handle_t handle;
              pid               = reply->pid;
              data->tid         = reply->tid;
-+#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(WINE_INPROCESS_SERVER)
 +            data->ps5_mutex_token = 0;
 +#endif
              peb->SessionId    = reply->session_id;
@@ -214,7 +214,7 @@ index 499ebe4..81f3f4d 100644
 
      data->request_fd = request_pipe[1];
      data->tid        = tid;
-+#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(WINE_INPROCESS_SERVER)
 +    data->ps5_mutex_token = 0;
 +#endif
      data->start      = start;
@@ -236,7 +236,7 @@ index ec93497..f9c8f92 100644
      ULONGLONG    ps5_spawn_us;      /* WINE_PS5_WAIT_WATCHDOG: when spawn_thread created it */
      ULONGLONG    ps5_sleep_since;   /* WINE_PS5_WAIT_WATCHDOG: NtDelayExecution calls since */
      unsigned int ps5_sleeps;
-+#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(WINE_INPROCESS_SERVER)
 +    unsigned int ps5_mutex_token; /* occupies the padding before ps5_sleep_asked on x86_64 */
 +#endif
      LONGLONG     ps5_sleep_asked;   /* microseconds of sleep asked since then */

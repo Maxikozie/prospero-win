@@ -23,7 +23,7 @@ index 4b9f0da..1df568f 100644
   "/etc/security/cacerts",  /* Android */
  };
 
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* The console has no certificate store of its own that a title can read,
 + * and the runtime's modules live beside the title: the bundle the package
 + * carries, share/wine/ca-certificates.crt, found from this module's own
@@ -69,7 +69,7 @@ index 4b9f0da..1df568f 100644
      }
  #endif
 
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    load_runtime_root_certs();
 +#endif
      for (i = 0; i < ARRAY_SIZE(CRYPT_knownLocations) && list_empty(&root_cert_list); i++)

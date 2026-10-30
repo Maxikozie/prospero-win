@@ -25,7 +25,7 @@ diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
  /* the in-process server signals threads through this table on PS5 */
  static int (*register_server_thread)( long tid, pthread_t thread );
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* wine/ps5/pw_wine_cwd.h */
 +extern unsigned long *pw_cwd_changes_counter(void);
 +extern void pw_cwd_listings_enable( int enable );
@@ -59,7 +59,7 @@ diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
  
      if (!(module = dlopen( module_path, RTLD_NOW )))
          fatal_error( "cannot load the in-process server %s: %s\n", module_path, dlerror() );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    share_name_changes( module );  /* before the server starts creating files */
 +#endif
      if (!(connect_server = dlsym( module, "pw_wineserver_connect" )))

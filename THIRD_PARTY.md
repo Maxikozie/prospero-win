@@ -24,6 +24,29 @@ The title also contains a tile-address permutation adapted from SDL's PS5
 video backend, Copyright (C) 2026 John Törnblom, under the zlib licence. The
 full notice is in prospero-win's `native/pw_videoout_ps5.c`.
 
+## The PS4 title and the Orbis Wine modules (branch `orbis`)
+
+On the PS4 (Orbis OS) the title and Wine's Unix modules are built with the
+[OpenOrbis toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain) v0.5.4: its
+`link.x`, `crt1.o` and `create-fself` (GPL-3.0), its musl-based `libc.a` (MIT) and
+`libc++` (Apache-2.0 with LLVM exception), and its stub libraries. As on the PS5, the title
+combines that startup code with prospero-win's, so `eboot.bin` is distributed under the GPL,
+version 3; the Wine PRXs link the static libc and libc++ and prospero-win's own code stays
+LGPL. `tools/build_wine_orbis.sh` and `tools/build_native_orbis.sh` reference the SDK's linker
+script by path; nothing of the SDK is copied into this tree.
+
+[orbis-compat](https://github.com/orbis-ports/orbis-compat) `6922a7b` (MIT) supplies the header
+overlay and `liborbis-compat.a` (corrected `struct stat`, pthread sizes, paths, `sigaltstack`)
+that the PRXs and the title link; `tools/gen_prx_descriptor.py --orbis` restates the layout of its
+module parameter block (size, magic, SDK version: three numbers measured from the SDK's
+`crtlib.o`).
+
+`wine/orbis/include/` restates FreeBSD 9 amd64 ABI facts (signal numbers and flags,
+`mcontext_t`, selectors, trap numbers, socket and kevent layouts, cdio, sysctl and mount
+constants) from FreeBSD's `sys/` headers (BSD-2-Clause, the FreeBSD Project); the values are the
+kernel ABI the console implements, with the offsets measured on the PS5 and the PS4 on the
+consoles noted in each file.
+
 ## The privilege helper: `lapy.elf`
 
 `lapy.elf` is the prebuilt

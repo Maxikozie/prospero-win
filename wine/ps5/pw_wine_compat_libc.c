@@ -10,8 +10,12 @@
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __ORBIS__
+#include <sys/mount.h>    /* the OpenOrbis SDK has no sys/extattr.h; the overlay's FreeBSD struct statfs */
+#else
 #include <sys/extattr.h>
 #include <sys/mount.h>
+#endif
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/thr.h>
@@ -46,8 +50,14 @@ int posix_fadvise(int fd,off_t offset,off_t length,int advice)
 unsigned int if_nametoindex(const char *name){return pw_compat_if_nametoindex(name);}
 int fstatfs(int fd,struct statfs *buf){(void)fd;(void)buf;return pw_compat_no_fstatfs();}
 int link(const char *from,const char *to){(void)from;(void)to;return pw_compat_no_link();}
+#ifdef __ORBIS__
+/* The OpenOrbis SDK's prototype takes void *; FreeBSD's caddr_t. */
+int ptrace(int request,pid_t pid,void *address,int data)
+{(void)request;(void)pid;(void)address;(void)data;return (int)pw_compat_no_ptrace();}
+#else
 int ptrace(int request,pid_t pid,caddr_t address,int data)
 {(void)request;(void)pid;(void)address;(void)data;return (int)pw_compat_no_ptrace();}
+#endif
 mode_t umask(mode_t mask){return pw_compat_umask(mask);}
 char *nl_langinfo(nl_item item){return (char *)(item==CODESET?pw_compat_codeset():"");}
 clock_t times(struct tms *buffer){return pw_compat_times(buffer);}

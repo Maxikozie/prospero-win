@@ -18,6 +18,9 @@
 #   tools/build_host_wine.sh [--source DIR] [--work DIR] [--jobs N]
 # prints the installed wine's path last. --source is a checkout of Wine that
 # has WINE_COMMIT (default .deps/wine/source, as build_wine_ps5.sh).
+# PROSPERO_WINE_CONFIGURE_EXTRA adds configure arguments, for a PC without the
+# optional development packages ("--without-x --without-freetype" gives a
+# headless Wine that still initialises prefixes and runs console programs).
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -68,9 +71,14 @@ cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
 cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
     fail "cannot stage shared-input ABI"
 
-configure_args="--prefix=/usr --enable-archs=i386,x86_64 --disable-tests"
+configure_args="--prefix=/usr --enable-archs=i386,x86_64 --disable-tests${PROSPERO_WINE_CONFIGURE_EXTRA:+ $PROSPERO_WINE_CONFIGURE_EXTRA}"
+# The stamp covers the console series (0100-0999); the Orbis-only patches
+# (1000-1499, __ORBIS__) are inert on the PC, so changing one re-applies the
+# series and lets make rebuild what changed instead of starting over.
 stamp=$({ printf '%s\n' "$commit" "$configure_args"
-          for patch in $ordered; do cat "$patches/$patch"; done; } | sha256sum | cut -c1-64)
+          for patch in $ordered; do
+              [ "$(printf '%s' "$patch" | cut -c1-4)" -ge 1000 ] || cat "$patches/$patch"
+          done; } | sha256sum | cut -c1-64)
 build=$work/build
 if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.prospero-stamp" 2>/dev/null)" != "$stamp" ]; then
     rm -rf "$build"

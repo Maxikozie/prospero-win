@@ -34,7 +34,7 @@ index 6c254e6..dedaa63 100644
      char           *unix_name;  /* name to unlink on close, points to parent fd unix_name */
  };
  
-+#if defined(__PROSPERO__) && !defined(PS5_PARK_DIRECTORIES)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) && !defined(PS5_PARK_DIRECTORIES)
 +#define PS5_PARK_DIRECTORIES
 +#endif
 +

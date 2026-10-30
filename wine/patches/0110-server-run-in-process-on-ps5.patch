@@ -214,7 +214,7 @@ index 5135ed50cf..44ff43012e 100644
              fatal_error( "lstat %s: %s\n", name, strerror( errno ));
      }
      if (!S_ISDIR(st->st_mode)) fatal_error( "%s is not a directory\n", name );
-+#ifndef __PROSPERO__  /* one user; its file systems do not keep unix owners */
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)  /* one user; its file systems do not keep unix owners */
      if (st->st_uid != getuid()) fatal_error( "%s is not owned by you\n", name );
      if (st->st_mode & 077) fatal_error( "%s must not be accessible by other users\n", name );
 +#endif
@@ -226,7 +226,7 @@ index 5135ed50cf..44ff43012e 100644
      /* create the base directory if needed */
  
 -#ifdef __ANDROID__  /* there's no /tmp dir on Android */
-+#if defined(__ANDROID__) || defined(__PROSPERO__)  /* there's no /tmp dir on Android or PS5 */
++#if defined(__ANDROID__) || (defined(__PROSPERO__) || defined(__ORBIS__))  /* there's no /tmp dir on Android or PS5 */
      if (asprintf( &base_dir, "%s/.wineserver", config_dir ) == -1)
          fatal_error( "out of memory\n" );
  #else
@@ -290,7 +290,7 @@ index 68229d10bf..397f6625cb 100644
  extern void read_request( struct thread *thread );
  extern void write_reply( struct thread *thread );
  extern timeout_t monotonic_counter(void);
-+#if defined(__PROSPERO__) && !defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) && !defined(WINE_INPROCESS_SERVER)
 +/* A PS5 title cannot create processes: the server runs on a thread of the
 + * process that hosts Wine and receives its clients through a socketpair. */
 +#define WINE_INPROCESS_SERVER 1

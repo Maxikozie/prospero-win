@@ -18,7 +18,7 @@ index 2a00ad5b32..46064fc40b 100644
  #endif
  
 -#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)
-+#if defined(__PROSPERO__)
++#if (defined(__PROSPERO__) || defined(__ORBIS__))
 +/* A PS5 title has no fstab and no device nodes for its drives, and its libc
 + * does not provide getfsent: there is never a default device to report. */
 +static char *parse_mount_entries( FILE *f, dev_t dev, ino_t ino )

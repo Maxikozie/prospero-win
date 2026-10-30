@@ -29,7 +29,7 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
 + */
 +static int enter_directory( HANDLE handle, int fd )
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    char *unix_name;
 +    int ret;
 +

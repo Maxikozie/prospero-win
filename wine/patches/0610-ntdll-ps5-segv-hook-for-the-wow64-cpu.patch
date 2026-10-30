@@ -22,7 +22,7 @@ index 4c21268..1aae754 100644
  }
  
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* A WoW64 CPU backend that lets translated accesses fault instead of
 + * checking them resumes those faults itself, through this hook rather than
 + * a SIGSEGV handler of its own: the previous action sigaction reports here
@@ -48,7 +48,7 @@ index 4c21268..1aae754 100644
      struct xcontext context;
      EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    if (segv_hook && segv_hook( siginfo, _sigcontext )) return;
 +#endif
 +    data = init_handler( sigcontext );

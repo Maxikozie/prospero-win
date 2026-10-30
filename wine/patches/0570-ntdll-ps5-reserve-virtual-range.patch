@@ -28,7 +28,7 @@ index 0a83dfd251..99228f07cb 100644
  }
  
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* libkernel: claim address space without committing memory. Unlike
 + * mmap( NULL ), whose placement region fills after a few hundred MiB, a
 + * reservation can cover the whole low 4 GiB that WoW64 needs. */
@@ -45,7 +45,7 @@ index 0a83dfd251..99228f07cb 100644
      ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
  #elif defined(MAP_TRYFIXED)
      ptr = mmap( start, size, prot, MAP_TRYFIXED | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
-+#elif defined(__PROSPERO__)
++#elif (defined(__PROSPERO__) || defined(__ORBIS__))
 +    /* The kernel ignores MAP_EXCL, so claim the range with a reservation
 +     * that refuses to overwrite, then map over it if needed. */
 +    ptr = start;
@@ -66,7 +66,7 @@ index 0a83dfd251..99228f07cb 100644
      /* if we don't have a preloader, try to reserve the space now */
      reserve_area( (void *)0x000000010000, (void *)0x000068000000 );
      reserve_area( (void *)0x00007f000000, (void *)0x00007fff0000 );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* User space ends far below 0x7ffffe000000; reserve room for the view
 +     * heap wherever the kernel has space above 4 GiB. */
 +    {

@@ -21,7 +21,7 @@ index 17160e976c..08e048d798 100644
  
      limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
      if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* An i386 image only runs below 4 GiB. When its preferred base is taken,
 +     * the last resort below is any address, which map_view gives from the
 +     * high reserved area first (0600). */

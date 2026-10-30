@@ -111,10 +111,10 @@ index 7d97745..dc7c269 100644
  
  /* PS5 hosts use 16 KiB pages: keep 4 KiB Windows pages over a larger host
 - * page, the same scheme as 16 KiB-page aarch64 hosts. */
--#if defined(__aarch64__) || defined(__PROSPERO__)
+-#if defined(__aarch64__) || (defined(__PROSPERO__) || defined(__ORBIS__))
 + * page, the same scheme as 16 KiB-page aarch64 hosts. An x86-64 PC can keep
 + * larger host pages too (WINE_HOST_PAGE_SIZE), to run the console's scheme. */
-+#if defined(__aarch64__) || defined(__PROSPERO__) || defined(__x86_64__)
++#if defined(__aarch64__) || (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(__x86_64__)
  static UINT_PTR host_page_size;
  static UINT_PTR host_page_mask;
  #else
@@ -122,7 +122,7 @@ index 7d97745..dc7c269 100644
      struct list *ptr, *next;
      void *end, *area_end;
  
-+#if defined(__x86_64__) && !defined(__PROSPERO__)
++#if defined(__x86_64__) && !(defined(__PROSPERO__) || defined(__ORBIS__))
 +    if (host_page_size > page_size)  /* WINE_HOST_PAGE_SIZE: the preloader's areas are 4 KiB-aligned */
 +    {
 +        char *start = ROUND_ADDR( (char *)addr + host_page_mask, host_page_mask );
@@ -219,10 +219,10 @@ index 7d97745..dc7c269 100644
      pthread_mutex_init( &virtual_mutex, &attr );
      pthread_mutexattr_destroy( &attr );
  
--#if defined(__aarch64__) || defined(__PROSPERO__)
-+#if defined(__aarch64__) || defined(__PROSPERO__) || defined(__x86_64__)
+-#if defined(__aarch64__) || (defined(__PROSPERO__) || defined(__ORBIS__))
++#if defined(__aarch64__) || (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(__x86_64__)
      host_page_size = sysconf( _SC_PAGESIZE );
-+#if defined(__x86_64__) && !defined(__PROSPERO__)
++#if defined(__x86_64__) && !(defined(__PROSPERO__) || defined(__ORBIS__))
 +    {
 +        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
 +        UINT_PTR size = env ? strtoul( env, NULL, 0 ) : 0;
@@ -344,7 +344,7 @@ index 67a6c18..a66c23a 100644
  void init_memory(void)
  {
      host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
-+#if defined(__x86_64__) && !defined(__PROSPERO__)
++#if defined(__x86_64__) && !(defined(__PROSPERO__) || defined(__ORBIS__))
 +    {
 +        /* ntdll's WINE_HOST_PAGE_SIZE: sections are sized to the host page it keeps */
 +        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );

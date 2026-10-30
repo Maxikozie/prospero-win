@@ -19,7 +19,7 @@ index d234b20481..a11cc77666 100644
      pid_t pid, wret;
      int fd[2], status, err;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    return STATUS_NOT_SUPPORTED;  /* no fork/exec in a PS5 title */
 +#endif
 +
@@ -30,7 +30,7 @@ index d234b20481..a11cc77666 100644
      data_size_t handles_size, jobs_size;
      obj_handle_t *handles, *jobs;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* A PS5 title is a single process: it can neither fork nor exec, so
 +     * Windows process creation fails cleanly instead of spawning a loader. */
 +    TRACE( "process creation is not supported on PS5\n" );

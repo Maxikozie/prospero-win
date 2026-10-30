@@ -25,7 +25,7 @@ index 99228f07cb..17160e976c 100644
      return TRUE;
  }
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* wine/ps5/pw_wine_dmem_ps5.c, linked into ntdll: anonymous memory in the
 + * reserved areas comes from the console's direct memory instead of its
 + * ~440 MiB of flexible memory; every other call passes through. */
@@ -71,7 +71,7 @@ index 99228f07cb..17160e976c 100644
  
      if (!((intptr_t)addr + size)) size -= host_page_size;  /* avoid wrap-around */
      end = (char *)addr + size;
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    __wine_ps5_dmem_region( addr, size );
 +#endif
  
@@ -105,7 +105,7 @@ index 99228f07cb..17160e976c 100644
          if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
          if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +        /* An allocation free to go anywhere goes above 4 GiB first, leaving
 +         * the low reserved areas to the i386 guest. */
 +        if ((char *)end > (char *)PS5_HIGH_BASE &&

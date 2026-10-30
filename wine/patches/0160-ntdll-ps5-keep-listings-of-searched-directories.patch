@@ -43,7 +43,7 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
  static BOOLEAN get_dir_case_sensitivity_stat( int root_fd, const char *dir )
  {
 -#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* A title has no fstatfs (pw_wine_compat answers ENOSYS), so the FreeBSD
 +     * method below always answered TRUE, after an openat and a close. */
 +    return TRUE;
@@ -55,7 +55,7 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
  }
  
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* wine/ps5/pw_wine_cwd.h: a directory's names, kept in memory while no name
 + * in it can have changed */
 +extern int pw_cwd_scan_directory( int dirfd, const char *path, int (*visit)( const char *name, void *context ),
@@ -114,7 +114,7 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
 -                                  BOOLEAN check_case )
 +                                  BOOLEAN check_case, BOOLEAN *no_reparse )
  {
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    struct dir_match match;
 +    unsigned int flags;
 +#else
@@ -135,7 +135,7 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
      }
  #endif /* VFAT_IOCTL_READDIR_BOTH */
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* Each system call costs microseconds on the console, and the loaders that
 +     * look for a file in an override folder before every open miss there on
 +     * almost every lookup: the names come from memory while the directory

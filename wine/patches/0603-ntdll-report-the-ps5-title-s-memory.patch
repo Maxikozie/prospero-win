@@ -25,7 +25,7 @@ diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
      }
  }
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* wine/ps5/pw_wine_dmem_ps5.c: the title's memory, not the console's. */
 +extern void __wine_ps5_memory_budget( unsigned long long *total, unsigned long long *available );
 +#endif
@@ -37,7 +37,7 @@ diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
      }
  #endif
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    {
 +        /* The sandbox's BSD readings may be zero. Use the title's memory
 +         * budget and an equally sized synthetic page-file budget; this
@@ -65,7 +65,7 @@ diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
  void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
  {
 -#if defined(HAVE_SYSINFO) \
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* Include MmLowestPhysicalPage below when reporting the title's budget. */
 +    extern void __wine_ps5_memory_budget( unsigned long long *total, unsigned long long *available );
 +    unsigned long long total, available;

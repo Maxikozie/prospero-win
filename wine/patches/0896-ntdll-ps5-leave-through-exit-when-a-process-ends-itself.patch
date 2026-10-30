@@ -25,7 +25,7 @@ index a11cc77666..2ff204ba24 100644
      {
          if (!handle) process_exiting = TRUE;
          else if (process_exiting) exit_process( exit_code );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +        else
 +        {
 +            /* _exit skips the exit handlers a title restarts into its

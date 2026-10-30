@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# The C compiler for Wine's Unix side on the PS4: LLVM 18's clang driven at
+# the OpenOrbis target with the header overlays and the flags every Orbis
+# object needs, so that Wine's configure and make can use it as CC.
+#
+#   wine/orbis/include     FreeBSD signal, trap, selector and thread headers
+#                          (the SDK's are musl's over a FreeBSD kernel)
+#   orbis-compat/include   struct stat, pthread attribute sizes, sysctl, umtx,
+#                          the sigaltstack and SA_* repairs, orbis_prefix.h
+#   $OO_PS4_TOOLCHAIN/include  the SDK
+#
+# A link step (no -c/-S/-E) gets the SDK's crt and libraries so configure's
+# "compiler works" and "library exists" probes link; Wine's own modules are
+# relinked as PRXs by tools/build_wine_orbis.sh and never run this link.
+#
+# Environment: OO_PS4_TOOLCHAIN (required), ORBIS_COMPAT_INCLUDE (required),
+# ORBIS_CLANG (default clang; LLVM 18), ORBIS_CFLAGS_EXTRA.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+: "${OO_PS4_TOOLCHAIN:?set OO_PS4_TOOLCHAIN to the OpenOrbis toolchain}"
+: "${ORBIS_COMPAT_INCLUDE:?set ORBIS_COMPAT_INCLUDE to orbis-compat's include directory}"
+clang=${ORBIS_CLANG:-clang}
+
+link=1
+for arg in "$@"; do
+    case $arg in
+    -c|-S|-E|-M|-MM|--version|-v|-dumpmachine|-dumpversion|-print-*) link=0 ;;
+    esac
+done
+
+set -- --target=x86_64-pc-freebsd12-elf -isysroot "$OO_PS4_TOOLCHAIN" \
+    -isystem "$root/wine/orbis/include" -isystem "$ORBIS_COMPAT_INCLUDE" \
+    -isystem "$OO_PS4_TOOLCHAIN/include" -include orbis_prefix.h \
+    -D__ORBIS__ -D_BSD_SOURCE -march=btver2 -fno-omit-frame-pointer -fPIC -funwind-tables \
+    ${ORBIS_CFLAGS_EXTRA:-} "$@"
+if [ "$link" = 1 ]; then
+    set -- -fuse-ld=lld "$@"
+    # Shared objects (Wine's .so targets) link as ld.lld -shared does; an
+    # executable (configure's probes) gets the SDK's crt1.o and libraries.
+    shared=0
+    for arg in "$@"; do [ "$arg" != -shared ] || shared=1; done
+    if [ "$shared" = 1 ]; then
+        set -- "$@" -nostdlib -L"$OO_PS4_TOOLCHAIN/lib" -Wl,--warn-unresolved-symbols
+    else
+        set -- "$@" -nostdlib -L"$OO_PS4_TOOLCHAIN/lib" -pie "$OO_PS4_TOOLCHAIN/lib/crt1.o" \
+            -lc -lkernel -lSceNet -lSceSystemService -lSceUserService
+    fi
+fi
+exec "$clang" "$@"

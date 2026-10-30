@@ -22,7 +22,7 @@ index 9f429e23e3..a9eccb6b11 100644
          {
              while (p > dir + 1 && p[-1] == '/') p--;
              *p = 0;
-+#ifndef __PROSPERO__  /* one user; its file systems do not keep unix owners */
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)  /* one user; its file systems do not keep unix owners */
              if (!stat( dir, &st ) && st.st_uid != getuid())
                  fatal_error( "'%s' is not owned by you, refusing to create a configuration directory there\n", dir );
 +#endif

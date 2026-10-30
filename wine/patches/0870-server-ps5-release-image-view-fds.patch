@@ -31,7 +31,7 @@ pw_image_view_fd_release containing exactly 1 with optional newline.
 +/* Opt-in resource cleanup; read the prefix setting once, without retaining a file. */
 +int ps5_image_view_fd_release_enabled(void)
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    static int enabled = -1;
 +    const char *value;
 +    char buffer[3];

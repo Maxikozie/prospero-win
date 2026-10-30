@@ -31,7 +31,7 @@ index 8cf36c581d..403849bd3a 100644
 @@ -1013,6 +1013,14 @@ static void mmap_init( const struct preload_info *preload_info )
      reserve_area( (void *)0x000000010000, (void *)0x000068000000 );
      reserve_area( (void *)0x00007f000000, (void *)0x00007fff0000 );
- #ifdef __PROSPERO__
+ #if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* Linux leaves 0x68000000-0x7f000000 to its own libraries; the console
 +     * has none there, and it is where the i386 builtin DLLs and many of a
 +     * game's DLLs go. Unreserved, every image view there is a plain fixed

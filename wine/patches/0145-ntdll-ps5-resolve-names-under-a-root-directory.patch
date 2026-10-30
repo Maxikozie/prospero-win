@@ -26,7 +26,7 @@ index ec35dea..48b58c3 100644
  }
  
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +extern void pw_cwd_track( int fd, const char *absolute );
 +#endif
 +
@@ -37,7 +37,7 @@ index ec35dea..48b58c3 100644
 + */
 +static void track_root_directory( HANDLE handle, int fd )
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    char *unix_name;
 +
 +    /* The descriptor came from the in-process server, so this module's

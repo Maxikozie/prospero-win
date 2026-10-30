@@ -25,7 +25,7 @@ index 7a7b3be..394a46e 100644
  extern NTSTATUS ps5_qpc_anchor( void *args );
  #include "../pw_qpc_clock.h"
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* Games poll some classes every frame: Call of Juarez Gunslinger asks for
 + * ProcessAffinityMask 60 times a second, and with the title's +process
 + * default that one line filled its whole log, so the +loaddll lines that
@@ -47,7 +47,7 @@ index 7a7b3be..394a46e 100644
      unsigned int ret = STATUS_SUCCESS;
      ULONG len = 0;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    if (TRACE_ON(process) && first_query( class ))
 +#endif
      TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, class, info, size, ret_len );

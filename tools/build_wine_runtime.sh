@@ -24,6 +24,10 @@
 #   PROSPERO_WINE_BUILD    build directory  (default <build-root>/build)
 #   PROSPERO_WINE_OUT      staged runtime   (default .deps/wine-runtime)
 #   PROSPERO_WINE_GIT      clone URL used when --source does not exist
+#   PROSPERO_WINE_CONFIGURE_EXTRA  extra configure arguments for a host without
+#                          the optional development packages (for example
+#                          "--without-x --without-freetype"; the PE modules do
+#                          not depend on them). Recorded in the manifest.
 set -eu
 
 WINE_COMMIT=490f6d5dcbb2a5047345b8af88d114bbcaad69a8
@@ -42,7 +46,7 @@ LIBRARY=lib/i386-windows
 # run asked for c_437.nls and crashed on the unset table pointer that a refused
 # codepage request left behind.
 DATA_SUFFIX=".nls"
-CONFIGURE_ARGS="--enable-archs=i386,x86_64 --disable-tests"
+CONFIGURE_ARGS="--enable-archs=i386,x86_64 --disable-tests${PROSPERO_WINE_CONFIGURE_EXTRA:+ $PROSPERO_WINE_CONFIGURE_EXTRA}"
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 default_root="$root/.deps/wine"

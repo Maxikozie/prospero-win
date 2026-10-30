@@ -9,7 +9,12 @@
  * protected with sceKernelMprotect; execute permission is refused at map
  * time but granted by mprotect. A self-check maps, writes, protects and
  * frees one page before the first region is taken; if any step fails, the
- * regions stay ordinary reservations and every call passes through. */
+ * regions stay ordinary reservations and every call passes through.
+ *
+ * On the PS4 (__ORBIS__) the same recipe runs over sceKernelAllocateDirectMemory
+ * (one pool, WB_ONION) and the same map, protect and reserve calls, which the
+ * PS4 port's milestone a probe measured: a 16 KiB granule, 16 GiB reservations,
+ * execute granted by mprotect after a read-write map. */
 #include "pw_wine_dmem.h"
 #include "pw_wine_heap.h"
 #include <errno.h>
@@ -20,7 +25,16 @@
 #include <sys/mman.h>
 
 extern int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment);
+#ifdef __ORBIS__
+/* The PS4 has one direct-memory pool, allocated by physical range: the whole
+ * pool, any free block. Type 0 is SCE_KERNEL_WB_ONION (CPU-cached memory);
+ * mapping with the GPU bits and executing after sceKernelMprotect were
+ * measured on the console (the PS4 port's milestone a probe). */
+extern int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t bytes, size_t alignment, int type,
+                                         int64_t *offset);
+#else
 extern int sceKernelAllocateMainDirectMemory(size_t bytes, size_t alignment, int type, int64_t *offset);
+#endif
 extern int sceKernelMapDirectMemory(void **address, size_t bytes, int protection, int flags,
                                     int64_t offset, size_t alignment);
 extern int sceKernelMprotect(const void *address, size_t bytes, int protection);
@@ -34,7 +48,11 @@ enum {
     PAGE = 0x4000,
     KERNEL_FIXED = 0x10,
     KERNEL_NO_OVERWRITE = 0x80,
+#ifdef __ORBIS__
+    MEMORY_TYPE = 0x00,       /* SCE_KERNEL_WB_ONION */
+#else
     MEMORY_TYPE = 0x0c,       /* as ps5-xash3d's heap */
+#endif
     CPU_READ_WRITE = 0x03,
     CPU_GPU_READ_WRITE = 0xf2,  /* what ps5-xash3d's heap maps with */
     RUNS = 32768,
@@ -84,7 +102,12 @@ static int allocate(void *context, size_t bytes, int64_t *offset)
     uint64_t t0 = slow_start();
     int rc;
     (void)context;
+#ifdef __ORBIS__
+    rc = sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), bytes, PAGE, MEMORY_TYPE,
+                                       offset) != 0;
+#else
     rc = sceKernelAllocateMainDirectMemory(bytes, PAGE, MEMORY_TYPE, offset) != 0;
+#endif
     slow_end(t0, "allocate", bytes);
     return rc;
 }

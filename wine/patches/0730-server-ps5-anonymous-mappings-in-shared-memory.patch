@@ -39,7 +39,7 @@ index 65bebaa..9294dec 100644
 +/* create the unix fd behind an anonymous mapping */
 +static int create_anonymous_mapping_fd( file_pos_t size )
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* There is no memfd on the PS5, so a temp file lives on the console's
 +     * storage: every write through a view dirties the page cache of an
 +     * unlinked file, and closing the last fd of one was seen to block for

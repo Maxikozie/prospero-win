@@ -530,7 +530,7 @@ index 5e3f7550a4..a5e331fcff 100644
  #include "wine/unixlib.h"
  #include "wine/debug.h"
 +
-+#if defined(__PROSPERO__) && !defined(WINE_PS5_USER_DRIVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) && !defined(WINE_PS5_USER_DRIVER)
 +/* A PS5 title has no explorer and no display driver dll: win32u carries
 + * its own user driver (ps5drv.c) and the server creates the desktop. */
 +#define WINE_PS5_USER_DRIVER 1

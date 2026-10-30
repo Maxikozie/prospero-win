@@ -34,7 +34,7 @@ index 394a46e..1b2e7a6 100644
  #include "../pw_qpc_clock.h"
 +#include "../pw_title_menu.h"
 +
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* wine/ps5/pw_wine_sink.c: the menu the title wants drawn. */
 +extern void pw_wine_menu( struct pw_title_menu *menu );
 +#endif
@@ -45,7 +45,7 @@ index 394a46e..1b2e7a6 100644
 + * drawing can be checked without a console. */
 +static NTSTATUS title_menu( struct pw_title_menu *menu )
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    pw_wine_menu( menu );
 +    return STATUS_SUCCESS;
 +#else
@@ -69,7 +69,7 @@ index 394a46e..1b2e7a6 100644
 +#endif
 +}
  
- #ifdef __PROSPERO__
+ #if defined(__PROSPERO__) || defined(__ORBIS__)
  /* Games poll some classes every frame: Call of Juarez Gunslinger asks for
 @@ -1142,6 +1178,7 @@ static BOOL first_query( PROCESSINFOCLASS class )
      static unsigned int queried[4];

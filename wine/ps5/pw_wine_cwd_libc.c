@@ -22,6 +22,9 @@
  * Wine's lookups of names that are not found; see pw_wine_cwd.h. */
 #include "pw_wine_cwd.h"
 #include <dirent.h>
+#ifdef __ORBIS__
+#include <sys/mount.h>    /* the overlay's FreeBSD struct statfs for __wrap_statfs */
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>

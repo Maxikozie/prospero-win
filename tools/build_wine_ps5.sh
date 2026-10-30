@@ -147,8 +147,11 @@ done
 
 [ -z "$ps5vk_sdk" ] || [ -z "$radv" ] || fail "--ps5vk-sdk and --radv both name libvulkan.prx; give one"
 
-# The series: NNNN-lower-case-name.patch, unique numbers below 1000, each a
+# The series: NNNN-lower-case-name.patch, unique numbers 0100-1499, each a
 # mail-formatted patch with a subject. Printed in the order it is applied.
+# 0100-0999 are the console series shared by the PS5 and the PS4 (gates
+# widened by tools/widen_console_gates.py); 1000-1499 are Orbis (PS4) only,
+# under __ORBIS__, so they are inert here and in the host build.
 series() {
     [ -d "$patches" ] || fail "no patch directory $patches"
     last=-1
@@ -161,8 +164,8 @@ series() {
             fail "patch name must be NNNN-lower-case-words.patch: $patch"
         number=$(printf '%s' "$patch" | cut -c1-4 | sed 's/^0*//')
         number=${number:-0}
-        [ "$number" -ge 100 ] && [ "$number" -le 999 ] ||
-            fail "patch number outside 0100-0999: $patch"
+        [ "$number" -ge 100 ] && [ "$number" -le 1499 ] ||
+            fail "patch number outside 0100-1499: $patch"
         [ "$number" -ne "$last" ] || fail "duplicate patch number: $patch"
         last=$number
         grep -q '^Subject: ' "$patches/$patch" || fail "patch has no Subject: $patch"

@@ -96,10 +96,19 @@ int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t
     if (at == MAP_FAILED) return (int)0x8002000c;
     return 0;
 }
+#ifdef __ORBIS__
+/* The PS4's call: the pool's range, any free block. */
+int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t bytes, size_t alignment, int type,
+                                  int64_t *offset)
+{
+    unsigned count = (unsigned)(bytes / PAGE), run = 0;
+    assert(start == 0 && end == (int64_t)budget_pool && alignment == PAGE && type == 0);
+#else
 int sceKernelAllocateMainDirectMemory(size_t bytes, size_t alignment, int type, int64_t *offset)
 {
     unsigned count = (unsigned)(bytes / PAGE), run = 0;
     assert(alignment == PAGE && type == 0x0c);
+#endif
     for (unsigned p = 0; p < PHYS_PAGES; p++) {
         run = allocated[p] ? 0 : run + 1;
         if (run == count) {

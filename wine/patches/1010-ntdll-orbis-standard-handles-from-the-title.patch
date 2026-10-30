@@ -1,0 +1,37 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: orbis: standard handles from the title's descriptors
+
+A PS4 title cannot dup2 onto fd 1 or 2 (refused, measured on the console,
+as on the PS5), so the forwarding socket pairs the title makes for a
+program's output keep their numbers; PW_ORBIS_STDOUT_FD and
+PW_ORBIS_STDERR_FD name them and the initial standard handles are made
+from those descriptors instead of 1 and 2.
+
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 606f3480f2..27cc5248af 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1341,10 +1341,21 @@ static void add_registry_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
+ static void get_initial_console( RTL_USER_PROCESS_PARAMETERS *params )
+ {
+     int output_fd = -1;
++    int stdout_fd = 1, stderr_fd = 2;
+ 
++#ifdef __ORBIS__
++    /* A PS4 title cannot put a descriptor of its own on 1 or 2 (dup2 onto
++     * them is refused, measured), so the title names the writer ends of its
++     * forwarding socket pairs and the standard handles are made from those. */
++    {
++        const char *var;
++        if ((var = getenv( "PW_ORBIS_STDOUT_FD" )) && atoi( var ) > 2) stdout_fd = atoi( var );
++        if ((var = getenv( "PW_ORBIS_STDERR_FD" )) && atoi( var ) > 2) stderr_fd = atoi( var );
++    }
++#endif
+     wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
+-    wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+-    wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
++    wine_server_fd_to_handle( stdout_fd, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
++    wine_server_fd_to_handle( stderr_fd, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
+ 
+     if (main_image_info.SubSystemType != IMAGE_SUBSYSTEM_WINDOWS_CUI)
+         return;

@@ -23,7 +23,7 @@ index a4e8292..a8b5939 100644
   *
   * Init a couple of places with CPU related information.
   */
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* sys/cpuset.h's cpuset_t is wider than the set the console's kernel takes,
 + * which is 64 bits wide (measured), so declare the call with that. */
 +extern int cpuset_getaffinity( int level, int which, id_t id, size_t size, ULONGLONG *mask );
@@ -52,7 +52,7 @@ index a4e8292..a8b5939 100644
          num = 1;
          WARN("Failed to detect the number of processors.\n");
      }
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    num = ps5_process_cpus( num );
 +#endif
  #elif defined(CTL_HW) && defined(HW_NCPU)

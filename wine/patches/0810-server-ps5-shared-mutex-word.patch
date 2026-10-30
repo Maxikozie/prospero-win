@@ -763,7 +763,7 @@ index 5a0830a..4904aac 100644
      struct list            desktop_entry; /* entry in per-desktop thread list */
      struct process        *process;
      thread_id_t            id;            /* thread id */
-+#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) || defined(WINE_INPROCESS_SERVER)
 +    unsigned int           ps5_mutex_token; /* monotonic token; never reuse Wine tid */
 +#endif
      struct list            mutex_list;    /* list of currently owned mutexes */

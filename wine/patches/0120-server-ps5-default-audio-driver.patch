@@ -20,7 +20,7 @@ diff --git a/server/registry.c b/server/registry.c
      free( current_user_path );
      load_init_registry_from_file( "user.reg", hkcu );
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* The console has one audio device, which the PS5 driver (wineps5)
 +     * plays through the title; none in mmdevapi's default list can load.
 +     * A prefix that names its own audio drivers keeps them. */

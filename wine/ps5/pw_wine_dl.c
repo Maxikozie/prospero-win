@@ -134,6 +134,23 @@ static void *open_locked(const char *path)
     int (*start)(size_t,const void *)=(int (*)(size_t,const void *))
         (uintptr_t)pw_prx_lookup(module->descriptor,"module_start");
     if(start)(void)start(0,NULL);
+#ifdef __ORBIS__
+    {
+        /* Each PS4 module has its own environ: give the new one ours
+         * (wine/orbis/pw_wine_env_orbis.c). */
+        extern void pw_wine_env_replicate(int (*)(const char *,const char *));
+        typedef void (*PwExitHook)(void *,int,const char *);
+        extern void pw_wine_get_exit_hook(PwExitHook *,void **);
+        int (*set)(const char *,const char *)=(int (*)(const char *,const char *))
+            (uintptr_t)pw_prx_lookup(module->descriptor,"pw_wine_setenv");
+        void (*set_hook)(PwExitHook,void *)=(void (*)(PwExitHook,void *))
+            (uintptr_t)pw_prx_lookup(module->descriptor,"pw_wine_set_exit_hook");
+        if(set)pw_wine_env_replicate(set);
+        /* And the title's exit hook: a module's exit() must not reach the
+         * kernel either (wine/orbis/pw_wine_exit_orbis.c). */
+        if(set_hook){PwExitHook hook=NULL;void *context=NULL;pw_wine_get_exit_hook(&hook,&context);if(hook)set_hook(hook,context);}
+    }
+#endif
     return module;
 }
 void *pw_wine_dl_open(const char *path)

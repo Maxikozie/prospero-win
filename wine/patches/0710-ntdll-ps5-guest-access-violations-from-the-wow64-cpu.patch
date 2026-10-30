@@ -37,7 +37,7 @@ atom in GetClassInfoExA, so the crash surfaced far from its cause.
                   context->R8, context->R9, context->R10, context->R11 );
      TRACE_(seh)( " r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
                   context->R12, context->R13, context->R14, context->R15 );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    {
 +        /* Name where the syscall faulted (or, for a call through a NULL
 +         * pointer, its caller). The syscall then fails with the exception
@@ -82,7 +82,7 @@ atom in GetClassInfoExA, so the crash surfaced far from its cause.
          rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
          break;
      }
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    if (segv_unresolved_hook && rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
 +        TRAP_sig(sigcontext) == TRAP_x86_PAGEFLT && segv_unresolved_hook( siginfo, _sigcontext ))
 +    {

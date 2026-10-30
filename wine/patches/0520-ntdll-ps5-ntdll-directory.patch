@@ -18,7 +18,7 @@ index 0d43c5c65e..9a003ddd00 100644
  {
      Dl_info info;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* A PS5 title loads ntdll as a PRX, which dladdr cannot name; the title
 +     * passes the directory it loaded it from. */
 +    if ((!dladdr( init_paths, &info ) || !(ntdll_dir = realpath_dirname( info.dli_fname ))) &&

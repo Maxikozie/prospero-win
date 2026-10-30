@@ -104,7 +104,7 @@ index 34950fa..40bed6e 100644
      HANDLE handle;
 +    ULONG_PTR zero_bits = 0;
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    const char *fast = getenv( "PW_INPUT_SHARED_FAST" );
 +    if (fast && !strcmp( fast, "1" )) zero_bits = ~(UINT)0;
 +#endif
@@ -142,7 +142,7 @@ index 34950fa..40bed6e 100644
 +_Static_assert( offsetof(shared_object_t, id) == 8, "shared input object ID ABI" );
 +ULONG_PTR ps5_get_key_shared( void *args, ULONG_PTR size )
 +{
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    struct pw_key_shared result = {0};
 +    struct object_lock input_lock = OBJECT_LOCK_INIT, desktop_lock = OBJECT_LOCK_INIT;
 +    const input_shm_t *input = NULL;

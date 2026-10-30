@@ -13,6 +13,11 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __ORBIS__
+/* The OpenOrbis SDK's musl termios keeps the speeds under reserved names. */
+#define c_ospeed __c_ospeed
+#define c_ispeed __c_ispeed
+#endif
 
 int pw_compat_isatty(int fd)
 {

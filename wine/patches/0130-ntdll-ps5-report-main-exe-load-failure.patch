@@ -26,7 +26,7 @@ diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
  }
  
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* End the process through exit(), so the host's exit handlers run: a PS5
 + * title restarts into its launcher from one. Terminating the other threads
 + * first marks the process as exiting; terminating itself straight away is
@@ -46,7 +46,7 @@ diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
  
      get_full_path( main_argv[1], curdir, &nt_name );
      status = load_main_exe( &nt_name, 0, module );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* The title's own image may hold the program's preferred base, so the
 +     * program is mapped elsewhere; the PE loader relocates it, as Windows
 +     * does. start.exe would only retry in a new process, which a PS5 title
@@ -58,7 +58,7 @@ diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
          (strpbrk( main_argv[1], "/\\" ) || (main_argv[1][0] && main_argv[1][1] == ':')))
      {
          MESSAGE( "wine: failed to open %s\n", debugstr_a(main_argv[1]) );
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +        exit_initial_process( status );
 +#endif
          NtTerminateProcess( GetCurrentProcess(), status );
@@ -68,7 +68,7 @@ diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
          }
      }
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* start.exe would only run the program in a new process, which a PS5
 +     * title cannot create: say why it cannot run in this one instead. */
 +    if (status)

@@ -1,0 +1,49 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: server: orbis: no unix-owner checks on the configuration directory
+
+On the PS4 the title's files under /data belong to root and the process
+runs as another user (measured: "wineserver: /data/.../prefix is not
+owned by you" ended the first run that reached the server). The uid
+checks patch 0110 left in create_server_dir and in ntdll's server
+directory setup are skipped on Orbis, as 0110 skips the others.
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index f13e1326e0..c5b76c7ffd 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1988,7 +1988,9 @@ static int server_connect(void)
+ 
+     /* make sure we are at the right place */
+     if (stat( ".", &st ) == -1) fatal_perror( "stat %s", server_dir );
++#ifndef __ORBIS__  /* /data on the PS4 keeps no unix owners */
+     if (st.st_uid != getuid()) fatal_error( "'%s' is not owned by you\n", server_dir );
++#endif
+     if (st.st_mode & 077) fatal_error( "'%s' must not be accessible by other users\n", server_dir );
+ 
+     for (retry = 0; retry < 6; retry++)
+@@ -2010,8 +2012,10 @@ static int server_connect(void)
+         /* make sure the socket is sane (ISFIFO needed for Solaris) */
+         if (!S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode))
+             fatal_error( "'%s/%s' is not a socket\n", server_dir, SOCKETNAME );
++#ifndef __ORBIS__  /* /data on the PS4 keeps no unix owners */
+         if (st.st_uid != getuid())
+             fatal_error( "'%s/%s' is not owned by you\n", server_dir, SOCKETNAME );
++#endif
+ 
+         /* try to connect to it */
+         addr.sun_family = AF_UNIX;
+diff --git a/server/request.c b/server/request.c
+index 13bfefdd71..85a57c76cc 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -1009,8 +1009,10 @@ static char *create_server_dir( int force )
+         fatal_error( "open %s: %s\n", config_dir, strerror( errno ));
+     if (fstat( config_dir_fd, &st ) == -1)
+         fatal_error( "stat %s: %s\n", config_dir, strerror( errno ));
++#ifndef __ORBIS__  /* /data on the PS4 keeps no unix owners: the title's files are root's */
+     if (st.st_uid != getuid())
+         fatal_error( "%s is not owned by you\n", config_dir );
++#endif
+ 
+     /* create the base directory if needed */
+ 

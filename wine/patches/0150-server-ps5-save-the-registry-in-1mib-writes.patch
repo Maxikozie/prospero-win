@@ -20,7 +20,7 @@ index 2444e20bd8..364b72e529 100644
  /* save a registry branch to a file */
  static void save_all_subkeys( struct key *key, FILE *f )
  {
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +    /* Each write() costs about 3.3 ms on the console whatever its size, and
 +     * stdio would issue one per st_blksize (64 KiB on /data): a 3.2 MB
 +     * system.reg took 154 ms, holding up every server request. Write it in

@@ -24,7 +24,7 @@ index e612e5e0d3..4c21268d8e 100644
  
  #elif defined(__FreeBSD__) || defined (__FreeBSD_kernel__)
  
-+#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
 +/* Measured on PS5 FW 12.02: the kernel stores FreeBSD's amd64 mcontext_t
 + * unchanged, but at ucontext offset 64 rather than the 16 the SDK header
 + * declares for uc_mcontext. */
@@ -106,7 +106,7 @@ index e612e5e0d3..4c21268d8e 100644
      struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
      WOW_TEB *wow_teb = get_wow_teb( teb );
  
-+#ifndef __PROSPERO__
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)
      if (wow_teb)
      {
          if (!fs32_sel)
@@ -127,7 +127,7 @@ index e612e5e0d3..4c21268d8e 100644
  {
      struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
  
-+#ifndef __PROSPERO__
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)
      if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
 +#endif
  }
@@ -137,7 +137,7 @@ index e612e5e0d3..4c21268d8e 100644
          WARN_(seh)( "could not enable syscall user dispatch\n" );
  #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
      amd64_set_gsbase( teb );
-+#ifndef __PROSPERO__
++#if !defined(__PROSPERO__) && !defined(__ORBIS__)
      amd64_get_fsbase( &thread_data->pthread_teb );
 +#else
 +    /* PE code never loads %fs here (no 32-bit compatibility mode: i386 code

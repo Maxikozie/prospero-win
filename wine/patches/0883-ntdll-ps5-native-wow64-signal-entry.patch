@@ -65,7 +65,7 @@ index ee77208..884d70f 100644
 @@ -297,13 +348,11 @@ __ASM_GLOBAL_FUNC( modify_ldt,
  #define TRAP_sig(context)    (UCONTEXT_MC(context).mc_trapno)
  #define ERROR_sig(context)   (UCONTEXT_MC(context).mc_err)
- #ifdef __PROSPERO__
+ #if defined(__PROSPERO__) || defined(__ORBIS__)
 -/* Measured on PS5 FW 12.02 with a payload that faults with known FP state:
 - * the kernel keeps 32 more bytes in mcontext_t than the SDK header declares,
 - * so its FXSAVE image is at ucontext offset 320, not mc_fpstate (288), and

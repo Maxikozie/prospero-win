@@ -118,7 +118,7 @@ index fd1f229..e74fe93 100644
 +#include "../pw_qpc_clock.h"
 +NTSTATUS ps5_qpc_anchor( void *args )
 +{
-+#if defined(__PROSPERO__) && defined(__x86_64__)
++#if (defined(__PROSPERO__) || defined(__ORBIS__)) && defined(__x86_64__)
 +    struct pw_qpc_anchor *anchor = args;
 +    const char *verified = getenv( "PW_QPC_TSC_VALIDATED" );
 +    const char *text = getenv( "PW_QPC_TSC_HZ" );

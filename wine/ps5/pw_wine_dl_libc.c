@@ -11,6 +11,9 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef RTLD_SELF
+#define RTLD_SELF ((void *)-3)   /* FreeBSD's value; the OpenOrbis SDK's musl dlfcn.h lacks it */
+#endif
 
 extern int32_t sceKernelLoadStartModule(const char *,size_t,const void *,uint32_t,const void *,int *);
 extern int sceKernelGetModuleInfo(int32_t,void *);

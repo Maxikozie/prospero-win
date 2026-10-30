@@ -88,7 +88,7 @@ index 94618f4..d23a29d 100644
      mach_port_deallocate( mach_task_self(), thread_port );
  }
  
-+#elif defined(__PROSPERO__)
++#elif (defined(__PROSPERO__) || defined(__ORBIS__))
 +
 +#include <sys/stat.h>
 +

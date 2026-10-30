@@ -1,0 +1,284 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Wine's Unix side for the PS4 (Orbis OS, OpenOrbis toolchain): the pinned
+# Wine with the console patch series, compiled by tools/orbis-clang and
+# relinked into ntdll.prx, wineserver.prx and win32u.prx with the wine/ps5
+# shims and the wine/orbis ones, each with a PRXDESC1 descriptor and the
+# PS4 module parameter block. The structure follows tools/build_wine_ps5.sh;
+# what differs is the toolchain (clang 18 + ld.lld at x86_64-pc-freebsd12-elf
+# over the SDK and orbis-compat's overlay), the converter (create-fself
+# --lib instead of ps5-native-tool), the exit wraps (a title may not exit)
+# and report.json's binding check (the SDK's stub libraries instead of the
+# PS5's libkernel_sys).
+#
+# Usage:
+#   tools/build_wine_orbis.sh [--check-patches] [--jobs N] [--work DIR]
+#       [--modules "ntdll wineserver win32u"] [--allow-unbound]
+#
+# Environment:
+#   OO_PS4_TOOLCHAIN       the OpenOrbis toolchain (required)
+#   ORBIS_COMPAT           orbis-compat as consumers see it: include/ (the
+#                          overlay) and build/ (liborbis-compat.a, libc16/)
+#   PROSPERO_WINE_SOURCE   Wine checkout with the pin (default .deps/wine/source)
+#   PROSPERO_WINE_BUILD    host tools tree with tools/winebuild (default
+#                          .deps/wine/build, from tools/build_wine_runtime.sh)
+#   PROSPERO_WINE_ORBIS_WORK  work directory (default .deps/wine-orbis)
+#   LLVM_BIN               directory of clang/ld.lld/llvm-* 18 (default: PATH)
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
+host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
+work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
+jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+modules="ntdll wineserver win32u"
+allow_unbound=0
+check_only=0
+
+fail() { echo "build_wine_orbis: $*" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+    case $1 in
+    --check-patches) check_only=1 ;;
+    --jobs) jobs=$2; shift ;;
+    --work) work=$2; shift ;;
+    --modules) modules=$2; shift ;;
+    --allow-unbound) allow_unbound=1 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) fail "unknown argument $1" ;;
+    esac
+    shift
+done
+
+# One pin and one series: the console build's.
+commit=$(sed -n 's/^WINE_COMMIT=//p' "$root/tools/build_wine_ps5.sh")
+patches=$root/wine/patches
+ordered=$(sh "$root/tools/build_wine_ps5.sh" --check-patches) || fail "the patch series is not well-formed"
+if [ "$check_only" = 1 ]; then printf '%s\n' "$ordered"; exit 0; fi
+
+: "${OO_PS4_TOOLCHAIN:?set OO_PS4_TOOLCHAIN}"
+: "${ORBIS_COMPAT:?set ORBIS_COMPAT (include/ and build/)}"
+[ -n "${LLVM_BIN:-}" ] && PATH="$LLVM_BIN:$PATH"
+export PATH OO_PS4_TOOLCHAIN
+export ORBIS_COMPAT_INCLUDE="$ORBIS_COMPAT/include"
+compat_lib=$ORBIS_COMPAT/build
+for tool in clang ld.lld llvm-ar llvm-nm llvm-objdump llvm-readelf python3 \
+        i686-w64-mingw32-gcc x86_64-w64-mingw32-gcc; do
+    command -v "$tool" >/dev/null || fail "$tool is required"
+done
+clang --version | grep -q 'clang version 18' || fail "clang 18 is required (LLVM_BIN)"
+fself=$OO_PS4_TOOLCHAIN/bin/linux/create-fself
+[ -x "$fself" ] || fself=$OO_PS4_TOOLCHAIN/bin/create-fself
+[ -x "$fself" ] || fail "no create-fself under $OO_PS4_TOOLCHAIN/bin"
+[ -f "$compat_lib/liborbis-compat.a" ] || fail "no liborbis-compat.a under $compat_lib"
+[ -f "$ORBIS_COMPAT_INCLUDE/orbis_prefix.h" ] || fail "no orbis_prefix.h under $ORBIS_COMPAT_INCLUDE"
+[ -x "$host_tools/tools/winebuild/winebuild" ] || fail "no host tools tree at $host_tools (tools/build_wine_runtime.sh)"
+git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
+    fail "$source_dir does not have the pinned Wine revision $commit"
+cc=$root/tools/orbis-clang
+
+mkdir -p "$work"
+tree=$work/source
+[ -d "$tree/.git" ] || git clone -q --shared --no-checkout "$source_dir" "$tree"
+git -C "$tree" checkout -q --force "$commit"
+git -C "$tree" clean -q -fdx
+for patch in $ordered; do
+    git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
+done
+python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
+    fail "cannot stage Vulkan command-stream runtime"
+cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h"
+cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h"
+cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h"
+
+# Configure for a FreeBSD 12 host (the target triple's OS: Wine takes its
+# FreeBSD signal, thread and server code) without the desktop libraries;
+# FreeType and Vulkan come back with the display milestones.
+configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
+--enable-archs=i386,x86_64 --disable-tests --without-x \
+--without-fontconfig --without-alsa --without-pulse \
+--without-dbus --without-gstreamer --without-sdl --without-udev --without-usb \
+--without-v4l2 --without-wayland --without-opengl --without-oss \
+--without-pcap --without-pcsclite --without-sane --without-krb5 --without-gphoto \
+--without-netapi --without-inotify --without-capi --without-cups --without-gssapi \
+--without-ffmpeg --without-freetype --without-vulkan --without-gnutls --without-unwind \
+ac_cv_func_thr_kill2=yes $(for h in capi cdrom errqueue filter fs hdreg hidraw input ioctl ipx irda major \
+memfd ntsync param rtnetlink serial types ucdrom userfaultfd videodev2 wireless; do \
+printf 'ac_cv_header_linux_%s_h=no ' "$h"; done)"
+# The SDK ships musl's Linux headers beside Sony's FreeBSD kernel: a
+# linux/*.h that configure finds would select Linux code (seccomp filters,
+# memfd) the kernel does not have, so every linux/ header is declared absent.
+# thr_kill2 is not in libkernel: wine/ps5/pw_wine_threads_libc.c provides it
+# at the PRX link (configure's link test cannot see that), and without
+# HAVE_THR_KILL2 the server would signal threads with kill().
+cflags=${CFLAGS:--g -O2}
+stamp=$({ printf '%s\n' "$commit" "$configure_args" "$cflags" "$OO_PS4_TOOLCHAIN"
+          cat "$cc" "$root"/wine/orbis/include/*.h "$root"/wine/orbis/include/*/*.h
+          for patch in $ordered; do cat "$patches/$patch"; done; } | sha256sum | cut -c1-64)
+build=$work/build
+if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.orbis-stamp" 2>/dev/null)" != "$stamp" ]; then
+    rm -rf "$build"
+    mkdir -p "$build"
+    # shellcheck disable=SC2086
+    (cd "$build" && "$tree/configure" $configure_args CC="$cc" CFLAGS="$cflags" \
+        --with-wine-tools="$host_tools" > "$work/configure.log" 2>&1) ||
+        fail "configure failed; see $work/configure.log"
+    echo "$stamp" > "$build/.orbis-stamp"
+fi
+
+# The shims, compiled once: the heap and direct memory (ntdll's ELF link
+# takes them), then the loader, compat, cwd, threads, sink and exit units.
+obj=$work/obj
+mkdir -p "$obj"
+shim_cflags="-std=gnu11 -O2 -Wall -Wextra -Werror"
+compile_shim() {
+    # shellcheck disable=SC2086
+    "$cc" $shim_cflags -I"$root/wine/ps5" -I"$root/wine/orbis" -c "$1" -o "$obj/$(basename "${1%.c}").o" ||
+        fail "cannot compile $1"
+}
+for unit in pw_wine_heap pw_wine_heap_libc pw_wine_dmem pw_wine_dmem_ps5 \
+        pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
+        pw_wine_threads pw_wine_threads_libc pw_wine_sink pw_wine_cwd pw_wine_cwd_libc; do
+    compile_shim "$root/wine/ps5/$unit.c"
+done
+for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis; do
+    compile_shim "$root/wine/orbis/$unit.c"
+done
+heap="$obj/pw_wine_heap.o $obj/pw_wine_heap_libc.o"
+dmem="$obj/pw_wine_dmem.o $obj/pw_wine_dmem_ps5.o"
+
+# The ELF links: Wine's own make, with the heap and dmem objects on ntdll's
+# link line and the server's own heap on its. Unresolved symbols are warnings
+# here (the PRX link reports them); the make log keeps every link command
+# line, which the PRX link reads back.
+: > "$work/make.log"
+status=0
+for step in "dlls/ntdll/ntdll.so|$heap $dmem" "dlls/win32u/win32u.so|" "server/wineserver|$heap"; do
+    target=${step%%|*}; objects=${step#*|}
+    case " $modules " in *" $(basename "${target%.so}") "*) ;; *) continue ;; esac
+    (cd "$build" && rm -f "$target")
+    make -C "$build" -k -j"$jobs" LDFLAGS="$objects -Wl,--warn-unresolved-symbols" "$target" \
+        >> "$work/make.log" 2>&1 || status=$?
+done
+[ "$status" = 0 ] || echo "build_wine_orbis: make returned $status; see $work/make.log" >&2
+
+# The PRX link.
+prx=$work/prx
+rm -rf "$prx"
+mkdir -p "$prx/obj" "$prx/sce_module"
+link_objects() {
+    python3 - "$work/make.log" "$1" <<'PY'
+import shlex, sys
+text = open(sys.argv[1], errors="replace").read().replace("\\\n", " ")
+lines = [line for line in text.splitlines() if f"-o {sys.argv[2]} " in line]
+if lines:
+    print(" ".join(arg for arg in shlex.split(lines[-1])
+                   if arg.endswith(".o") and not arg.startswith("/")))
+PY
+}
+cwd_wraps=""
+for name in $(grep -o '__wrap_[a-z_]*' "$root/wine/ps5/pw_wine_cwd_libc.c" | sed 's/^__wrap_//' |
+        LC_ALL=C sort -u); do
+    cwd_wraps="$cwd_wraps --wrap=$name"
+done
+exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --wrap=_write --wrap=_writev --wrap=dup"
+# link_prx NAME TARGET "EXTRA OBJECTS": a position-independent image laid
+# out by the SDK's own linker script (create-fself reads that layout; an
+# ld.lld --shared image crashes it), every global exported, entry
+# module_start, the SDK's static libc behind orbis-compat's corrections,
+# libkernel and the system stubs as needed. Symbols defined in the image bind
+# locally, as -Bsymbolic would. Then the host gates and the conversion to a
+# PRX. The recipe is the one the milestone a probe loaded and resolved on
+# the console, plus --no-rosegment and the console's 16 KiB page: the PS4
+# loader maps raw p_vaddr and rounds segment sizes to a page, so a PT_LOAD
+# that starts mid-page is refused with ENOEXEC (0x80020008, measured on
+# ntdll.prx, whose .data/.bss followed a read-only module-parameter segment
+# by 0x20 bytes; the block is writable now, see gen_prx_descriptor.py).
+# --no-rosegment keeps lld from making a separate read-only segment of the
+# rodata as orbis-porting-kit does for executables.
+prx_status=0
+link_prx() {
+    name=$1; objects=
+    [ "$2" = - ] || objects=$(link_objects "$2")
+    log=$prx/$name.link.log
+    [ -n "$objects$3" ] || { echo "no ELF link of $2 in make.log" > "$log"; prx_status=1; return; }
+    # shellcheck disable=SC2086
+    (cd "$build" && ld.lld -m elf_x86_64 -pie --export-dynamic -e module_start \
+        --script "$OO_PS4_TOOLCHAIN/link.x" -T "$root/wine/ps5/prx_eh_frame.ld" --eh-frame-hdr \
+        --no-rosegment -z max-page-size=0x4000 -soname "$name.prx" -z lazy \
+        --warn-unresolved-symbols -o "$prx/$name.shared.elf" $objects $3 \
+        -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
+        -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ -lSceNet --as-needed "$OO_PS4_TOOLCHAIN"/lib/libSce*.so \
+        --no-as-needed) > "$log" 2>&1 || { prx_status=1; return; }
+    llvm-readelf --dyn-syms "$prx/$name.shared.elf" | grep -q 'GLOBAL DEFAULT .* module_start$' ||
+        { echo "module_start is not a default-visibility export" >> "$log"; prx_status=1; return; }
+    (cd "$prx" && "$fself" -in="$name.shared.elf" -out="$name.oelf" --lib="sce_module/$name.prx" \
+        --paid 0x3800000000000011) >> "$log" 2>&1 || { prx_status=1; return; }
+    chmod 755 "$prx/sce_module/$name.prx"
+}
+desc() {
+    name=$1; shift
+    python3 "$root/tools/gen_prx_descriptor.py" --orbis "$prx/obj/${name}_desc.c" "$@" ||
+        fail "cannot generate the $name descriptor"
+    # shellcheck disable=SC2086
+    "$cc" -std=c11 -O2 -Wall -Wextra -Werror -I"$root/wine/ps5" -c "$prx/obj/${name}_desc.c" \
+        -o "$prx/obj/${name}_desc.o" || fail "cannot compile the $name descriptor"
+}
+case " $modules " in *" ntdll "*)
+    desc ntdll __wine_main pw_wine_dl_adopt dlopen dlsym dlerror \
+        pw_wine_heap_stats pw_wine_heap_malloc pw_wine_heap_free \
+        pw_wine_set_present_sink pw_wine_post_input pw_wine_sink_stats \
+        pw_wine_present pw_wine_next_input pw_wine_input_fd \
+        pw_wine_set_pad pw_wine_rumble pw_wine_pad pw_wine_set_rumble pw_wine_set_menu pw_wine_menu \
+        pw_wine_set_pad_at pw_wine_rumble_at pw_wine_pad_at pw_wine_set_rumble_at pw_wine_pads_wanted \
+        pw_wine_set_audio_sink pw_wine_audio_available pw_wine_audio_output \
+        __wine_virtual_stats __wine_virtual_fault_top __wine_ps5_set_output_sink __wine_ps5_memory_stats pw_cwd_set \
+        __wine_ps5_set_segv_hook __wine_ps5_set_segv_unresolved_hook pw_wine_set_display_release pw_wine_release_display \
+        pw_wine_set_exit_hook pw_wine_setenv
+    shims=""
+    for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
+            pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis; do
+        shims="$shims $obj/$unit.o"
+    done
+    link_prx ntdll dlls/ntdll/ntdll.so "$heap $dmem $shims $prx/obj/ntdll_desc.o $cwd_wraps $exit_wraps"
+    ;;
+esac
+case " $modules " in *" wineserver "*)
+    desc wineserver pw_wineserver_connect pw_wine_thread_register pw_wine_thread_unregister \
+        pw_wineserver_call_direct pw_wineserver_try_fast_mutex pw_wineserver_mutex_backend \
+        pw_wineserver_sync_backend pw_cwd_share_changes pw_wine_set_exit_hook pw_wine_setenv
+    link_prx wineserver server/wineserver "$heap $obj/pw_wine_compat.o $obj/pw_wine_compat_libc.o \
+        $obj/pw_wine_compat_orbis.o $obj/pw_wine_threads.o $obj/pw_wine_threads_libc.o \
+        $obj/pw_wine_cwd.o $obj/pw_wine_cwd_libc.o $obj/pw_wine_exit_orbis.o $obj/pw_wine_env_orbis.o $obj/pw_wine_stdio_orbis.o \
+        $prx/obj/wineserver_desc.o $cwd_wraps $exit_wraps"
+    ;;
+esac
+case " $modules " in *" win32u "*)
+    # Its ntdll imports stay unresolved here and are recorded, and
+    # create-fself refuses an image with imports no library provides:
+    # binding one application PRX to another is the display milestone's
+    # work, so win32u's failure is a warning, not the build's verdict.
+    desc win32u __wine_unix_lib_init
+    saved_status=$prx_status
+    link_prx win32u dlls/win32u/win32u.so "$prx/obj/win32u_desc.o"
+    [ "$prx_status" = "$saved_status" ] || echo "build_wine_orbis: win32u.prx not converted (ntdll imports unbound; expected until milestone d)" >&2
+    prx_status=$saved_status
+    ;;
+esac
+
+must_bind=$(printf '%s' "$modules" | tr ' ' ',' | sed 's/,win32u//; s/win32u,//')
+report_status=0
+python3 "$root/tools/orbis_prx_report.py" --work "$work" --toolchain "$OO_PS4_TOOLCHAIN" \
+    --out "$work/report.json" --wine-commit "$commit" --patches "$patches" \
+    --must-bind "$must_bind" || report_status=$?
+echo "report: $work/report.json"
+for name in $modules; do
+    if [ -f "$prx/sce_module/$name.prx" ]; then
+        echo "  $name.prx: $(wc -c < "$prx/sce_module/$name.prx") bytes"
+    else
+        echo "  $name.prx: NOT BUILT (see $prx/$name.link.log)"
+    fi
+done
+[ "$prx_status" = 0 ] || fail "a PRX link failed; see $prx/*.link.log"
+[ "$report_status" = 0 ] || [ "$allow_unbound" = 1 ] || fail "report.json has errors"
+echo "wine orbis: $prx/sce_module"

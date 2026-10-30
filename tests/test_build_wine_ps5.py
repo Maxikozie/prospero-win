@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -131,13 +132,14 @@ def main() -> int:
     assert result.returncode == 0, result.stderr
     listed = result.stdout.split()
     assert listed == sorted(p.name for p in (ROOT / "wine/patches").glob("*.patch"))
-    assert listed and all(100 <= int(name[:4]) <= 999 for name in listed)
+    assert listed and all(100 <= int(name[:4]) <= 1499 for name in listed)
     assert check(["0900-clock.patch", "0901-input.patch", "0999-boundary.patch"]).returncode == 0
     # Numeric order across owners' ranges.
     result = check(["0500-core-b.patch", "0100-services-a.patch", "0101-services-c.patch"])
     assert result.returncode == 0 and result.stdout.split() == [
         "0100-services-a.patch", "0101-services-c.patch", "0500-core-b.patch"]
-    for bad in (["0099-too-low.patch"], ["1000-too-high.patch"], ["0100-Upper.patch"],
+    assert check(["0999-boundary.patch", "1000-orbis.patch", "1499-orbis-last.patch"]).returncode == 0
+    for bad in (["0099-too-low.patch"], ["1500-too-high.patch"], ["0100-Upper.patch"],
                 ["0100-a.patch", "0100-b.patch"], ["100-short.patch"], ["0100-a.diff"],
                 ["notes.txt"]):
         assert check(bad).returncode != 0, bad
@@ -154,6 +156,11 @@ def main() -> int:
                                          "sce_module/libvulkan.prx", "radv_link_recipe"))
     adapter = (ROOT / "wine/ps5/pw_vulkan_radv.c").read_text()
     assert "vk_icdGetInstanceProcAddr" in adapter and "vk_common_GetDeviceProcAddr" in adapter
+    # The console series is two-platform: no bare __PROSPERO__ gate outside the
+    # PS5-only patches (tools/widen_console_gates.py).
+    result = subprocess.run([sys.executable, str(ROOT / "tools/widen_console_gates.py"), "--check"],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout
     # The pinned revision matches the host runtime build.
     for tool in ("build_wine_ps5.sh", "build_wine_runtime.sh"):
         assert "WINE_COMMIT=490f6d5dcbb2a5047345b8af88d114bbcaad69a8" in (ROOT / "tools" / tool).read_text()
