@@ -24,8 +24,39 @@
 #include <termios.h>
 #include <unistd.h>
 
+#ifdef __ORBIS__
+/* On the PS4 Wine's pipes are the kernel's: measured on the console,
+ * fcntl(F_SETFL, O_NONBLOCK) is EACCES on an AF_UNIX socket pair end (run
+ * 12, also through FIONBIO, run 13) and works on a kernel pipe (run 14), and
+ * the server's reply, request and wake descriptors need it. The socket
+ * pairs below (the PS5's pipes) stay behind WINE_ORBIS_KERNEL_PIPE=0. Built
+ * with --wrap=pipe; __real_pipe is libkernel's. */
+#include <string.h>
+extern int __real_pipe(int fds[2]);
+static int orbis_kernel_pipe(void)
+{
+    static int wanted=-1;
+    if(wanted<0){const char *e=getenv("WINE_ORBIS_KERNEL_PIPE");wanted=!(e&&!strcmp(e,"0"));}
+    return wanted;
+}
+int __wrap_pipe(int fds[2]){return orbis_kernel_pipe()?__real_pipe(fds):pw_compat_pipe(fds);}
+int pipe2(int fds[2],int flags)
+{
+    if(!orbis_kernel_pipe())return pw_compat_pipe2(fds,flags);
+    if(flags&~(O_CLOEXEC|O_NONBLOCK)){errno=EINVAL;return -1;}
+    if(__real_pipe(fds))return -1;
+    for(int i=0;i<2;i++) {
+        if((flags&O_CLOEXEC)&&fcntl(fds[i],F_SETFD,FD_CLOEXEC))goto fail;
+        if((flags&O_NONBLOCK)&&fcntl(fds[i],F_SETFL,O_NONBLOCK))goto fail;
+    }
+    return 0;
+fail:
+    {int saved=errno;close(fds[0]);close(fds[1]);errno=saved;return -1;}
+}
+#else
 int pipe(int fds[2]){return pw_compat_pipe(fds);}
 int pipe2(int fds[2],int flags){return pw_compat_pipe2(fds,flags);}
+#endif
 int futimens(int fd,const struct timespec times[2]){return pw_compat_futimens(fd,times);}
 int posix_fallocate(int fd,off_t offset,off_t length)
 {return pw_compat_posix_fallocate(fd,offset,length);}

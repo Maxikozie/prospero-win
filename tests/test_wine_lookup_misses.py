@@ -74,7 +74,7 @@ def patched_file_c(source):
 
 
 file_c = new_side(LOOKUP.read_text(), FILE_C)
-start = file_c.index("#ifdef __PROSPERO__\n/* wine/ps5/pw_wine_cwd.h")
+start = file_c.index("#if defined(__PROSPERO__) || defined(__ORBIS__)\n/* wine/ps5/pw_wine_cwd.h")
 MATCH = file_c[start:file_c.index("#endif", file_c.index("static int match_dir_entry")) + len("#endif")]
 SOURCE = wine_source()
 if SOURCE:

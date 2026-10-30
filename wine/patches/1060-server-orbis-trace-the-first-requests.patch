@@ -1,0 +1,147 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: server, ntdll: orbis: trace the first requests and the thread fd hand-over
+
+Run 11 on the PS4 completed the client handshake (patch 1050's lines) and
+then stalled in the first request: the server read init_first_thread and
+the two fd messages, the client never got a reply. Which step failed is
+not said by either side: a thread whose reply descriptor did not arrive is
+killed without a word, and the client then reads its own reply pipe
+forever (it still holds the write end). Orbis stderr lines, to remove with
+patch 1050: the fd messages received (client fd, thread, server fd), the
+inflight look-ups and O_NONBLOCK in init_thread, each of the first eight
+requests with its status and whether a reply fd exists, the first replies
+written, every thread killed with its last request, and on the client the
+first eight requests sent with their status.
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 757eb8e355..71c12eb8ff 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -697,6 +697,21 @@ unsigned int server_call_unlocked( void *req_ptr )
+             abort_thread( 0 );  /* the server killed this thread */
+         }
+     }
++#endif
++#ifdef __ORBIS__
++    {
++        static unsigned int traced;
++        if (traced < 8)
++        {
++            traced++;
++            fprintf( stderr, "wine-orbis: request %d: %u bytes on fd %d, reply on fd %d\n", (int)req->u.req.request_header.req,
++                     (unsigned int)(sizeof(req->u.req) + req->u.req.request_header.request_size), data->request_fd, data->reply_fd );
++            if ((ret = send_request( data->request_fd, req ))) return ret;
++            ret = wait_reply( data->reply_fd, req );
++            fprintf( stderr, "wine-orbis: request %d -> status %08x\n", (int)req->u.req.request_header.req, ret );
++            return ret;
++        }
++    }
+ #endif
+     if ((ret = send_request( data->request_fd, req ))) return ret;
+     ret = wait_reply( data->reply_fd, req );
+diff --git a/server/request.c b/server/request.c
+index a396b9ef21..97bbabc618 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -242,6 +242,12 @@ static void send_reply( union generic_reply *reply )
+     {
+         if ((ret = write( get_unix_fd( current->reply_fd ),
+                           reply, sizeof(*reply) )) != sizeof(*reply)) goto error;
++#ifdef __ORBIS__
++        {
++            static unsigned int traced;
++            if (traced++ < 4) fprintf( stderr, "wineserver: orbis: reply of %d bytes written to fd %d\n", ret, get_unix_fd( current->reply_fd ));
++        }
++#endif
+     }
+     else
+     {
+@@ -298,6 +304,17 @@ static void call_req_handler( struct thread *thread )
+     else
+         set_error( STATUS_NOT_IMPLEMENTED );
+ 
++#ifdef __ORBIS__
++    {
++        static unsigned int traced;
++        if (traced < 8 || (current && current->error))
++        {
++            traced++;
++            fprintf( stderr, "wineserver: orbis: request %d for thread %04x -> status %08x, reply fd %s\n", req,
++                     thread->id, current ? current->error : 0, current && current->reply_fd ? "set" : "NONE" );
++        }
++    }
++#endif
+     if (current)
+     {
+         if (current->reply_fd)
+@@ -697,6 +714,10 @@ int receive_fd( struct process *process )
+         }
+     }
+ 
++#ifdef __ORBIS__
++    fprintf( stderr, "wineserver: orbis: fd message on process %04x -> %d (errno %d): client fd %d for thread %04x, received as %d\n",
++             process->id, ret, ret == -1 ? errno : 0, ret > 0 ? data.fd : -1, ret > 0 ? data.tid : 0, fd );
++#endif
+     if (ret == sizeof(data))
+     {
+         struct thread *thread;
+diff --git a/server/thread.c b/server/thread.c
+index 4fce40305e..6b131e4854 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1743,6 +1743,10 @@ int thread_get_inflight_fd( struct thread *thread, int client )
+ void kill_thread( struct thread *thread, int violent_death )
+ {
+     if (thread->state == TERMINATED) return;  /* already killed */
++#ifdef __ORBIS__
++    fprintf( stderr, "wineserver: orbis: thread %04x killed (exit code %d, violent %d, last request %d)\n",
++             thread->id, thread->exit_code, violent_death, (int)thread->ps5_last_req );
++#endif
+     thread->state = TERMINATED;
+     thread->exit_time = current_time;
+     if (current == thread) current = NULL;
+@@ -1860,13 +1864,22 @@ done:
+ 
+ static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
+ {
++#ifdef __ORBIS__
++    int client_reply_fd = reply_fd, client_wait_fd = wait_fd;
++#endif
+     if ((reply_fd = thread_get_inflight_fd( thread, reply_fd )) == -1)
+     {
++#ifdef __ORBIS__
++        fprintf( stderr, "wineserver: orbis: init_thread %04x: no inflight fd for the client's reply fd %d\n", thread->id, client_reply_fd );
++#endif
+         set_error( STATUS_TOO_MANY_OPENED_FILES );
+         return 0;
+     }
+     if ((wait_fd = thread_get_inflight_fd( thread, wait_fd )) == -1)
+     {
++#ifdef __ORBIS__
++        fprintf( stderr, "wineserver: orbis: init_thread %04x: no inflight fd for the client's wait fd %d\n", thread->id, client_wait_fd );
++#endif
+         set_error( STATUS_TOO_MANY_OPENED_FILES );
+         goto error;
+     }
+@@ -1877,10 +1890,20 @@ static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
+         goto error;
+     }
+ 
+-    if (fcntl( reply_fd, F_SETFL, O_NONBLOCK ) == -1) goto error;
++    if (fcntl( reply_fd, F_SETFL, O_NONBLOCK ) == -1)
++    {
++#ifdef __ORBIS__
++        fprintf( stderr, "wineserver: orbis: init_thread %04x: O_NONBLOCK on reply fd %d refused (errno %d)\n", thread->id, reply_fd, errno );
++#endif
++        goto error;
++    }
+ 
+     thread->reply_fd = create_anonymous_fd( &thread_fd_ops, reply_fd, &thread->obj, 0 );
+     thread->wait_fd  = create_anonymous_fd( &thread_fd_ops, wait_fd, &thread->obj, 0 );
++#ifdef __ORBIS__
++    fprintf( stderr, "wineserver: orbis: init_thread %04x: reply fd %d, wait fd %d (%s)\n", thread->id, reply_fd, wait_fd,
++             thread->reply_fd && thread->wait_fd ? "ok" : "fd objects failed" );
++#endif
+     return thread->reply_fd && thread->wait_fd;
+ 
+  error:

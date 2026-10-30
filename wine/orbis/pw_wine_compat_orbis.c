@@ -184,3 +184,82 @@ int __wrap_dup(int fd)
     errno = saved;
     return -1;
 }
+
+/* ---- ENOSYS stubs of the SDK's libc that Wine calls unchecked ------------
+ *
+ * tools/orbis_libc_stubs.py lists the functions of libc.a that only set
+ * ENOSYS. Wine's ntdll reads uname() for its version string without looking
+ * at the result, so an unfilled utsname would be read as text (umask, the
+ * other such call, is wine/ps5/pw_wine_compat_libc.c's). A title has no
+ * kernel name query: fixed answers. */
+#include <sys/utsname.h>
+
+int uname(struct utsname *name)
+{
+    memset(name, 0, sizeof(*name));
+    snprintf(name->sysname, sizeof(name->sysname), "FreeBSD");
+    snprintf(name->nodename, sizeof(name->nodename), "ps4");
+    snprintf(name->release, sizeof(name->release), "9.0-ORBIS");
+    snprintf(name->version, sizeof(name->version), "Orbis OS");
+    snprintf(name->machine, sizeof(name->machine), "amd64");
+    return 0;
+}
+
+/* ---- O_NONBLOCK on the PS4 -------------------------------------------------
+ *
+ * Measured (console run 12): fcntl(F_SETFL, O_NONBLOCK) on the end of a
+ * socket pair that arrived through SCM_RIGHTS fails with EACCES, which cost
+ * the in-process server its first client (init_thread gave up without a
+ * reply). Wine sets O_NONBLOCK through fcntl everywhere (reply pipes, the
+ * wake pipe, sockets), so the call is wrapped (--wrap=fcntl): when the kernel
+ * refuses F_SETFL, the same bit goes through FIONBIO, FreeBSD's other door to
+ * it, by libkernel's ioctl under its FreeBSD prototype (the SDK's ioctl takes
+ * an int, which would sign-extend the request). Each outcome is reported
+ * once; nothing else about fcntl changes. */
+#include <stdarg.h>
+
+#define ORBIS_FIONBIO 0x8004667eUL   /* FreeBSD _IOW('f', 126, int) */
+
+extern int __real_fcntl(int fd, int cmd, ...);
+extern int _ioctl(int fd, unsigned long request, ...);
+
+int __wrap_fcntl(int fd, int cmd, ...)
+{
+    static int logged[2];
+    va_list ap;
+    long arg;
+    int rc, saved, on;
+
+    va_start(ap, cmd);
+    arg = va_arg(ap, long);
+    va_end(ap);
+    rc = __real_fcntl(fd, cmd, arg);
+    if (rc != -1 || cmd != F_SETFL) return rc;
+    saved = errno;
+    on = (arg & O_NONBLOCK) != 0;
+    if (_ioctl(fd, ORBIS_FIONBIO, &on) == 0) {
+        if (!__atomic_exchange_n(&logged[0], 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "wine-orbis: fcntl(F_SETFL, %#lx) on fd %d refused (errno %d); FIONBIO used instead\n",
+                    arg, fd, saved);
+        return 0;
+    }
+    if (!__atomic_exchange_n(&logged[1], 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "wine-orbis: fcntl(F_SETFL, %#lx) on fd %d refused (errno %d) and FIONBIO too (errno %d)\n",
+                arg, fd, saved, errno);
+    errno = saved;
+    return -1;
+}
+
+/* ---- getauxval ---------------------------------------------------------------
+ *
+ * Measured (console run 13): SIGSEGV at address 0 in musl's getauxval. The
+ * SDK's libc.a reads the aux vector its start-up code saved, and a PRX has
+ * no start-up code (the loader runs neither constructors nor crt), so the
+ * pointer is NULL. A title has no aux vector to give anyway; Wine's callers
+ * (get_image_address, the FSGSBASE check) take 0 as "unknown". */
+unsigned long getauxval(unsigned long type)
+{
+    (void)type;
+    errno = ENOENT;
+    return 0;
+}

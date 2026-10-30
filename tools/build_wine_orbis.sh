@@ -104,13 +104,22 @@ configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
 --without-ffmpeg --without-freetype --without-vulkan --without-gnutls --without-unwind \
 ac_cv_func_thr_kill2=yes $(for h in capi cdrom errqueue filter fs hdreg hidraw input ioctl ipx irda major \
 memfd ntsync param rtnetlink serial types ucdrom userfaultfd videodev2 wireless; do \
-printf 'ac_cv_header_linux_%s_h=no ' "$h"; done)"
+printf 'ac_cv_header_linux_%s_h=no ' "$h"; done) \
+ac_cv_header_sys_epoll_h=no wine_cv_have_sched_setaffinity=no $(for f in epoll_create sched_getcpu getrandom \
+sysinfo memfd_create process_vm_readv process_vm_writev futimesat; do printf 'ac_cv_func_%s=no ' "$f"; done)"
 # The SDK ships musl's Linux headers beside Sony's FreeBSD kernel: a
 # linux/*.h that configure finds would select Linux code (seccomp filters,
 # memfd) the kernel does not have, so every linux/ header is declared absent.
 # thr_kill2 is not in libkernel: wine/ps5/pw_wine_threads_libc.c provides it
 # at the PRX link (configure's link test cannot see that), and without
 # HAVE_THR_KILL2 the server would signal threads with kill().
+# The SDK's libc.a is musl with the system-call layer replaced: the functions
+# above exist in it as stubs that set ENOSYS, so configure's link test finds
+# them and Wine takes code that always fails (HAVE_EPOLL_CREATE put the
+# server's main loop on epoll, which returned -1 at once; the loop then
+# polled, unseen). tools/orbis_libc_stubs.py lists every such stub and the
+# check after configure refuses a config.h that takes one for real; sys/epoll.h
+# is musl's header for the same stubs.
 cflags=${CFLAGS:--g -O2}
 stamp=$({ printf '%s\n' "$commit" "$configure_args" "$cflags" "$OO_PS4_TOOLCHAIN"
           cat "$cc" "$root"/wine/orbis/include/*.h "$root"/wine/orbis/include/*/*.h
@@ -125,6 +134,8 @@ if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.orbis-stamp" 2>/dev/null)" !=
         fail "configure failed; see $work/configure.log"
     echo "$stamp" > "$build/.orbis-stamp"
 fi
+python3 "$root/tools/orbis_libc_stubs.py" --config "$build/include/config.h" ||
+    fail "configure took an ENOSYS stub of the SDK's libc for a real function; declare it absent in configure_args"
 
 # The shims, compiled once: the heap and direct memory (ntdll's ELF link
 # takes them), then the loader, compat, cwd, threads, sink and exit units.
@@ -181,7 +192,7 @@ for name in $(grep -o '__wrap_[a-z_]*' "$root/wine/ps5/pw_wine_cwd_libc.c" | sed
         LC_ALL=C sort -u); do
     cwd_wraps="$cwd_wraps --wrap=$name"
 done
-exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --wrap=_write --wrap=_writev --wrap=dup"
+exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --wrap=_write --wrap=_writev --wrap=dup --wrap=fcntl --wrap=pipe"
 # link_prx NAME TARGET "EXTRA OBJECTS": a position-independent image laid
 # out by the SDK's own linker script (create-fself reads that layout; an
 # ld.lld --shared image crashes it), every global exported, entry

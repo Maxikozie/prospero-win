@@ -76,7 +76,7 @@ def patched_file_c(source):
 
 
 changed = new_side(PATCH.read_text(), FILE_C)
-start = changed.index("#ifdef __PROSPERO__\nextern void pw_cwd_track")
+start = changed.index("#if defined(__PROSPERO__) || defined(__ORBIS__)\nextern void pw_cwd_track")
 DECLARE = changed[start:changed.index("#endif", start) + len("#endif")]
 TRACK = DECLARE + "\n\n" + function(changed, "static void track_root_directory(")
 SOURCE = wine_source()
@@ -84,7 +84,7 @@ if SOURCE:
     whole = patched_file_c(SOURCE)
     assert DECLARE in whole and function(changed, "static void track_root_directory(") in whole
     lookup_c = new_side((PATCHES / "0160-ntdll-ps5-keep-listings-of-searched-directories.patch").read_text(), FILE_C)
-    start = lookup_c.index("#ifdef __PROSPERO__\n/* wine/ps5/pw_wine_cwd.h")
+    start = lookup_c.index("#if defined(__PROSPERO__) || defined(__ORBIS__)\n/* wine/ps5/pw_wine_cwd.h")
     MATCH = lookup_c[start:lookup_c.index("#endif", lookup_c.index("static int match_dir_entry")) + len("#endif")]
     NT_TO_UNIX = function(whole, "static NTSTATUS nt_to_unix_file_name(")
     BY_ID = function(whole, "static NTSTATUS file_id_to_unix_file_name(")

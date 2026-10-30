@@ -187,6 +187,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_hello64.py
+	python3 tests/test_orbis_libc_stubs.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
 	python3 tests/test_wine_fixed_reserve.py
@@ -263,6 +264,7 @@ wine-check: test
 	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_hello64.py
+	python3 tests/test_orbis_libc_stubs.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
 	python3 tests/test_wine_fixed_reserve.py

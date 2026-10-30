@@ -32,8 +32,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# The flags may hold one level of $(...) (the Orbis rules pass -Wl$(comma)--wrap=...).
 RULE = re.compile(
-    r"\$\(eval \$\(call test_rule,([^,]+),([^,]*),([^)]*)\)\)")
+    r"\$\(eval \$\(call test_rule,([^,]+),([^,]*),((?:[^()]|\([^()]*\))*)\)\)")
 RECIPE = re.compile(r"^test: .*?\n\n", re.S | re.M)
 PYTHON_SUITE = re.compile(r"python3 (tests/test_[A-Za-z0-9_]+\.py)")
 
