@@ -177,79 +177,6 @@ static int capture_fd(int fd, PwFdForward *forward)
     return pthread_create(&thread, NULL, forward_fd, forward) ? -4 : 0;
 }
 
-/* A hypothesis the first run answers: whether pipe() works on this kernel
- * (the PS5 has none, so Wine's compat layer uses socket pairs). */
-static void probe_pipe(void)
-{
-    int fds[2], rc = pipe(fds), err = errno;
-    char byte = 'p';
-    int ok = 0;
-
-    if (rc == 0) {
-        ok = write(fds[1], &byte, 1) == 1 && read(fds[0], &byte, 1) == 1 && byte == 'p';
-        close(fds[0]);
-        close(fds[1]);
-    }
-    LOG("PW_WINE64 pipe rc=%d errno=%d roundtrip=%d", rc, rc ? err : 0, ok);
-}
-
-/* Descriptor duplication and passing on this kernel: Wine's server dup()s
- * every mapping's descriptor and hands clients their reply descriptors with
- * SCM_RIGHTS (measured in run 9: dup returned EPERM). */
-static int try_dup(const char *what, int fd)
-{
-    int d = dup(fd), e1 = errno, f, e2;
-    if (d >= 0) close(d);
-    f = fcntl(fd, F_DUPFD, 10);
-    e2 = errno;
-    if (f >= 0) close(f);
-    LOG("PW_WINE64 fds %s dup=%d errno=%d F_DUPFD=%d errno=%d", what, d, d < 0 ? e1 : 0, f, f < 0 ? e2 : 0);
-    return d >= 0 || f >= 0;
-}
-
-static void probe_fds(void)
-{
-    int pair[2], pfd[2], file, got = -1, rc;
-    struct msghdr msg;
-    struct iovec iov;
-    char byte = 'f', control[64];
-    struct cmsghdr *cmsg;
-
-    file = open(PW_ROOT "/prefix/system.reg", O_RDONLY);
-    if (file >= 0) { try_dup("file", file); }
-    else LOG("PW_WINE64 fds file open failed errno=%d", errno);
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0) {
-        try_dup("socket", pair[0]);
-        /* Pass the file over the pair, as the in-process server does. */
-        memset(&msg, 0, sizeof(msg));
-        memset(control, 0, sizeof(control));
-        iov.iov_base = &byte; iov.iov_len = 1;
-        msg.msg_iov = &iov; msg.msg_iovlen = 1;
-        msg.msg_control = control; msg.msg_controllen = CMSG_SPACE(sizeof(int));
-        cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int)); cmsg->cmsg_level = SOL_SOCKET; cmsg->cmsg_type = SCM_RIGHTS;
-        memcpy(CMSG_DATA(cmsg), &file, sizeof(int));
-        rc = (int)sendmsg(pair[0], &msg, 0);
-        LOG("PW_WINE64 fds sendmsg(SCM_RIGHTS)=%d errno=%d", rc, rc < 0 ? errno : 0);
-        if (rc == 1) {
-            memset(&msg, 0, sizeof(msg)); memset(control, 0, sizeof(control));
-            byte = 0; iov.iov_base = &byte; iov.iov_len = 1;
-            msg.msg_iov = &iov; msg.msg_iovlen = 1;
-            msg.msg_control = control; msg.msg_controllen = sizeof(control);
-            rc = (int)recvmsg(pair[1], &msg, 0);
-            cmsg = CMSG_FIRSTHDR(&msg);
-            if (rc == 1 && cmsg && cmsg->cmsg_type == SCM_RIGHTS) memcpy(&got, CMSG_DATA(cmsg), sizeof(int));
-            LOG("PW_WINE64 fds recvmsg=%d errno=%d byte=%c controllen=%u passed_fd=%d readable=%d", rc,
-                rc < 0 ? errno : 0, byte ? byte : '?', (unsigned)msg.msg_controllen, got,
-                got >= 0 ? (int)(lseek(got, 0, SEEK_SET) == 0) : -1);
-            if (got >= 0) close(got);
-        }
-        close(pair[0]); close(pair[1]);
-    } else LOG("PW_WINE64 fds socketpair failed errno=%d", errno);
-    if (pipe(pfd) == 0) { try_dup("pipe", pfd[0]); close(pfd[0]); close(pfd[1]); }
-    if (file >= 0) close(file);
-}
-
 /* ---- Wine's debug output -------------------------------------------------- */
 
 static void wine_output_sink(const char *str, size_t len)
@@ -550,8 +477,6 @@ int main(int argc, char **argv)
     }
     LOG("PW_WINE64 ntdll=%s prefix=%s exe=%s found=%d", ntdll_path, PW_ROOT "/prefix", exe, !first);
 
-    probe_pipe();
-    probe_fds();
     probe_module(ntdll_dir, "pw_probe_mod");
     probe_module(ntdll_dir, "pw_probe_tls");
     {

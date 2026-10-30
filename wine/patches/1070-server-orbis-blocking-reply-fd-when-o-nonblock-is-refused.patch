@@ -1,0 +1,39 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: server: orbis: keep a blocking reply descriptor when O_NONBLOCK is refused
+
+Measured on the PS4 (console run 12): fcntl(F_SETFL, O_NONBLOCK) on the
+reply descriptor a client passed with SCM_RIGHTS fails with EACCES when
+the descriptor is a socket pair end, and FIONBIO is refused as well
+(run 13). init_thread then gave up without a reply, which the client
+waits for forever. Wine's pipes are kernel pipes on Orbis now
+(wine/orbis/pw_wine_compat_libc.c), where O_NONBLOCK works and this path
+is not taken; with WINE_ORBIS_KERNEL_PIPE=0 they are socket pairs again,
+and the thread then keeps a blocking reply descriptor (64-byte replies
+to a client that reads them at once) instead of dying.
+
+diff --git a/server/thread.c b/server/thread.c
+index a6fe880b11..1607fc9d8e 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1874,7 +1874,20 @@ static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
+         goto error;
+     }
+ 
+-    if (fcntl( reply_fd, F_SETFL, O_NONBLOCK ) == -1) goto error;
++    if (fcntl( reply_fd, F_SETFL, O_NONBLOCK ) == -1)
++    {
++#ifdef __ORBIS__
++        /* Measured on the PS4 (run 12): EACCES on a passed socket pair end,
++         * and FIONBIO is refused as well. Wine's pipes are kernel pipes on
++         * Orbis, where O_NONBLOCK works; with WINE_ORBIS_KERNEL_PIPE=0 they
++         * are socket pairs again, and a blocking reply descriptor still
++         * carries the 64-byte replies to a client that reads them at once. */
++        fprintf( stderr, "wineserver: orbis: init_thread %04x: O_NONBLOCK on reply fd %d refused (errno %d), going on blocking\n",
++                 thread->id, reply_fd, errno );
++#else
++        goto error;
++#endif
++    }
+ 
+     thread->reply_fd = create_anonymous_fd( &thread_fd_ops, reply_fd, &thread->obj, 0 );
+     thread->wait_fd  = create_anonymous_fd( &thread_fd_ops, wait_fd, &thread->obj, 0 );

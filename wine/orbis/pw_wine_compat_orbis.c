@@ -109,18 +109,12 @@ int fstat(int fd, struct stat *out)
 
 int stat(const char *path, struct stat *out)
 {
-    static int dumped;
     unsigned char raw[PW_STAT_RAW];
     int rc;
 
     if (!path || !out) { errno = EFAULT; return -1; }
     memset(raw, 0, sizeof(raw));
     if ((rc = sceKernelStat(path, raw)) != 0) { errno = sce_errno(rc); return -1; }
-    if (!__atomic_exchange_n(&dumped, 1, __ATOMIC_RELAXED)) {
-        char hex[2 * 120 + 1];
-        for (int i = 0; i < 120; i++) snprintf(hex + 2 * i, 3, "%02x", raw[i]);
-        fprintf(stderr, "wine-orbis: sceKernelStat(%s) raw=%s\n", path, hex);
-    }
     stat_translate(raw, out);
     if (!out->st_dev && !out->st_ino) {
         /* No identity from the path call: the descriptor's answer has it. */
