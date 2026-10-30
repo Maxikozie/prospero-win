@@ -27,6 +27,7 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -614,13 +615,42 @@ int __wrap_statfs(const char *path, struct statfs *buffer)
     return -1;
 }
 
+/* The PS4's libc.a is musl, whose realpath() opens the path and reads the
+ * link /proc/self/fd/N names: readlink() is one of its ENOSYS stubs, so
+ * realpath() fails for every path (measured in the PS4 port's milestone d2:
+ * the in-process server's open_fd then kept no unix_name for any file,
+ * get_handle_unix_name failed and no directory could be listed, so win32u
+ * found no fonts). The links that matter are this file's virtual ones,
+ * which resolve() has already replaced (a title cannot create a kernel
+ * symbolic link), so the real path is the resolved one, folded, if it
+ * exists. Built on the host too with PW_CWD_LEXICAL_REALPATH for the tests. */
+#if defined(__ORBIS__) && !defined(PW_CWD_LEXICAL_REALPATH)
+#define PW_CWD_LEXICAL_REALPATH 1
+#endif
+#ifdef PW_CWD_LEXICAL_REALPATH
+static char *lexical_realpath(const char *full, char *resolved_path)
+{
+    char folded[PW_CWD_PATH_MAX];
+    struct stat st;
+
+    if (pw_cwd_fold(full, folded, sizeof(folded)) || __real_stat(folded, &st)) return NULL;
+    if (!resolved_path) return strdup(folded);
+    if (strlen(folded) >= PATH_MAX) { errno = ENAMETOOLONG; return NULL; }
+    strcpy(resolved_path, folded);
+    return resolved_path;
+}
+#define realpath_of lexical_realpath
+#else
+#define realpath_of __real_realpath
+#endif
+
 char *__wrap_realpath(const char *path, char *resolved_path)
 {
     struct resolved r;
     char *result;
 
     if (resolve(&r, path, 1)) return NULL;
-    while (!(result = __real_realpath(r.full, resolved_path)) && reload(&r)) {}
+    while (!(result = realpath_of(r.full, resolved_path)) && reload(&r)) {}
     return result;
 }
 

@@ -91,9 +91,51 @@ cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h"
 cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h"
 cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h"
 
+# FreeType draws Wine's text (milestone d3): the release, units and exports
+# tools/build_wine_ps5.sh pins, compiled by tools/orbis-clang into a static
+# archive for configure and the objects of libfreetype.prx, which win32u's
+# dlopen("libfreetype.so") loads through pw_wine_dl beside ntdll.prx.
+# PROSPERO_FREETYPE_TARBALL names a local copy of the tarball.
+eval "$(sed -n '/^FREETYPE_VERSION=/,/^ FT_Set_Pixel_Sizes FT_Vector_Length FT_Vector_Transform FT_Vector_Unit"$/p' \
+    "$root/tools/build_wine_ps5.sh")"
+[ -n "${FREETYPE_SHA256:-}" ] && [ -n "${FREETYPE_EXPORTS:-}" ] || fail "cannot read the FreeType pin from tools/build_wine_ps5.sh"
+ft=$work/freetype
+ft_stamp=$(printf '%s\n' "$FREETYPE_SHA256" "$FREETYPE_UNITS" "$(cat "$cc")" | sha256sum | cut -c1-64)
+if [ "$(cat "$ft/.orbis-stamp" 2>/dev/null)" != "$ft_stamp" ]; then
+    tarball=${PROSPERO_FREETYPE_TARBALL:-$work/freetype-$FREETYPE_VERSION.tar.xz}
+    [ -f "$tarball" ] || curl -sSfL -o "$tarball" "$FREETYPE_URL" || fail "cannot download $FREETYPE_URL"
+    [ "$(sha256sum "$tarball" | cut -c1-64)" = "$FREETYPE_SHA256" ] ||
+        fail "$tarball does not match FreeType $FREETYPE_VERSION's pinned SHA-256"
+    rm -rf "$ft"
+    mkdir -p "$ft/src" "$ft/obj" "$ft/config"
+    tar -xJf "$tarball" -C "$ft/src" --strip-components=1
+    cat > "$ft/config/ftmodule_orbis.h" <<'EOF'
+FT_USE_MODULE( FT_Module_Class, autofit_module_class )
+FT_USE_MODULE( FT_Driver_ClassRec, tt_driver_class )
+FT_USE_MODULE( FT_Driver_ClassRec, t1_driver_class )
+FT_USE_MODULE( FT_Driver_ClassRec, cff_driver_class )
+FT_USE_MODULE( FT_Driver_ClassRec, winfnt_driver_class )
+FT_USE_MODULE( FT_Module_Class, psaux_module_class )
+FT_USE_MODULE( FT_Module_Class, psnames_module_class )
+FT_USE_MODULE( FT_Module_Class, pshinter_module_class )
+FT_USE_MODULE( FT_Module_Class, sfnt_module_class )
+FT_USE_MODULE( FT_Renderer_Class, ft_smooth_renderer_class )
+FT_USE_MODULE( FT_Renderer_Class, ft_raster1_renderer_class )
+EOF
+    for unit in $FREETYPE_UNITS; do
+        "$cc" -std=c99 -O2 -fPIC -DFT2_BUILD_LIBRARY '-DFT_CONFIG_MODULES_H=<ftmodule_orbis.h>' \
+            -I"$ft/config" -I"$ft/src/include" -c "$ft/src/src/$unit.c" -o "$ft/obj/$(basename "$unit").o" \
+            > "$ft/obj/$(basename "$unit").log" 2>&1 || fail "cannot compile FreeType $unit.c (see $ft/obj)"
+    done
+    llvm-ar rcs "$ft/libfreetype.a" "$ft"/obj/*.o
+    echo "$ft_stamp" > "$ft/.orbis-stamp"
+    echo "built FreeType $FREETYPE_VERSION"
+fi
+
 # Configure for a FreeBSD 12 host (the target triple's OS: Wine takes its
 # FreeBSD signal, thread and server code) without the desktop libraries;
-# FreeType and Vulkan come back with the display milestones.
+# FreeType is found by its flags (its soname is the name win32u dlopens);
+# Vulkan comes back with milestone e.
 configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
 --enable-archs=i386,x86_64 --disable-tests --without-x \
 --without-fontconfig --without-alsa --without-pulse \
@@ -101,7 +143,7 @@ configure_args="--host=x86_64-unknown-freebsd12 --build=x86_64-pc-linux-gnu \
 --without-v4l2 --without-wayland --without-opengl --without-oss \
 --without-pcap --without-pcsclite --without-sane --without-krb5 --without-gphoto \
 --without-netapi --without-inotify --without-capi --without-cups --without-gssapi \
---without-ffmpeg --without-freetype --without-vulkan --without-gnutls --without-unwind \
+--without-ffmpeg --without-vulkan --without-gnutls --without-unwind \
 ac_cv_func_thr_kill2=yes $(for h in capi cdrom errqueue filter fs hdreg hidraw input ioctl ipx irda major \
 memfd ntsync param rtnetlink serial types ucdrom userfaultfd videodev2 wireless; do \
 printf 'ac_cv_header_linux_%s_h=no ' "$h"; done) \
@@ -121,7 +163,7 @@ sysinfo memfd_create process_vm_readv process_vm_writev futimesat; do printf 'ac
 # check after configure refuses a config.h that takes one for real; sys/epoll.h
 # is musl's header for the same stubs.
 cflags=${CFLAGS:--g -O2}
-stamp=$({ printf '%s\n' "$commit" "$configure_args" "$cflags" "$OO_PS4_TOOLCHAIN"
+stamp=$({ printf '%s\n' "$commit" "$configure_args" "$cflags" "$OO_PS4_TOOLCHAIN" "$ft_stamp"
           cat "$cc" "$root"/wine/orbis/include/*.h "$root"/wine/orbis/include/*/*.h
           for patch in $ordered; do cat "$patches/$patch"; done; } | sha256sum | cut -c1-64)
 build=$work/build
@@ -130,12 +172,16 @@ if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.orbis-stamp" 2>/dev/null)" !=
     mkdir -p "$build"
     # shellcheck disable=SC2086
     (cd "$build" && "$tree/configure" $configure_args CC="$cc" CFLAGS="$cflags" \
+        FREETYPE_CFLAGS="-I$ft/src/include" FREETYPE_LIBS="$ft/libfreetype.a" \
+        ac_cv_lib_soname_freetype=libfreetype.so \
         --with-wine-tools="$host_tools" > "$work/configure.log" 2>&1) ||
         fail "configure failed; see $work/configure.log"
     echo "$stamp" > "$build/.orbis-stamp"
 fi
 python3 "$root/tools/orbis_libc_stubs.py" --config "$build/include/config.h" ||
     fail "configure took an ENOSYS stub of the SDK's libc for a real function; declare it absent in configure_args"
+grep -q '^#define SONAME_LIBFREETYPE "libfreetype.so"' "$build/include/config.h" ||
+    fail "configure did not take FreeType (see $work/configure.log): win32u would draw no text"
 
 # The shims, compiled once: the heap and direct memory (ntdll's ELF link
 # takes them), then the loader, compat, cwd, threads, sink and exit units.
@@ -152,7 +198,7 @@ for unit in pw_wine_heap pw_wine_heap_libc pw_wine_dmem pw_wine_dmem_ps5 \
         pw_wine_threads pw_wine_threads_libc pw_wine_sink pw_wine_cwd pw_wine_cwd_libc; do
     compile_shim "$root/wine/ps5/$unit.c"
 done
-for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis; do
+for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis; do
     compile_shim "$root/wine/orbis/$unit.c"
 done
 heap="$obj/pw_wine_heap.o $obj/pw_wine_heap_libc.o"
@@ -222,7 +268,12 @@ exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --w
 # in $prx/stubs. tools/orbis_bind_table.py then lists the import slots for
 # the title's check. Measured on the host only: whether the console loader
 # binds them is milestone d1's question.
-import_also="dlopen,dlsym,dlerror,dlclose,dladdr,malloc,free,calloc,realloc,posix_memalign,aligned_alloc,memalign"
+import_also="malloc,free,calloc,realloc,posix_memalign,aligned_alloc,memalign"
+# libkernel exports dlopen/dlsym/dlclose/dlerror too, and create-fself gives
+# an import to the first NEEDED library exporting its name (libkernel first;
+# measured in d1: win32u's dlsym slot held libkernel's). An importer takes
+# ntdll's dlfcn under the __wrap_ names of wine/orbis/pw_wine_dl_orbis.c.
+import_wraps="--wrap=dlopen --wrap=dlsym --wrap=dlclose --wrap=dlerror --wrap=dladdr"
 prx_status=0
 mkdir -p "$prx/stubs"
 ld_prx() { # ld_prx NAME OUT ARGS...
@@ -291,7 +342,8 @@ case " $modules " in *" ntdll "*)
         pw_wine_set_exit_hook pw_wine_setenv
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
-            pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis; do
+            pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
+            pw_wine_dl_orbis; do
         shims="$shims $obj/$unit.o"
     done
     link_prx ntdll dlls/ntdll/ntdll.so "$heap $dmem $shims $prx/obj/ntdll_desc.o $cwd_wraps $exit_wraps"
@@ -311,7 +363,33 @@ case " $modules " in *" win32u "*)
     # Its ntdll imports are loader imports of ntdll.prx (see link_prx).
     [ -f "$prx/ntdll.shared.elf" ] || fail "win32u imports from ntdll: build ntdll in the same run"
     desc win32u __wine_unix_lib_init
-    link_prx win32u dlls/win32u/win32u.so "$prx/obj/win32u_desc.o $exit_wraps" ntdll
+    # win32u opens and maps font files itself (freetype.c unix_face_create,
+    # map_font_file) by .../dosdevices/c:/... names, so it links its own copy
+    # of the working-directory emulation too (measured in d2: with the
+    # listing fixed, all 13 fonts reached unix_face_create and none loaded).
+    # shellcheck disable=SC2086
+    link_prx win32u dlls/win32u/win32u.so "-u opendir $prx/obj/win32u_desc.o $obj/pw_wine_cwd.o $obj/pw_wine_cwd_libc.o \
+        $exit_wraps $import_wraps $cwd_wraps" ntdll
+    # FreeType, which win32u loads by name, with its own static libc; the
+    # exit and stdio wraps are ntdll's (it may not exit, its stderr reaches
+    # the title). It opens font files with its own fopen, by the names
+    # win32u passes (.../dosdevices/c:/windows/Fonts/...), so it links its
+    # own copy of the working-directory emulation, as wineserver does: the
+    # c: link exists only in that emulation's table (measured in d2:
+    # AddFontResourceEx of tahoma.ttf failed with the file in place). Its
+    # only reference to opendir is the emulation's __real_opendir, which
+    # ld.lld bound to libSceLibcInternal's export instead of fetching
+    # libc.a's member (that library then became NEEDED, and it exports the
+    # malloc family the stub takes from ntdll): -u opendir fetches it.
+    # shellcheck disable=SC2086
+    desc libfreetype $FREETYPE_EXPORTS
+    link_prx libfreetype - "-u opendir $ft/obj/*.o $prx/obj/libfreetype_desc.o $obj/pw_wine_cwd.o \
+        $obj/pw_wine_cwd_libc.o $exit_wraps $cwd_wraps" ntdll
+    # Wine's own fonts, staged under share/wine/fonts and copied into the
+    # prefix's Fonts directory by scripts/ps4/prefix.sh (an /app0 or
+    # unlisted directory is not searched).
+    mkdir -p "$prx/fonts"
+    cp "$tree"/fonts/*.ttf "$prx/fonts/"
     ;;
 esac
 

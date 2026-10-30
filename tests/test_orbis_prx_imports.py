@@ -17,6 +17,7 @@ TABLE = os.path.join(ROOT, "tools", "orbis_bind_table.py")
 
 EXPORTER = r"""
 int wine_only(int x) { return x + 1; }
+int wine_only_too(int x) { return x + 2; }
 int shared_helper(int x) { return x * 2; }
 void *my_alloc(unsigned long n) { (void)n; return 0; }
 int exported_data = 7;
@@ -35,7 +36,7 @@ DATA_IMPORTER = r"""
 extern int exported_data;
 int read_data(void) { return exported_data; }
 """
-SDK = "int sdk_call(int x) { return x; }\n"
+SDK = "int sdk_call(int x) { return x; }\nint wine_only_too(int x) { return x; }\n"
 
 failures = []
 
@@ -78,7 +79,7 @@ def main():
 
         toolchain = os.path.join(tmp, "oo")
         os.makedirs(os.path.join(toolchain, "lib"))
-        sdk = build("libsdk", SDK)
+        sdk = build("libsdk", SDK, "-soname", "libsdk.so")
         shutil.copy(sdk, os.path.join(toolchain, "lib", "libsdk.so"))
         exporter = build("exporter", EXPORTER, "-soname", "exporter.so")
         # First link: the importer alone (undefined wine_only, sdk_call, my_alloc).
@@ -89,9 +90,16 @@ def main():
                    "--also", "my_alloc", "--out", stub_s, "--list", names, ok=False)
         check(proc.returncode == 0, f"stub generated ({proc.stderr.strip()})")
         listed = open(names).read().split() if os.path.exists(names) else []
+        # A stub library the importer does not need may export the same name: no conflict.
+        unneeded = build("libother", "int my_alloc_other(int x) { return x; }\nvoid *my_alloc(unsigned long n) { (void)n; return 0; }\n")
+        shutil.copy(unneeded, os.path.join(toolchain, "lib", "libother.so"))
+        proc = run(sys.executable, STUB, "--first-link", first, "--exporter", exporter, "--toolchain", toolchain,
+                   "--also", "my_alloc", "--out", stub_s, ok=False)
+        check(proc.returncode == 0, f"a name an unneeded stub library exports is taken ({proc.stderr.strip()})")
         check(listed == ["my_alloc", "wine_only"], f"stub names are my_alloc and wine_only: {listed}")
 
-        for also, word in (("missing_fn", "not defined"), ("exported_data", "OBJECT"), ("exported_tls", "TLS")):
+        for also, word in (("missing_fn", "not defined"), ("exported_data", "OBJECT"), ("exported_tls", "TLS"),
+                           ("wine_only_too", "SDK stub library the importer needs exports it too")):
             proc = run(sys.executable, STUB, "--first-link", first, "--exporter", exporter, "--toolchain", toolchain,
                        "--also", also, "--out", os.path.join(tmp, "bad.s"), ok=False)
             check(proc.returncode == 1 and word in proc.stderr, f"--also {also} refused ({word})")

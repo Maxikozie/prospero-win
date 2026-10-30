@@ -9,6 +9,11 @@ For every module under WORK/prx with a NAME.shared.elf:
                    from NAME.link.log
   needed           DT_NEEDED entries (the SDK's stub libraries)
   imports          undefined dynamic symbols (what the loader must bind)
+  sce_imports      {library: count} of the import entries create-fself wrote
+                   into NAME.oelf; a sibling's count must equal
+                   sibling_imports' (create-fself gives a name to the first
+                   NEEDED library exporting it, libkernel first: measured in
+                   d1, win32u's dlsym went to libkernel)
   data_imports     undefined dynamic OBJECT symbols: a data import between
                    application PRXs is not bound by the loader
   sibling_imports  {module: count} of imports another PRX of the build
@@ -32,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +83,50 @@ def defined_names(elf):
         if len(parts) >= 3:
             names.add(parts[-1].split("@", 1)[0])
     return names
+
+
+SCE_DYNLIBDATA = 0x61000000
+DT_SCE_IMPORT_LIB = 0x61000015
+DT_SCE_STRTAB = 0x61000035
+DT_SCE_STRSZ = 0x61000037
+# The letters of an SCE symbol name's "#<library>#<module>" suffix.
+SCE_ID = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
+
+
+def sce_import_counts(oelf):
+    """{library name: import entries} from an OELF's SCE dynamic tables."""
+    data = Path(oelf).read_bytes()
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phnum = struct.unpack_from("<H", data, 0x38)[0]
+    dynlib = dynamic = None
+    for i in range(phnum):
+        p_type, _, offset, _, _, filesz, _, _ = struct.unpack_from("<IIQQQQQQ", data, phoff + i * 56)
+        if p_type == SCE_DYNLIBDATA:
+            dynlib = offset
+        elif p_type == 2:
+            dynamic = (offset, filesz)
+    if dynlib is None or dynamic is None:
+        return {}
+    tags = {}
+    for at in range(dynamic[0], dynamic[0] + dynamic[1], 16):
+        tag, value = struct.unpack_from("<QQ", data, at)
+        tags.setdefault(tag, []).append(value)
+    strtab = data[dynlib + tags[DT_SCE_STRTAB][0]: dynlib + tags[DT_SCE_STRTAB][0] + tags[DT_SCE_STRSZ][0]]
+
+    def string(at):
+        return strtab[at: strtab.index(b"\0", at)].decode()
+
+    letters = {}
+    for value in tags.get(DT_SCE_IMPORT_LIB, []):
+        library_id = (value >> 48) & 0xffff
+        if library_id < len(SCE_ID):
+            letters[SCE_ID[library_id]] = string(value & 0xffffffff)
+    counts = {}
+    for entry in strtab.split(b"\0"):
+        parts = entry.decode(errors="replace").split("#")
+        if len(parts) == 3 and parts[1] in letters:
+            counts[letters[parts[1]]] = counts.get(letters[parts[1]], 0) + 1
+    return counts
 
 
 def needed(elf):
@@ -161,6 +211,7 @@ def main():
             "needed": deps,
             "imports": len(undefined),
             "sibling_imports": {s: sum(1 for v in from_sibling.values() if v == s) for s in siblings},
+            "sce_imports": sce_import_counts(prx_dir / f"{name}.oelf") if (prx_dir / f"{name}.oelf").exists() else {},
             "data_imports": sorted(objects),
             "unbound": unbound,
             "raw_syscalls": syscalls,
@@ -174,6 +225,12 @@ def main():
             report.setdefault("warnings", []).append(f"{name}: no PRX")
             if name in must_bind:
                 report["errors"].append(f"{name}: no PRX")
+                status = 1
+        for sibling, count in module["sibling_imports"].items():
+            got = module["sce_imports"].get(sibling)
+            if module["sce_imports"] and got != count:
+                report["errors"].append(f"{name}: {count} import(s) from {sibling} in the ELF, {got or 0} in the OELF's "
+                                        f"{sibling} library (create-fself gave the rest to an SDK library)")
                 status = 1
         if sibling_data:
             report["errors"].append(f"{name}: data import(s) from a sibling PRX: {', '.join(sibling_data)}")

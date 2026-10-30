@@ -11,10 +11,13 @@
  * the watchdog gives up, on the kernel log and the UDP log, after which the
  * title idles: on the PS4 a process that exits is reported as a crash.
  *
- * Before Wine, milestone d1's stages run (pw_d1_orbis.h: cross-PRX
- * binding, the title's VideoOut, the DS4), each recorded in a progress
- * file; hello.exe is the last stage, and the "PS4WINE d1 ..." line follows
- * the c line.
+ * Before Wine, a milestone plan's stages run (pw_milestone_orbis.h; the
+ * plan from PS4WINE_MILESTONE in <root>/env.txt, default d2): d1 cross-PRX
+ * binding, the title's VideoOut, the DS4, then hello.exe; d2 win32u's and
+ * FreeType's slots, the display, then gdi64.exe with its frames on
+ * VideoOut. Each stage is recorded in a progress file, the Wine program is
+ * the last stage, and the plan's "PS4WINE d1|d2|d3 ..." lines follow (d1
+ * after milestone c's line).
  *
  * Arguments (from argv[0] on after a LoadExec restart, from argv[1] on at a
  * fresh launch): path=<absolute Windows path> (default C:\hello.exe).
@@ -31,7 +34,7 @@
 #include "pw_wine_prx.h"
 #include "prospero_win.h"
 #include "pw_wine_exit_orbis.h"
-#include "pw_d1_orbis.h"
+#include "pw_milestone_orbis.h"
 #include "ps5log/ps5log.h"
 #include "orbislog/orbislog.h"
 #include <errno.h>
@@ -58,7 +61,6 @@
 #define PW_ROOT "/data/prospero-win"
 #endif
 #define PW_RUNTIME "/win/wine/lib/wine/x86_64-unix"
-#define PW_DEFAULT_EXE "C:\\hello.exe"
 #define PW_WATCHDOG_S 180
 
 #define LOG(...) pw_diagnostics_log(__VA_ARGS__)
@@ -103,12 +105,12 @@ static void emit_line(const char *line)
 
 static void log_line(const char *line) { LOG("%s", line); }
 
-/* The milestone line: every sink, once; then the d1 hello stage ends. */
+/* Milestone c's line (in the d1 plan), every sink, once; then the plan's
+ * Wine stage ends. */
 static void report(const char *exit_text, const char *kind)
 {
     char line[512], quoted[220];
     size_t n = 0;
-    int hello_ok;
 
     if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) return;
     pthread_mutex_lock(&stdout_lock);
@@ -121,9 +123,33 @@ static void report(const char *exit_text, const char *kind)
              "session_s=%llu",
              quoted, server_connected ? "inprocess" : "none", exit_text, PW_BUILD_ID, load_status,
              start.stage, kind, (unsigned long long)((now_ns() - hello_ns) / 1000000000ull));
-    emit_line(line);
-    hello_ok = !strcmp(exit_text, "0") && server_connected && !strcmp(quoted, "Hello from PE64");
-    pw_d1_hello_end(hello_ok ? "ok" : exit_text);
+    if (pw_ms_c_line()) emit_line(line);
+    else LOG("%s", line);
+    pw_ms_wine_end(exit_text, quoted, server_connected);
+}
+
+/* NAME=VALUE in <root>/env.txt, before the plan starts (load_env_file reads
+ * the whole file for Wine later). */
+static const char *early_setting(const char *name, char *out, size_t size)
+{
+    char text[4096], *line, *next;
+    size_t length = strlen(name);
+    FILE *file = fopen(PW_ROOT "/env.txt", "rb");
+    size_t got;
+
+    if (!file) return NULL;
+    got = fread(text, 1, sizeof(text) - 1, file);
+    fclose(file);
+    text[got] = 0;
+    for (line = text; line && *line; line = next) {
+        if ((next = strchr(line, '\n'))) *next++ = 0;
+        if (!strncmp(line, name, length) && line[length] == '=') {
+            snprintf(out, size, "%s", line + length + 1);
+            out[strcspn(out, "\r \t")] = 0;
+            return out;
+        }
+    }
+    return NULL;
 }
 
 /* ---- fd 1 and fd 2 -> the log ------------------------------------------- */
@@ -419,8 +445,12 @@ int main(int argc, char **argv)
     LOG("PW_WINE64 start build=%s argc=%d argv0=%s netlog=%s:%u", PW_BUILD_ID, argc,
         argc > 0 && argv[0] ? argv[0] : "", logcfg.server, (unsigned)logcfg.port);
 
-    /* path=... from argv[0] on (a LoadExec restart) or argv[1] on. */
-    snprintf(exe, sizeof(exe), "%s", PW_DEFAULT_EXE);
+    {
+        char milestone[16];
+        LOG("PW_WINE64 plan %s", pw_ms_select(early_setting("PS4WINE_MILESTONE", milestone, sizeof(milestone))));
+    }
+    /* path=... from argv[0] on (a LoadExec restart) or argv[1] on; else the plan's program. */
+    snprintf(exe, sizeof(exe), "%s", pw_ms_exe());
     for (int i = 0; i < argc; i++) {
         if (argv[i] && !strncmp(argv[i], "path=", 5) && argv[i][5]) snprintf(exe, sizeof(exe), "%s", argv[i] + 5);
     }
@@ -435,16 +465,16 @@ int main(int argc, char **argv)
     LOG("PW_WINE64 ntdll=%s prefix=%s exe=%s found=%d", ntdll_path, PW_ROOT "/prefix", exe, !first);
 
     {
-        PwD1Config d1 = { ntdll_dir, PW_ROOT, PW_BUILD_ID, log_line, emit_line, now_ns_hook };
-        pw_d1_start(&d1);
-        pw_d1_title_stages();
+        PwMsConfig ms = { ntdll_dir, PW_ROOT, PW_BUILD_ID, log_line, emit_line, now_ns_hook };
+        pw_ms_start(&ms);
+        pw_ms_title_stages();
     }
-    if (!pw_d1_hello_should_run()) {
-        /* hello.exe ended or was lost in an earlier launch of this cycle. */
-        pw_d1_emit_line();
+    if (!pw_ms_wine_should_run()) {
+        /* The Wine stage ended or was lost in an earlier launch of this cycle. */
+        pw_ms_emit_lines();
         for (;;) sleep(60);
     }
-    pw_d1_hello_begin();
+    pw_ms_wine_begin();
     hello_ns = now_ns();
     {
         static PwFdForward forward_stderr = { -1, -1, "WINESERVER" }, forward_stdout = { -1, -1, "STDOUT" };
@@ -492,13 +522,21 @@ int main(int argc, char **argv)
         if (set_sink) set_sink(wine_output_sink);
         if (set_exit) set_exit(exit_hook, NULL);
         {
+            /* The user driver's frames (patch 0400's pw_wine_present) to the title's VideoOut. */
+            void (*set_present)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *) =
+                (void (*)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *))(uintptr_t)
+                    pw_prx_lookup(start.descriptor, "pw_wine_set_present_sink");
+            LOG("PW_WINE64 present_sink=%d", set_present != NULL);
+            if (set_present) set_present(pw_ms_present, NULL);
+        }
+        {
             /* The same cross-check through the kernel's own lookup. */
             void *sym = NULL;
             int rc = sceKernelDlsym(start.module, "__wine_main", &sym);
             LOG("PW_WINE64 dlsym __wine_main rc=0x%x same=%d", (unsigned)rc,
                 sym == (void *)(uintptr_t)start.wine_main);
         }
-        add_env("WINEDEBUG", "err+all,+loaddll,+process");
+        add_env("WINEDEBUG", "err+all,warn+ps5drv,+loaddll,+process");
         add_env("WINEARCH", "wow64");
         add_env("HOME", PW_ROOT "/prefix");
         add_env("USER", "ps4");

@@ -341,6 +341,14 @@ int main(void)
     assert(!chmod("file2", 0600) && !stat("file2", &st) && (st.st_mode & 0777) == 0600);
     assert(realpath("dosdevices/c:", resolved));
     assert(realpath(at_root("prefix/drive_c"), expected) && !strcmp(resolved, expected));
+    {
+        /* A caller's NULL buffer is allocated, "." and ".." fold, a missing name is ENOENT. */
+        char *allocated = realpath("dosdevices/c:/../drive_c/.", NULL);
+        assert(allocated && !strcmp(allocated, expected));
+        free(allocated);
+        errno = 0;
+        assert(!realpath("dosdevices/c:/no-such-file", resolved) && errno == ENOENT);
+    }
 
     /* fchdir back into a directory opened by path, then the *at() calls. */
     assert((dir_fd = open(".", O_RDONLY)) >= 0);
