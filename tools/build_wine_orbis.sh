@@ -207,24 +207,67 @@ exit_wraps="--wrap=exit --wrap=_exit --wrap=abort --wrap=write --wrap=writev --w
 # by 0x20 bytes; the block is writable now, see gen_prx_descriptor.py).
 # --no-rosegment keeps lld from making a separate read-only segment of the
 # rodata as orbis-porting-kit does for executables.
+# A module that imports from a sibling PRX (win32u from ntdll) names the
+# exporter as its 4th argument. A first link shows what the module cannot
+# get elsewhere (Wine's own symbols, the exporter's __wrap_* hooks);
+# tools/orbis_import_stub.py turns that, plus the dlfcn and malloc families
+# (the importer's heap and look-ups are the exporter's, as on the PS5), into
+# a stub library with the exporter's soname, and the second link binds those
+# names to it ahead of the static libc. Only those: binding against the
+# exporter's whole dynamic table also took libc's TLS variable from ntdll.
+# create-fself turns them into imports of the exporter's library. The names
+# must agree: create-fself names an importer's module and library after the
+# NEEDED soname less ".so", and an exporter's after -libname, hence -soname
+# NAME.so and -libname=NAME on every module, and the stub under that soname
+# in $prx/stubs. tools/orbis_bind_table.py then lists the import slots for
+# the title's check. Measured on the host only: whether the console loader
+# binds them is milestone d1's question.
+import_also="dlopen,dlsym,dlerror,dlclose,dladdr,malloc,free,calloc,realloc,posix_memalign,aligned_alloc,memalign"
 prx_status=0
-link_prx() {
-    name=$1; objects=
-    [ "$2" = - ] || objects=$(link_objects "$2")
-    log=$prx/$name.link.log
-    [ -n "$objects$3" ] || { echo "no ELF link of $2 in make.log" > "$log"; prx_status=1; return; }
+mkdir -p "$prx/stubs"
+ld_prx() { # ld_prx NAME OUT ARGS...
+    name=$1; out=$2; shift 2
     # shellcheck disable=SC2086
     (cd "$build" && ld.lld -m elf_x86_64 -pie --export-dynamic -e module_start \
         --script "$OO_PS4_TOOLCHAIN/link.x" -T "$root/wine/ps5/prx_eh_frame.ld" --eh-frame-hdr \
-        --no-rosegment -z max-page-size=0x4000 -soname "$name.prx" -z lazy \
-        --warn-unresolved-symbols -o "$prx/$name.shared.elf" $objects $3 \
+        --no-rosegment -z max-page-size=0x4000 -soname "$name.so" -z lazy \
+        --warn-unresolved-symbols -o "$out" "$@" \
         -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
         -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ -lSceNet --as-needed "$OO_PS4_TOOLCHAIN"/lib/libSce*.so \
-        --no-as-needed) > "$log" 2>&1 || { prx_status=1; return; }
+        --no-as-needed)
+}
+link_prx() {
+    name=$1; objects=; exporter=${4:-}
+    [ "$2" = - ] || objects=$(link_objects "$2")
+    log=$prx/$name.link.log
+    [ -n "$objects$3" ] || { echo "no ELF link of $2 in make.log" > "$log"; prx_status=1; return; }
+    : > "$log"
+    if [ -n "$exporter" ]; then
+        # shellcheck disable=SC2086
+        ld_prx "$name" "$prx/obj/$name.first.elf" $objects $3 >> "$log" 2>&1 || { prx_status=1; return; }
+        python3 "$root/tools/orbis_import_stub.py" --first-link "$prx/obj/$name.first.elf" \
+            --exporter "$prx/$exporter.shared.elf" --toolchain "$OO_PS4_TOOLCHAIN" --also "$import_also" \
+            --out "$prx/obj/${name}_${exporter}_stub.s" --list "$prx/$name.imports.txt" >> "$log" 2>&1 ||
+            { prx_status=1; return; }
+        "$cc" -c "$prx/obj/${name}_${exporter}_stub.s" -o "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 &&
+            ld.lld -m elf_x86_64 -shared -soname "$exporter.so" -o "$prx/obj/$exporter.stub.so" \
+                "$prx/obj/${name}_${exporter}_stub.o" >> "$log" 2>&1 || { prx_status=1; return; }
+        objects="$objects $prx/obj/$exporter.stub.so"
+    fi
+    # shellcheck disable=SC2086
+    ld_prx "$name" "$prx/$name.shared.elf" $objects $3 >> "$log" 2>&1 || { prx_status=1; return; }
     llvm-readelf --dyn-syms "$prx/$name.shared.elf" | grep -q 'GLOBAL DEFAULT .* module_start$' ||
         { echo "module_start is not a default-visibility export" >> "$log"; prx_status=1; return; }
+    if [ -n "$exporter" ]; then
+        python3 "$root/tools/orbis_bind_table.py" --elf "$prx/$name.shared.elf" \
+            --exporter "$exporter=$prx/obj/$exporter.stub.so" --out "$prx/sce_module/$name.bind.txt" \
+            --no-data >> "$log" 2>&1 || { prx_status=1; return; }
+        cp "$prx/obj/$exporter.stub.so" "$prx/stubs/$exporter.so"
+    fi
     (cd "$prx" && "$fself" -in="$name.shared.elf" -out="$name.oelf" --lib="sce_module/$name.prx" \
-        --paid 0x3800000000000011) >> "$log" 2>&1 || { prx_status=1; return; }
+        -libname="$name" -library-path="$prx/stubs" --paid 0x3800000000000011) >> "$log" 2>&1 ||
+        { prx_status=1; return; }
+    [ -z "$exporter" ] || rm -f "$prx/stubs/$exporter.so"
     chmod 755 "$prx/sce_module/$name.prx"
 }
 desc() {
@@ -265,19 +308,14 @@ case " $modules " in *" wineserver "*)
     ;;
 esac
 case " $modules " in *" win32u "*)
-    # Its ntdll imports stay unresolved here and are recorded, and
-    # create-fself refuses an image with imports no library provides:
-    # binding one application PRX to another is the display milestone's
-    # work, so win32u's failure is a warning, not the build's verdict.
+    # Its ntdll imports are loader imports of ntdll.prx (see link_prx).
+    [ -f "$prx/ntdll.shared.elf" ] || fail "win32u imports from ntdll: build ntdll in the same run"
     desc win32u __wine_unix_lib_init
-    saved_status=$prx_status
-    link_prx win32u dlls/win32u/win32u.so "$prx/obj/win32u_desc.o"
-    [ "$prx_status" = "$saved_status" ] || echo "build_wine_orbis: win32u.prx not converted (ntdll imports unbound; expected until milestone d)" >&2
-    prx_status=$saved_status
+    link_prx win32u dlls/win32u/win32u.so "$prx/obj/win32u_desc.o $exit_wraps" ntdll
     ;;
 esac
 
-must_bind=$(printf '%s' "$modules" | tr ' ' ',' | sed 's/,win32u//; s/win32u,//')
+must_bind=$(printf '%s' "$modules" | tr ' ' ',')
 report_status=0
 python3 "$root/tools/orbis_prx_report.py" --work "$work" --toolchain "$OO_PS4_TOOLCHAIN" \
     --out "$work/report.json" --wine-commit "$commit" --patches "$patches" \

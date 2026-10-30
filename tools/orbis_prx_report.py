@@ -11,15 +11,18 @@ For every module under WORK/prx with a NAME.shared.elf:
   imports          undefined dynamic symbols (what the loader must bind)
   data_imports     undefined dynamic OBJECT symbols: a data import between
                    application PRXs is not bound by the loader
-  unbound          imports that no OpenOrbis stub library exports: the loader
-                   leaves these slots at 0 and the first call faults
+  sibling_imports  {module: count} of imports another PRX of the build
+                   exports, by its NEEDED soname (win32u from ntdll.so)
+  unbound          imports that neither an OpenOrbis stub library nor a
+                   sibling PRX named in NEEDED exports: the loader leaves
+                   these slots at 0 and the first call faults
   raw_syscalls     functions containing a syscall instruction, except Wine's
                    two dispatchers: a raw system call kills a title
   bytes, sha256    of the PRX
 
-Exit status 1 when a module in --must-bind has unbound imports or no PRX, or
-any module has raw syscalls (the build script decides what is fatal); a
-module outside --must-bind (win32u until its ntdll imports bind) is recorded.
+Exit status 1 when a module in --must-bind has unbound imports or no PRX, a
+data import from a sibling PRX, or any module has raw syscalls (the build
+script decides what is fatal).
 
 Usage: orbis_prx_report.py --work DIR --toolchain OO_PS4_TOOLCHAIN --out report.json
        [--wine-commit SHA] [--patches DIR] [--must-bind ntdll,wineserver]
@@ -65,6 +68,15 @@ def dynamic_symbols(elf):
         if parts[3] == "OBJECT":
             objects.add(name)
     return undefined, objects
+
+
+def defined_names(elf):
+    names = set()
+    for line in run(["llvm-nm", "-D", "--defined-only", str(elf)]).splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            names.add(parts[-1].split("@", 1)[0])
+    return names
 
 
 def needed(elf):
@@ -125,18 +137,30 @@ def main():
     }
     must_bind = {n for n in args.must_bind.split(",") if n}
     status = 0
-    for shared in sorted(prx_dir.glob("*.shared.elf")):
+    shared_elves = sorted(prx_dir.glob("*.shared.elf"))
+    sibling_exports = {elf.name[: -len(".shared.elf")]: defined_names(elf) for elf in shared_elves}
+    for shared in shared_elves:
         name = shared.name[: -len(".shared.elf")]
         prx = prx_dir / "sce_module" / f"{name}.prx"
         undefined, objects = dynamic_symbols(shared)
         unresolved = unresolved_from_log(prx_dir / f"{name}.link.log")
-        unbound = sorted(n for n in undefined if n not in all_exports)
+        deps = needed(shared)
+        siblings = [d[: -len(".so")] for d in deps if d.endswith(".so") and d[: -len(".so")] in sibling_exports]
+        from_sibling = {}
+        for symbol in undefined:
+            for sibling in siblings:
+                if symbol in sibling_exports[sibling]:
+                    from_sibling[symbol] = sibling
+                    break
+        unbound = sorted(n for n in undefined if n not in all_exports and n not in from_sibling)
         syscalls = raw_syscalls(shared)
+        sibling_data = sorted(n for n in objects if n in from_sibling)
         module = {
             "built": prx.exists(),
             "unresolved": unresolved,
-            "needed": needed(shared),
+            "needed": deps,
             "imports": len(undefined),
+            "sibling_imports": {s: sum(1 for v in from_sibling.values() if v == s) for s in siblings},
             "data_imports": sorted(objects),
             "unbound": unbound,
             "raw_syscalls": syscalls,
@@ -151,6 +175,9 @@ def main():
             if name in must_bind:
                 report["errors"].append(f"{name}: no PRX")
                 status = 1
+        if sibling_data:
+            report["errors"].append(f"{name}: data import(s) from a sibling PRX: {', '.join(sibling_data)}")
+            status = 1
         if syscalls:
             report["errors"].append(f"{name}: raw syscall in {', '.join(syscalls)}")
             status = 1

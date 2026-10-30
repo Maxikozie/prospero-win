@@ -11,6 +11,11 @@
  * the watchdog gives up, on the kernel log and the UDP log, after which the
  * title idles: on the PS4 a process that exits is reported as a crash.
  *
+ * Before Wine, milestone d1's stages run (pw_d1_orbis.h: cross-PRX
+ * binding, the title's VideoOut, the DS4), each recorded in a progress
+ * file; hello.exe is the last stage, and the "PS4WINE d1 ..." line follows
+ * the c line.
+ *
  * Arguments (from argv[0] on after a LoadExec restart, from argv[1] on at a
  * fresh launch): path=<absolute Windows path> (default C:\hello.exe).
  *
@@ -26,6 +31,7 @@
 #include "pw_wine_prx.h"
 #include "prospero_win.h"
 #include "pw_wine_exit_orbis.h"
+#include "pw_d1_orbis.h"
 #include "ps5log/ps5log.h"
 #include "orbislog/orbislog.h"
 #include <errno.h>
@@ -64,7 +70,6 @@ extern uint32_t sceKernelLoadStartModule(const char *path, size_t argc, const vo
                                          const void *option, int *result);
 extern int sceKernelGetModuleInfo(int32_t handle, void *info);
 extern int sceKernelDlsym(int32_t handle, const char *symbol, void **address);
-extern int sceKernelGetModuleList(int32_t *handles, size_t size, size_t *count);
 
 /* ---- state the exit hook reports --------------------------------------- */
 
@@ -75,7 +80,7 @@ static char last_stdout[200];
 static volatile uint64_t last_stdout_ns;
 static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int reported;
-static uint64_t start_ns;
+static uint64_t start_ns, hello_ns;
 
 static uint64_t now_ns(void)
 {
@@ -84,11 +89,26 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* The milestone line: every sink, once. */
+static uint64_t now_ns_hook(void) { return now_ns(); }
+
+/* A record that must arrive: the kernel log, the UDP log and the diagnostics log. */
+static void emit_line(const char *line)
+{
+    char datagram[1500];
+    orbislog_klog(line);
+    snprintf(datagram, sizeof(datagram), "%s\n", line);
+    ps5log_raw(datagram, strlen(datagram));
+    LOG("%s", line);
+}
+
+static void log_line(const char *line) { LOG("%s", line); }
+
+/* The milestone line: every sink, once; then the d1 hello stage ends. */
 static void report(const char *exit_text, const char *kind)
 {
     char line[512], quoted[220];
     size_t n = 0;
+    int hello_ok;
 
     if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) return;
     pthread_mutex_lock(&stdout_lock);
@@ -100,14 +120,10 @@ static void report(const char *exit_text, const char *kind)
              "PS4WINE c hello.exe stdout=\"%s\" server=%s exit=%s build=%s load=%d stage=%d kind=%s "
              "session_s=%llu",
              quoted, server_connected ? "inprocess" : "none", exit_text, PW_BUILD_ID, load_status,
-             start.stage, kind, (unsigned long long)((now_ns() - start_ns) / 1000000000ull));
-    orbislog_klog(line);
-    {
-        char datagram[520];
-        snprintf(datagram, sizeof(datagram), "%s\n", line);
-        ps5log_raw(datagram, strlen(datagram));
-    }
-    LOG("%s", line);
+             start.stage, kind, (unsigned long long)((now_ns() - hello_ns) / 1000000000ull));
+    emit_line(line);
+    hello_ok = !strcmp(exit_text, "0") && server_connected && !strcmp(quoted, "Hello from PE64");
+    pw_d1_hello_end(hello_ok ? "ok" : exit_text);
 }
 
 /* ---- fd 1 and fd 2 -> the log ------------------------------------------- */
@@ -237,35 +253,6 @@ static void exit_hook(void *context, int status, const char *kind)
  * RIP sits at ucontext offset 224, RBP at 136 (mcontext at 64: FreeBSD's
  * mc_rbp at 72), measured on the PS4 in milestone a. Every Orbis object is
  * built with frame pointers, so the RBP chain is a backtrace. */
-static const char *module_of(uint64_t address, char *out, size_t size)
-{
-    int32_t handles[64];
-    size_t count = 0;
-
-    snprintf(out, size, "?");
-    if (sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &count) != 0) return out;
-    for (size_t m = 0; m < count; m++) {
-        uint8_t mi[PW_PRX_MODULE_INFO_BYTES];
-        uint64_t size_word = sizeof(mi);
-        PwPrxSegment segs[PW_PRX_MAX_SEGMENTS];
-        uint32_t n = 0;
-        char name[PW_PRX_MAX_NAME];
-        memset(mi, 0, sizeof(mi));
-        memcpy(mi, &size_word, sizeof(size_word));
-        if (sceKernelGetModuleInfo(handles[m], mi) != 0) continue;
-        memcpy(mi, &size_word, sizeof(size_word));
-        if (pw_prx_parse_module_info(mi, name, segs, &n) != PW_PRX_OK) continue;
-        for (uint32_t i = 0; i < n; i++) {
-            uint64_t base = (uint64_t)(uintptr_t)segs[i].address;
-            if (address >= base && address < base + segs[i].size) {
-                snprintf(out, size, "%s+0x%llx", name, (unsigned long long)(address - base));
-                return out;
-            }
-        }
-    }
-    return out;
-}
-
 static void early_fault(int sig, siginfo_t *info, void *opaque)
 {
     uint64_t rip = 0, offset = 0, rbp = 0;
@@ -287,7 +274,7 @@ static void early_fault(int sig, siginfo_t *info, void *opaque)
 
         snprintf(line, sizeof(line), "PS4WINE fault signal=%d addr=0x%llx rip=0x%llx ntdll_segment=%d offset=0x%llx in=%s",
                  sig, (unsigned long long)(uintptr_t)(info ? info->si_addr : NULL), (unsigned long long)rip,
-                 segment, (unsigned long long)offset, module_of(rip, where, sizeof(where)));
+                 segment, (unsigned long long)offset, pw_orbis_module_of(rip, where, sizeof(where)));
         orbislog_klog(line);
         LOG("%s", line);
         /* The frame chain: [rbp] is the caller's rbp, [rbp+8] the return address. */
@@ -298,7 +285,7 @@ static void early_fault(int sig, siginfo_t *info, void *opaque)
             memcpy(&next, frame, sizeof(next));
             memcpy(&ret, frame + 8, sizeof(ret));
             if (!ret) break;
-            LOG("PW_WINE64 frame %d ret=0x%llx %s", depth, (unsigned long long)ret, module_of(ret, where, sizeof(where)));
+            LOG("PW_WINE64 frame %d ret=0x%llx %s", depth, (unsigned long long)ret, pw_orbis_module_of(ret, where, sizeof(where)));
             if (next <= rbp) break;
             rbp = next;
         }
@@ -404,36 +391,6 @@ static void load_env_file(const char *path)
     }
 }
 
-/* ---- the PRX recipe, checked on a tiny module ------------------------------ */
-
-/* A second hypothesis of the first run: a module linked like the Wine PRXs
- * (--shared, a global module_start, no crtlib.o) loads, its constructor
- * runs when module_start is called, and sceKernelDlsym sees its export. */
-static void probe_module(const char *dir, const char *name)
-{
-    char path[512];
-    int result = 0, started = -1, dlsym_ok = -1;
-    int32_t handle;
-    void *sym = NULL;
-
-    snprintf(path, sizeof(path), "%s/%s.prx", dir, name);
-    handle = (int32_t)sceKernelLoadStartModule(path, 0, NULL, 0, NULL, &result);
-    if (handle <= 0) {
-        LOG("PW_WINE64 %s load=0x%x result=%d", name, (unsigned)handle, result);
-        return;
-    }
-    if (sceKernelDlsym(handle, "pw_probe_mod_started", &sym) == 0 && sym) {
-        int kernel_started = ((int (*)(void))sym)();
-        void *ms = NULL;
-        if (sceKernelDlsym(handle, "module_start", &ms) == 0 && ms) ((int (*)(size_t, const void *))ms)(0, NULL);
-        started = ((int (*)(void))sym)();
-        LOG("PW_WINE64 %s kernel_ran_ctor=%d ctor_after_module_start=%d", name, kernel_started == 0x5157,
-            started == 0x5157);
-        dlsym_ok = 1;
-    }
-    LOG("PW_WINE64 %s load=0x%x dlsym=%d ctor=%d", name, (unsigned)handle, dlsym_ok, started == 0x5157);
-}
-
 /* ---- main ------------------------------------------------------------------- */
 
 static const char *const runtime_roots[] = { PW_ROOT "/runtime", "/app0" };
@@ -477,8 +434,18 @@ int main(int argc, char **argv)
     }
     LOG("PW_WINE64 ntdll=%s prefix=%s exe=%s found=%d", ntdll_path, PW_ROOT "/prefix", exe, !first);
 
-    probe_module(ntdll_dir, "pw_probe_mod");
-    probe_module(ntdll_dir, "pw_probe_tls");
+    {
+        PwD1Config d1 = { ntdll_dir, PW_ROOT, PW_BUILD_ID, log_line, emit_line, now_ns_hook };
+        pw_d1_start(&d1);
+        pw_d1_title_stages();
+    }
+    if (!pw_d1_hello_should_run()) {
+        /* hello.exe ended or was lost in an earlier launch of this cycle. */
+        pw_d1_emit_line();
+        for (;;) sleep(60);
+    }
+    pw_d1_hello_begin();
+    hello_ns = now_ns();
     {
         static PwFdForward forward_stderr = { -1, -1, "WINESERVER" }, forward_stdout = { -1, -1, "STDOUT" };
         static char fd_text[2][16];
@@ -569,7 +536,7 @@ int main(int argc, char **argv)
             next_alive = now + 1000000000ull;
         }
         pw_diagnostics_tick(now);
-        if (!reported && now - start_ns > (uint64_t)PW_WATCHDOG_S * 1000000000ull) {
+        if (!reported && now - hello_ns > (uint64_t)PW_WATCHDOG_S * 1000000000ull) {
             LOG("PW_WINE64 watchdog: no exit after %d s", PW_WATCHDOG_S);
             report("timeout", "watchdog");
         }
