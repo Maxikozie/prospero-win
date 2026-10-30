@@ -5,6 +5,7 @@
 #include "pw_videoout_orbis.h"
 #include "pw_pad_orbis.h"
 #include "pw_wine_prx.h"
+#include "pw_wine_display.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -606,7 +607,11 @@ static void stage_display(char *fields, size_t size)
 static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t frames, drawn;
 static uint32_t frame_width, frame_height;
-static uint32_t *last_drawn;   /* a copy of the last frame with any pixel drawn */
+static uint32_t *last_drawn;   /* the last frame with any pixel drawn, as the driver's BGRA (frame_width x frame_height) */
+static uint32_t cleared[PW_VIDEOOUT_ORBIS_BUFFERS][2];   /* the frame size each buffer's border was cleared for */
+/* Latency: from the first pad event not yet shown to the next present, and each present's own time. */
+static volatile uint64_t input_pending_ns;
+static uint64_t lat_n, lat_sum_ns, lat_max_ns, present_n, present_sum_ns;
 static uint32_t present_scale, present_x0, present_y0;   /* desktop -> 1920x1080 */
 static int fb_saved = -1;      /* -1 not yet, 0 saved, else failed */
 
@@ -619,11 +624,19 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
 {
     const uint32_t W = PW_VIDEOOUT_ORBIS_WIDTH, H = PW_VIDEOOUT_ORBIS_HEIGHT;
     uint32_t scale, x0, y0, *dst;
+    uint64_t t0 = cfg.now_ns(), pending = input_pending_ns;
     int any = 0;
 
     (void)context;
     if (!video_open || !bgra || !width || !height || width > W || height > H) return -1;
     pthread_mutex_lock(&present_lock);
+    if (pending) {
+        uint64_t lat = t0 - pending;
+        input_pending_ns = 0;
+        lat_n++;
+        lat_sum_ns += lat;
+        if (lat > lat_max_ns) lat_max_ns = lat;
+    }
     scale = W / width < H / height ? W / width : H / height;
     if (!scale) scale = 1;
     x0 = (W - width * scale) / 2;
@@ -632,12 +645,26 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     present_x0 = x0;
     present_y0 = y0;
     dst = pw_videoout_orbis_back(&video);
-    for (size_t i = 0; i < (size_t)W * H; i++) dst[i] = 0xff000000u;   /* opaque black around the desktop */
+    /* The border around the desktop: once per buffer and frame size, not every frame (8 MB). */
+    if (cleared[video.back][0] != width || cleared[video.back][1] != height) {
+        for (size_t i = 0; i < (size_t)W * H; i++) dst[i] = 0xff000000u;
+        cleared[video.back][0] = width;
+        cleared[video.back][1] = height;
+    }
     for (uint32_t y = 0; y < height; y++) {
         const uint32_t *src = (const uint32_t *)((const uint8_t *)bgra + (size_t)y * stride);
+        if (scale == 1) {
+            uint32_t *row = dst + (size_t)(y0 + y) * W + x0;
+            for (uint32_t x = 0; x < width; x++) {
+                uint32_t v = src[x];
+                any |= (v & 0x00ffffffu) != 0;
+                row[x] = (v & 0x0000ff00u) | (v >> 16 & 0xffu) | (v & 0xffu) << 16 | 0xff000000u;
+            }
+            continue;
+        }
         for (uint32_t x = 0; x < width; x++) {
             uint32_t v = src[x], rgba = (v & 0x0000ff00u) | (v >> 16 & 0xffu) | (v & 0xffu) << 16 | 0xff000000u;
-            if (v & 0x00ffffffu) any = 1;
+            any |= (v & 0x00ffffffu) != 0;
             for (uint32_t dy = 0; dy < scale; dy++)
                 for (uint32_t dx = 0; dx < scale; dx++)
                     dst[(size_t)(y0 + y * scale + dy) * W + x0 + x * scale + dx] = rgba;
@@ -649,29 +676,53 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     frame_height = height;
     if (any) {
         drawn++;
+        /* The source frame, not the 8 MB scan-out buffer: the readback is built from it when saved. */
         if (!last_drawn) last_drawn = malloc((size_t)W * H * 4);
-        if (last_drawn) memcpy(last_drawn, video.buffers[video.shown], (size_t)W * H * 4);
+        if (last_drawn)
+            for (uint32_t y = 0; y < height; y++)
+                memcpy(last_drawn + (size_t)y * width, (const uint8_t *)bgra + (size_t)y * stride, (size_t)width * 4);
     }
+    present_n++;
+    present_sum_ns += cfg.now_ns() - t0;
     pthread_mutex_unlock(&present_lock);
     return 0;
+}
+
+/* The last drawn frame to <root>/<name>, laid out as the scan-out buffer
+ * (centred, scaled, R,G,B,A) for fbshot.sh; 0 on success. */
+static int save_drawn_as(const char *name)
+{
+    const uint32_t W = PW_VIDEOOUT_ORBIS_WIDTH, H = PW_VIDEOOUT_ORBIS_HEIGHT;
+    char shot[512];
+    PwVideoOutOrbis copy;
+    uint32_t *frame;
+    int rc = -1;
+
+    pthread_mutex_lock(&present_lock);
+    if (last_drawn && present_scale && (frame = malloc((size_t)W * H * 4))) {
+        for (size_t i = 0; i < (size_t)W * H; i++) frame[i] = 0xff000000u;
+        for (uint32_t y = 0; y < frame_height * present_scale; y++)
+            for (uint32_t x = 0; x < frame_width * present_scale; x++) {
+                uint32_t v = last_drawn[(size_t)(y / present_scale) * frame_width + x / present_scale];
+                frame[(size_t)(present_y0 + y) * W + present_x0 + x] =
+                    (v & 0x0000ff00u) | (v >> 16 & 0xffu) | (v & 0xffu) << 16 | 0xff000000u;
+            }
+        copy = video;
+        copy.buffers[copy.shown] = frame;
+        snprintf(shot, sizeof(shot), "%s/%s", cfg.root, name);
+        rc = pw_videoout_orbis_save(&copy, shot);
+        free(frame);
+        step("present: last drawn frame of %llu kept as %s (%s)", (unsigned long long)frames, shot,
+             rc ? "failed" : "ok");
+    }
+    pthread_mutex_unlock(&present_lock);
+    return rc;
 }
 
 /* The last drawn frame to <root>/shot.raw (fbshot.sh's readback); once. */
 static void save_last_drawn(void)
 {
-    char shot[512];
-    PwVideoOutOrbis copy;
-
-    pthread_mutex_lock(&present_lock);
-    if (fb_saved == -1 && last_drawn) {
-        copy = video;
-        copy.buffers[copy.shown] = last_drawn;
-        snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
-        fb_saved = pw_videoout_orbis_save(&copy, shot) ? 1 : 0;
-        step("present: last drawn frame of %llu kept as %s (%s)", (unsigned long long)frames, shot,
-             fb_saved ? "failed" : "ok");
-    }
-    pthread_mutex_unlock(&present_lock);
+    if (fb_saved == -1 && last_drawn) fb_saved = save_drawn_as("shot.raw") ? 1 : 0;
 }
 
 /* ---- d4: winemine and a scripted click ------------------------------------------- */
@@ -696,11 +747,8 @@ static uint32_t desktop_pixel(uint32_t x, uint32_t y)
 {
     uint32_t v = 0xffffffffu;
     pthread_mutex_lock(&present_lock);
-    if (last_drawn && present_scale && x < frame_width && y < frame_height) {
-        uint32_t rgba = last_drawn[(size_t)(present_y0 + y * present_scale) * PW_VIDEOOUT_ORBIS_WIDTH +
-                                   present_x0 + x * present_scale];
-        v = (rgba & 0xffu) << 16 | (rgba & 0xff00u) | (rgba >> 16 & 0xffu);
-    }
+    if (last_drawn && x < frame_width && y < frame_height)
+        v = last_drawn[(size_t)y * frame_width + x] & 0x00ffffffu;   /* BGRA in memory: 0xRRGGBB as a word */
     pthread_mutex_unlock(&present_lock);
     return v;
 }
@@ -713,35 +761,134 @@ static void pause_ms(unsigned ms)
 
 static void post(uint32_t type, uint32_t code, int32_t x, int32_t y, uint32_t down)
 {
-    struct { uint32_t type, code; int32_t x, y; uint32_t down; } event = { type, code, x, y, down };  /* PwWineInput */
+    PwWineInput event = { type, code, x, y, down };
     if (!post_input || post_input(&event)) d4_refused++;
     else d4_posted++;
-    pause_ms(50);
+}
+
+static void *save_readback(void *arg)
+{
+    (void)arg;
+    save_last_drawn();
+    return NULL;
 }
 
 /* Waits for winemine's first frame, clicks the middle cell as the host run
  * did (relative motion since patch 0670: to the corner, then by the point),
- * waits for the cell to change, then ends the Wine stage itself: winemine
- * does not exit. */
-static void *d4_script(void *arg)
+ * waits for the cell to change and keeps that frame as the readback: after
+ * settle_ms on this thread (d4), or at once on another (d: the pad loop
+ * starts without waiting; the user found the stick dead for the first
+ * seconds while this thread settled and wrote 8 MB). */
+static void d4_click(unsigned settle_ms)
 {
     uint64_t until;
-    (void)arg;
     for (until = cfg.now_ns() + 90000000000ull; cfg.now_ns() < until && (!post_input || !drawn);) pause_ms(100);
     pause_ms(3000);
     d4_before = desktop_pixel(D4_PROBE_X, D4_PROBE_Y);
     step("d4 before click: frames=%llu drawn=%llu probe=%06x post_input=%d", (unsigned long long)frames,
          (unsigned long long)drawn, (unsigned)d4_before, post_input != NULL);
     post(2, 0, -100000, -100000, 0);   /* PW_WINE_INPUT_MOUSE_MOVE */
+    pause_ms(50);
     post(2, 0, D4_CLICK_X, D4_CLICK_Y, 0);
+    pause_ms(50);
     post(3, 0, 0, 0, 1);               /* PW_WINE_INPUT_MOUSE_BUTTON, left */
+    pause_ms(50);
     post(3, 0, 0, 0, 0);
+    pause_ms(50);
     for (until = cfg.now_ns() + 10000000000ull; cfg.now_ns() < until; pause_ms(100))
         if ((d4_after = desktop_pixel(D4_PROBE_X, D4_PROBE_Y)) != d4_before) break;
     d4_board_opened = d4_after != d4_before && d4_after != 0xffffffffu;
-    pause_ms(2000);
     step("d4 after click: frames=%llu probe=%06x board_opened=%d", (unsigned long long)frames, (unsigned)d4_after,
          d4_board_opened);
+    if (settle_ms) {
+        pause_ms(settle_ms);
+        save_last_drawn();
+    } else {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, save_readback, NULL)) save_last_drawn();
+        else pthread_detach(thread);
+    }
+}
+
+/* d4: the click, then the Wine stage ends here: winemine does not exit. */
+static void *d4_script(void *arg)
+{
+    (void)arg;
+    d4_click(2000);
+    pw_ms_wine_end("running", "", -1);
+    return NULL;
+}
+
+/* ---- d: the DualShock 4 drives the pointer ------------------------------------------ */
+
+/* After d4's click (board_opened, the readback), the pad's left stick moves
+ * the pointer (relative motion, pw_wine_pointer_step: dead zone and squared
+ * curve, at most D_POINTER_SPEED px/s), cross is the left button and circle
+ * the right, until OPTIONS is pressed or D_PLAY_S seconds pass (the Wine
+ * stage's watchdog is 180 s). The last frame is kept as shot-end.raw. */
+enum { D_POINTER_SPEED = 600, D_PLAY_S = 150 };
+
+static volatile int d_inputs, d_pad = -1, d_pad_reads;
+static const char *d_end = "-";
+
+static void *d_script(void *arg)
+{
+    static const struct { uint32_t mask; uint32_t button; } buttons[] = {
+        { PW_PAD_ORBIS_CROSS, 0 }, { PW_PAD_ORBIS_CIRCLE, 1 },
+    };
+    PwPadOrbis pad;
+    PwPadOrbisState state;
+    PwWinePointer pointer = { 0, 0 };
+    uint32_t held = 0;
+    uint64_t last, until, started, next_report;
+    (void)arg;
+
+    d4_click(0);
+    if ((d_pad = pw_pad_orbis_open(&pad) == 0)) {
+        step("d pad open user=0x%x handle=%d: stick moves the pointer, cross/circle click, OPTIONS ends",
+             (unsigned)pad.user, pad.handle);
+        last = started = next_report = cfg.now_ns();
+        for (until = last + (uint64_t)D_PLAY_S * 1000000000ull; cfg.now_ns() < until; pause_ms(8)) {
+            uint64_t now = cfg.now_ns();
+            PwWineInput move;
+            memset(&state, 0, sizeof(state));
+            if (pw_pad_orbis_read(&pad, &state)) continue;
+            d_pad_reads++;
+            /* A record a second: a session closed from the PS menu ends no stage. */
+            if (now >= next_report) {
+                step("d play t=%llus reads=%d inputs=%d refused=%d frames=%llu buttons=0x%x stick=%u,%u "
+                     "lat_avg_ms=%llu lat_max_ms=%llu present_ms=%.1f",
+                     (unsigned long long)((now - started) / 1000000000ull), d_pad_reads, d_inputs, d4_refused,
+                     (unsigned long long)frames, (unsigned)state.buttons, state.left_x, state.left_y,
+                     (unsigned long long)(lat_n ? lat_sum_ns / lat_n / 1000000ull : 0),
+                     (unsigned long long)(lat_max_ns / 1000000ull),
+                     present_n ? present_sum_ns / (double)present_n / 1e6 : 0.0);
+                next_report = now + 1000000000ull;
+            }
+            if (state.buttons & PW_PAD_ORBIS_OPTIONS) { d_end = "options"; break; }
+            if (pw_wine_pointer_step(&pointer, state.left_x, state.left_y, D_POINTER_SPEED,
+                                     (uint32_t)((now - last) / 1000), &move)) {
+                if (!input_pending_ns) input_pending_ns = now;
+                post(move.type, move.code, move.x, move.y, 0);
+                d_inputs++;
+            }
+            last = now;
+            for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
+                uint32_t down = state.buttons & buttons[i].mask;
+                if (down != (held & buttons[i].mask)) {
+                    if (!input_pending_ns) input_pending_ns = now;
+                    post(3, buttons[i].button, 0, 0, down != 0);   /* PW_WINE_INPUT_MOUSE_BUTTON */
+                    d_inputs++;
+                }
+            }
+            held = state.buttons;
+        }
+        if (!strcmp(d_end, "-")) d_end = "time";
+    } else {
+        step("d pad open failed: %s 0x%x", pad.failed, (unsigned)pad.status);
+        d_end = "nopad";
+    }
+    save_drawn_as("shot-end.raw");
     pw_ms_wine_end("running", "", -1);
     return NULL;
 }
@@ -751,6 +898,7 @@ static void *d4_script(void *arg)
 static void d1_lines(void);
 static void d2_lines(void);
 static void d4_lines(void);
+static void d_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -774,15 +922,20 @@ static const PwMsStage d4_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "winemine", 0, NULL, "exit=fault" },
 };
+static const PwMsStage d_stages[] = {
+    { "display", 15, stage_display, "display=fault" },
+    { "play", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
     { "d4", d4_stages, sizeof(d4_stages) / sizeof(d4_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d4_lines },
+    { "d", d_stages, sizeof(d_stages) / sizeof(d_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d_lines },
 };
 
 const char *pw_ms_select(const char *name)
 {
-    plan = &plans[2];   /* the newest milestone */
+    plan = &plans[3];   /* the newest milestone */
     for (size_t i = 0; name && i < sizeof(plans) / sizeof(plans[0]); i++)
         if (!strcmp(plans[i].name, name)) plan = &plans[i];
     return plan->name;
@@ -904,9 +1057,10 @@ void pw_ms_wine_begin(void)
 {
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
-    if (plan->lines == d4_lines) {
+    if (plan->lines == d4_lines || plan->lines == d_lines) {
         pthread_t thread;
-        if (!pthread_create(&thread, NULL, d4_script, NULL)) pthread_detach(thread);
+        if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : d_script, NULL))
+            pthread_detach(thread);
     }
 }
 
@@ -914,7 +1068,20 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
 {
     char fields[PW_STAGE_FIELDS];
 
-    if (plan->lines == d4_lines) {
+    if (plan->lines == d_lines) {
+        save_last_drawn();
+        pthread_mutex_lock(&present_lock);
+        snprintf(fields, sizeof(fields), "exit=%s frames=%llu inputs=%d refused=%d board_opened=%d fb=%s drawn=%llu "
+                 "pad=%s pad_reads=%d end=%s probe_before=%06x probe_after=%06x lat_avg_ms=%llu lat_max_ms=%llu "
+                 "present_ms=%.1f", exit_text,
+                 (unsigned long long)frames, d_inputs, d4_refused, d4_board_opened < 0 ? 0 : d4_board_opened,
+                 fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", (unsigned long long)drawn,
+                 d_pad == 1 ? "ok" : d_pad == 0 ? "none" : "-", d_pad_reads, d_end, (unsigned)d4_before,
+                 (unsigned)d4_after, (unsigned long long)(lat_n ? lat_sum_ns / lat_n / 1000000ull : 0),
+                 (unsigned long long)(lat_max_ns / 1000000ull),
+                 present_n ? present_sum_ns / (double)present_n / 1e6 : 0.0);
+        pthread_mutex_unlock(&present_lock);
+    } else if (plan->lines == d4_lines) {
         save_last_drawn();
         pthread_mutex_lock(&present_lock);
         snprintf(fields, sizeof(fields), "exit=%s frames=%llu drawn=%llu frame=%ux%u fb=%s board_opened=%d "
@@ -1025,6 +1192,19 @@ static void d4_lines(void)
         { "display", DISPLAY },
     };
     emit_line("PS4WINE d4 winemine", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* Milestone d's own line. */
+static void d_lines(void)
+{
+    enum { DISPLAY, PLAY };
+    static const LineKey keys[] = {
+        { "frames", PLAY }, { "inputs", PLAY }, { "refused", PLAY }, { "board_opened", PLAY }, { "fb", PLAY },
+        { "drawn", PLAY }, { "pad", PLAY }, { "pad_reads", PLAY }, { "end", PLAY }, { "probe_before", PLAY },
+        { "probe_after", PLAY }, { "lat_avg_ms", PLAY }, { "lat_max_ms", PLAY }, { "present_ms", PLAY },
+        { "exit", PLAY }, { "display", DISPLAY },
+    };
+    emit_line("PS4WINE d winemine", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void pw_ms_emit_lines(void)

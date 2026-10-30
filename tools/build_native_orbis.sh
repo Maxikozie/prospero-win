@@ -72,7 +72,8 @@ common="-std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections
 -DPW_ROOT=\"$data_root\""
 sources="native/orbis/wine64_main_orbis.c native/orbis/orbislog/orbislog.c native/pw_diagnostics.c \
 src/pw_result.c src/pw_wine_start.c wine/ps5/pw_wine_prx.c native/orbis/pw_stage_orbis.c \
-native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/pw_pad_orbis.c"
+native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/pw_pad_orbis.c \
+native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c"
 objects=""
 for source in $sources; do
     object=$out/obj/$(basename "${source%.c}").o

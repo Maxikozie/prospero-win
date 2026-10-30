@@ -10,8 +10,10 @@
  *       its frames on VideoOut -> PS4WINE d2 gdi ... and PS4WINE d3 fonts ...
  *   d4  the display, winemine and a scripted click on its board
  *       -> PS4WINE d4 winemine frames=N board_opened=0|1 refused=N fb=ok ...
+ *   d   d4's click, then the DualShock 4 drives the pointer until OPTIONS
+ *       -> PS4WINE d winemine frames=N inputs=N refused=N board_opened=0|1 fb=ok ...
  *
- * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default d4).
+ * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default d).
  * Title stages run under a fault handler that records the fault and goes
  * on with the next stage; each has a time limit a watchdog thread enforces
  * (on overrun: an H record, the lines with what is known, idle). The Wine

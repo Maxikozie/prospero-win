@@ -14,6 +14,7 @@
 #define PW_PAD_ORBIS_STATE_BYTES 120
 #define PW_PAD_ORBIS_CROSS 0x4000u
 #define PW_PAD_ORBIS_CIRCLE 0x2000u
+#define PW_PAD_ORBIS_OPTIONS 0x0008u
 
 typedef struct PwPadOrbisState {
     uint32_t buttons;

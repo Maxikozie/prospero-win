@@ -12,7 +12,7 @@
  * title idles: on the PS4 a process that exits is reported as a crash.
  *
  * Before Wine, a milestone plan's stages run (pw_milestone_orbis.h; the
- * plan from PS4WINE_MILESTONE in <root>/env.txt, default d4): d1 cross-PRX
+ * plan from PS4WINE_MILESTONE in <root>/env.txt, default d): d1 cross-PRX
  * binding, the title's VideoOut, the DS4, then hello.exe; d2 win32u's and
  * FreeType's slots, the display, then gdi64.exe with its frames on
  * VideoOut. Each stage is recorded in a progress file, the Wine program is
