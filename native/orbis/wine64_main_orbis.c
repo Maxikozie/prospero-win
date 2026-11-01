@@ -450,8 +450,13 @@ int main(int argc, char **argv)
         char milestone[16];
         LOG("PW_WINE64 plan %s", pw_ms_select(early_setting("PS4WINE_MILESTONE", milestone, sizeof(milestone))));
     }
-    /* path=... from argv[0] on (a LoadExec restart) or argv[1] on; else the plan's program. */
+    /* path=... from argv[0] on (a LoadExec restart) or argv[1] on; else env.txt's
+     * PS4WINE_EXE (a Windows path without spaces); else the plan's program. */
     snprintf(exe, sizeof(exe), "%s", pw_ms_exe());
+    {
+        char chosen[256];
+        if (early_setting("PS4WINE_EXE", chosen, sizeof(chosen)) && chosen[0]) snprintf(exe, sizeof(exe), "%s", chosen);
+    }
     for (int i = 0; i < argc; i++) {
         if (argv[i] && !strncmp(argv[i], "path=", 5) && argv[i][5]) snprintf(exe, sizeof(exe), "%s", argv[i] + 5);
     }

@@ -206,7 +206,8 @@ for unit in pw_wine_heap pw_wine_heap_libc pw_wine_dmem pw_wine_dmem_ps5 \
         pw_wine_threads pw_wine_threads_libc pw_wine_sink pw_wine_cwd pw_wine_cwd_libc; do
     compile_shim "$root/wine/ps5/$unit.c"
 done
-for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis pw_wine_dup_orbis; do
+for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis pw_wine_dup_orbis \
+        pw_wine_threads_orbis; do
     compile_shim "$root/wine/orbis/$unit.c"
 done
 case " $modules " in *" libvulkan "*)
@@ -374,11 +375,11 @@ case " $modules " in *" ntdll "*)
         pw_wine_set_audio_sink pw_wine_audio_available pw_wine_audio_output \
         __wine_virtual_stats __wine_virtual_fault_top __wine_ps5_set_output_sink __wine_ps5_memory_stats pw_cwd_set \
         __wine_ps5_set_segv_hook __wine_ps5_set_segv_unresolved_hook pw_wine_set_display_release pw_wine_release_display \
-        pw_wine_set_exit_hook pw_wine_setenv
+        pw_wine_set_exit_hook pw_wine_setenv pw_wine_thread_stats
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
             pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
-            pw_wine_dl_orbis pw_wine_dup_orbis; do
+            pw_wine_dl_orbis pw_wine_dup_orbis pw_wine_threads_orbis; do
         shims="$shims $obj/$unit.o"
     done
     link_prx ntdll dlls/ntdll/ntdll.so "$heap $dmem $shims $prx/obj/ntdll_desc.o $cwd_wraps $exit_wraps"

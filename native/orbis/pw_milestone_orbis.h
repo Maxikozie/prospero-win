@@ -36,6 +36,16 @@
  *       -> PS4WINE p4 bench pinball present_mode=async buffers=3 shown_hz=N flip_errors=N ...
  *       In p1, p3 and p4, env.txt's PS4WINE_PRESENT_PATH=scale|vo720|vo1080 and
  *       PS4WINE_PRESENT_MODE=sync|async replace the plan's defaults.
+ *   p5  p4's path with Wine's audio driver on the title's sceAudioOut port,
+ *       then a scripted tail of keys that plays Pinball's sounds
+ *       -> PS4WINE p5 bench pinball audio=on audio_open=ok ... grains_nonzero=N ...
+ *          flex_mib_start=N flex_mib=N threads_created=N threads_raised=N stack_floor_mib=N ...
+ *   p5w wowprospero.prx's slots, the display, wincb32.exe (tests/wine_wincb.c:
+ *       windows and callbacks on the main thread and on new threads, then 8
+ *       threads alive at once while the title samples the free flexible memory)
+ *       -> PS4WINE p5w wincb bits=32 cpu=translator cases=23 cases_ok=N main_ok=N/N new_ok=N/N
+ *          ... hold_flex_kib=N threads_created=N threads_raised=N stack_floor_mib=N ...
+ *       env.txt's PS4WINE_EXE (any plan) names another program, e.g. C:\wincb64.exe.
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes

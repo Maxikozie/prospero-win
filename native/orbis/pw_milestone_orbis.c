@@ -32,6 +32,7 @@ extern uint32_t sceKernelLoadStartModule(const char *path, size_t argc, const vo
 extern int sceKernelGetModuleInfo(int32_t handle, void *info);
 extern int sceKernelDlsym(int32_t handle, const char *symbol, void **address);
 extern int sceKernelGetModuleList(int32_t *handles, size_t size, size_t *count);
+extern int sceKernelAvailableFlexibleMemorySize(size_t *size);
 /* libkernel's SceKernelVirtualQueryInfo (OpenOrbis _types/kernel.h): the
  * region, then what backs it. Flags 1: the region at or after the address. */
 typedef struct VqInfo {
@@ -80,6 +81,8 @@ static const char *const p_path_names[] = { "scale", "vo720", "vo1080" };
 static int bench_plan, p_path, p_async;
 static int native_plan(void);   /* p2: 32-bit code on the hardware WoW64 backend */
 static void p5_lines(void);
+static void p5w_lines(void);
+static void hold_sample(int alive);
 static void pause_ms(unsigned ms);
 
 /* ---- the progress file, through stdio ----------------------------------- */
@@ -2148,6 +2151,8 @@ static void stage_low_map(char *fields, size_t size)
 static char vk64_line[256], vk64s_line[256], d3d11_line[256];
 static char hello32_line[160], hello32s_line[160], gdi32_line[320];
 static int hello32_done;
+/* p5w: wincb.exe's summary (WINCB done); its hold markers are sampled as they come. */
+static char wincb_done[400];
 
 void pw_ms_stdout(const char *line)
 {
@@ -2158,6 +2163,9 @@ void pw_ms_stdout(const char *line)
     else if (!strncmp(line, "HELLO32S ", 9)) snprintf(hello32s_line, sizeof(hello32s_line), "%s", line + 9);
     else if (!strncmp(line, "GDI32 ", 6)) snprintf(gdi32_line, sizeof(gdi32_line), "%s", line + 6);
     else if (!strcmp(line, "Hello from PE32")) hello32_done = 1;
+    else if (!strncmp(line, "WINCB done ", 11)) snprintf(wincb_done, sizeof(wincb_done), "%s", line + 11);
+    else if (!strcmp(line, "WINCB hold_begin")) hold_sample(0);
+    else if (!strncmp(line, "WINCB hold n=", 13)) hold_sample(1);
 }
 
 /* What RADV reads (libvulkan.prx is given ntdll's environment when win32u
@@ -2232,6 +2240,80 @@ static const char *wow_stats(uint64_t out[PW_WOW_STAT_COUNT])
     if (strcmp(found, "ok")) return found;
     ((pw_wow_stats_fn)(uintptr_t)address)(out, PW_WOW_STAT_COUNT);
     return "ok";
+}
+
+/* ---- thread stacks: ntdll.prx's pthread layer and the free flexible memory ---- */
+
+/* Free flexible memory in bytes, -1 when the kernel does not say. */
+static long long flex_free(void)
+{
+    size_t size = 0;
+    return sceKernelAvailableFlexibleMemorySize(&size) ? -1 : (long long)size;
+}
+
+typedef struct ThreadStats {
+    const char *found;   /* "ok", or why there are no counts */
+    unsigned long created, raised, create_failed;
+    unsigned long long floor;
+} ThreadStats;
+
+/* The pthread layer linked into ntdll.prx (orbis-compat's, which gives a
+ * thread asking for less at least the main thread's stack): its counts,
+ * through ntdll's export (wine/orbis/pw_wine_threads_orbis.c). The title's
+ * own copy of the layer counts only the title's threads. */
+static void thread_stats(ThreadStats *t)
+{
+    void *address;
+
+    memset(t, 0, sizeof(*t));
+    t->found = ntdll_symbol("pw_wine_thread_stats", &address);
+    if (!strcmp(t->found, "ok"))
+        ((void (*)(unsigned long *, unsigned long *, unsigned long *, unsigned long long *))(uintptr_t)address)(
+            &t->created, &t->raised, &t->create_failed, &t->floor);
+}
+
+static long long flex_start = -1;   /* before Wine (pw_ms_wine_begin) */
+
+/* flex_mib_start flex_mib threads_created threads_raised threads_create_failed stack_floor_mib thread_stats */
+static void thread_fields(char *out, size_t size)
+{
+    ThreadStats t;
+    long long flex = flex_free();
+    char start[24] = "-", now[24] = "-";
+
+    thread_stats(&t);
+    if (flex_start >= 0) snprintf(start, sizeof(start), "%lld", flex_start >> 20);
+    if (flex >= 0) snprintf(now, sizeof(now), "%lld", flex >> 20);
+    if (strcmp(t.found, "ok"))
+        snprintf(out, size, "flex_mib_start=%s flex_mib=%s threads_created=- threads_raised=- threads_create_failed=- "
+                 "stack_floor_mib=- thread_stats=%s", start, now, t.found);
+    else
+        snprintf(out, size, "flex_mib_start=%s flex_mib=%s threads_created=%lu threads_raised=%lu "
+                 "threads_create_failed=%lu stack_floor_mib=%llu thread_stats=ok", start, now, t.created, t.raised,
+                 t.create_failed, t.floor >> 20);
+}
+
+/* p5w's hold probe: the free flexible memory when wincb.exe announces its 8
+ * threads (hold_begin) and when all 8 are alive (hold n=8), and the layer's
+ * thread count then. Called on the stdout forwarder's thread. */
+static long long hold_flex[2] = { -1, -1 };
+static ThreadStats hold_threads;
+
+static void hold_sample(int alive)
+{
+    hold_flex[alive ? 1 : 0] = flex_free();
+    if (alive) thread_stats(&hold_threads);
+}
+
+/* hold_flex_kib (begin minus alive: what the 8 threads took) flex_mib_hold threads_created_hold */
+static void hold_fields(char *out, size_t size)
+{
+    char kib[24] = "-", mib[24] = "-", created[24] = "-";
+
+    if (hold_flex[0] >= 0 && hold_flex[1] >= 0) snprintf(kib, sizeof(kib), "%lld", (hold_flex[0] - hold_flex[1]) / 1024);
+    if (hold_flex[1] >= 0) snprintf(mib, sizeof(mib), "%lld", hold_flex[1] >> 20);
+    if (hold_threads.found && !strcmp(hold_threads.found, "ok")) snprintf(created, sizeof(created), "%lu", hold_threads.created);
+    snprintf(out, size, "hold_flex_kib=%s flex_mib_hold=%s threads_created_hold=%s", kib, mib, created);
 }
 
 /* The value of KEY in a "k=v k=v" line, "-" when absent. */
@@ -2372,6 +2454,13 @@ static const PwMsStage p5_stages[] = {
     { "audio", 15, stage_audio, "audio_open=fault" },
     { "pinball", 0, NULL, "exit=fault" },
 };
+/* p5w: wincb.exe's window cases on the main thread and on new threads, on
+ * p5's stages without the audio (a 32-bit program: wowprospero's slots). */
+static const PwMsStage p5w_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "wincb", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -2388,6 +2477,8 @@ static const PwMsPlan plans[] = {
     /* p3, p4: the benchmark on another present path, after the HDMI test pattern. */
     { "p3", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p3_lines },
     { "p4", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p4_lines },
+    /* p5w before p5: the last plan is the default. */
+    { "p5w", p5w_stages, sizeof(p5w_stages) / sizeof(p5w_stages[0]), "C:\\wincb32.exe", 0, p5w_lines },
     { "p5", p5_stages, sizeof(p5_stages) / sizeof(p5_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p5_lines },
 };
 
@@ -2549,6 +2640,7 @@ int pw_ms_wine_should_run(void) { return pw_stage_should_run(&run, wine_stage())
 
 void pw_ms_wine_begin(void)
 {
+    flex_start = flex_free();
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
     if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines || p_plan()) {
@@ -2648,6 +2740,13 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", frame_width, frame_height);
         p_bench_fields(p_bench, sizeof(p_bench));
         pthread_mutex_unlock(&present_lock);
+        {
+            /* The thread stacks' cost (phase p5): appended, outside the lock. */
+            char threads[300];
+            size_t n = strlen(fields);
+            thread_fields(threads, sizeof(threads));
+            snprintf(fields + n, sizeof(fields) - n, " %s", threads);
+        }
     } else if (plan->lines == f_lines) {
         /* Pinball: the translator's counters, the frames (all, and the play's
          * rate), the pad. native_caps comes with f4. */
@@ -2693,6 +2792,20 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  pick(gdi32_line, "screen", screen, sizeof(screen)), pick(gdi32_line, "pixel", pixel, sizeof(pixel)),
                  pick(gdi32_line, "window", window, sizeof(window)), pick(gdi32_line, "fonts", fonts, sizeof(fonts)));
         pthread_mutex_unlock(&present_lock);
+    } else if (plan->lines == p5w_lines) {
+        /* wincb.exe: its summary (its "ok" renamed cases_ok), the hold probe's
+         * samples and the thread stacks' fields; cpu as in the p plans. */
+        static const char *const rename[] = { "ok", "cases_ok" };
+        uint64_t wow[PW_WOW_STAT_COUNT];
+        const char *counted = wow_stats(wow);
+        char done[400], hold[160], threads[300];
+        renamed(wincb_done[0] ? wincb_done : "cases=-", rename, 1, done, sizeof(done));
+        hold_fields(hold, sizeof(hold));
+        thread_fields(threads, sizeof(threads));
+        snprintf(fields, sizeof(fields), "exit=%s cpu=%s faults_unresolved=%llu %s %s %s", exit_text,
+                 !strcmp(counted, "ok") && wow[PW_WOW_STAT_THREADS] ? "translator"
+                 : module_loaded("wow64native") == 1 ? "native" : strcmp(counted, "ok") ? counted : "none",
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED], done, hold, threads);
     } else if (plan->c_line) {
         /* hello.exe: milestone c's regression (d1, e1). */
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
@@ -2950,9 +3063,28 @@ static void p5_lines(void)
         { "audio_init", AUDIO }, { "audio_volume", AUDIO }, { "audio_initial_user", AUDIO },
         { "cpu", PINBALL }, { "faults_unresolved", PINBALL }, { "frames", PINBALL }, { "pad", PINBALL },
         { "fb", PINBALL }, { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY },
-        { "vo_size", DISPLAY }, { "vo_buffers", DISPLAY }, { "exit", PINBALL },
+        { "vo_size", DISPLAY }, { "vo_buffers", DISPLAY }, { "flex_mib_start", PINBALL }, { "flex_mib", PINBALL },
+        { "threads_created", PINBALL }, { "threads_raised", PINBALL }, { "threads_create_failed", PINBALL },
+        { "stack_floor_mib", PINBALL }, { "thread_stats", PINBALL }, { "exit", PINBALL },
     };
     emit_line_with("PS4WINE p5 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
+}
+
+/* p5w: wincb.exe's summary, its hold probe and the thread stacks' cost. */
+static void p5w_lines(void)
+{
+    enum { WOW, DISPLAY, WINCB };
+    static const LineKey keys[] = {
+        { "bits", WINCB }, { "cpu", WINCB }, { "cases", WINCB }, { "cases_ok", WINCB }, { "main_ok", WINCB },
+        { "new_ok", WINCB }, { "direct_main", WINCB }, { "direct_new", WINCB }, { "cbt_main", WINCB },
+        { "cbt_new", WINCB }, { "cross", WINCB }, { "hold_windows", WINCB }, { "first_fail", WINCB },
+        { "faults_unresolved", WINCB }, { "hold_flex_kib", WINCB }, { "flex_mib_hold", WINCB },
+        { "threads_created_hold", WINCB }, { "flex_mib_start", WINCB }, { "flex_mib", WINCB },
+        { "threads_created", WINCB }, { "threads_raised", WINCB }, { "threads_create_failed", WINCB },
+        { "stack_floor_mib", WINCB }, { "thread_stats", WINCB }, { "wow_bound", WOW }, { "display", DISPLAY },
+        { "exit", WINCB },
+    };
+    emit_line("PS4WINE p5w wincb", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 /* p2: the probe's fields, Wine's native caps (0883's export; "-" while the

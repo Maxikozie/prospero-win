@@ -27,6 +27,10 @@
 #   --seconds N    how long the program runs (default 8)
 #   --click X,Y    a left click at X,Y on the desktop (800x600)
 #   --after N      the click comes once N frames were shown (default 1)
+#   --preload LIB  one more library to preload after the sink (repeatable;
+#                  tests/lab/pw_foreign_stack.c is one)
+#   --no-frame-check  a program that presents nothing (hidden windows) is
+#                  not a failure
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -36,6 +40,8 @@ frames=$root/.deps/wine-host-drv/frames
 seconds=8
 click=
 after=1
+preload=
+frame_check=1
 fail() { echo "test_wine_ps5_driver: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case $1 in
@@ -45,7 +51,9 @@ while [ $# -gt 0 ]; do
     --seconds) seconds=$2; shift ;;
     --click) click=$2; shift ;;
     --after) after=$2; shift ;;
-    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --preload) preload="$preload $2"; shift ;;
+    --no-frame-check) frame_check= ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --) shift; break ;;
     -*) fail "unknown argument $1" ;;
     *) break ;;
@@ -76,9 +84,9 @@ fi
 name=$(basename "$1")
 # env: an optional NAME=VALUE from an expansion is no assignment to the shell.
 env PW_SINK_PROCESS="${name%.exe}" PW_FRAME_DIR="$frames" PW_FRAME_DUMP="$frames/last.ppm" \
-    PW_INPUT_AFTER="$after" ${click:+PW_INPUT_CLICK=$click} LD_PRELOAD="$sink" \
+    PW_INPUT_AFTER="$after" ${click:+PW_INPUT_CLICK=$click} LD_PRELOAD="$sink$preload" \
     timeout -s KILL "$seconds" "$build/wine" "$@" > "$frames/run.log" 2>&1 || true
 "$build/server/wineserver" -k 2>/dev/null || true
 count=$(find "$frames" -name '[0-9]*.ppm' | wc -l)
 echo "test_wine_ps5_driver: $count frame(s) of $name in $frames (log: $frames/run.log)"
-[ "$count" -gt 0 ] || fail "no frame was presented"
+[ -z "$frame_check" ] || [ "$count" -gt 0 ] || fail "no frame was presented"

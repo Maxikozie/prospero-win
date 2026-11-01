@@ -1,0 +1,130 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: orbis: a new thread's syscall frame on its kernel stack
+
+On the PS4 the pthread_create linked into ntdll.prx (orbis-compat's)
+replaces any requested stack smaller than its floor, the main thread's
+stack size (16 MiB in the title), with a fresh attribute that keeps only
+the detach state and the guard size. The stack spawn_thread passes with
+pthread_attr_setstack is dropped, so every thread but the first runs its
+Unix side on a stack of the platform's (measured at 0x7e7xxxxxx), below its
+kernel stack (at 0x1000000000 and up). signal_start_thread made the syscall
+frame there, and KeUserModeCallback's check refused every callback with
+STATUS_STACK_OVERFLOW before any trace: a window procedure, a hook,
+WM_GETMINMAXINFO and WM_NCCREATE got 0 on every thread but the main one
+(winmm's devices thread could not make its message window, so no sound
+played), and is_inside_syscall() never held on those threads.
+
+A thread whose stack pointer lies outside its kernel stack when it starts
+now gets its frame at the top of that stack, as the first thread does in
+signal_init_process(), and signal_start_thread switches to it; the stack
+it started on stays for the exit path (frame->syscall_cfa). A thread that
+runs on its kernel stack, as everywhere but on the PS4, is left as it is,
+so the change is not gated on __ORBIS__: on the PC it does nothing unless
+a preloaded pthread_create moves threads the same way
+(tests/lab/pw_foreign_stack.c), which reproduces the failure there and
+tests this (tests/test_wine_wincb.py).
+
+WINE_PS5_THREAD_FRAME=0 keeps the old placement, so one runtime shows both
+on the console. The first thread found off its kernel stack says which was
+done, on the err channel ("thread frame moved to the kernel stack" or
+"thread frame left in place (switch off)", with both addresses), and
+KeUserModeCallback says once when it refuses a callback, with the
+addresses that decided it.
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index c5b76c7ffd..fb97262ed0 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -2397,6 +2397,9 @@ void server_init_thread( struct thread_data *data )
+     if (data->teb)
+     {
+         init_teb_data( data );
++#ifdef __x86_64__
++        signal_init_thread_frame( data );
++#endif
+         signal_start_thread( data->start, data->param, data->teb );
+     }
+     else if (data->start)
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 62a7f129d6..b60c865b73 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2074,7 +2074,16 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     ULONG64 rsp = (frame->rsp - offsetof( struct callback_stack_layout, args_data[len] )) & ~15;
+     struct callback_stack_layout *stack = (struct callback_stack_layout *)rsp;
+ 
+-    if ((char *)get_kernel_stack( data ) + min_kernel_stack > (char *)&frame) return STATUS_STACK_OVERFLOW;
++    if ((char *)get_kernel_stack( data ) + min_kernel_stack > (char *)&frame)
++    {
++        static LONG reported;
++
++        /* Refused before any trace: say so once, with the addresses that decided it. */
++        if (!InterlockedExchange( &reported, 1 ))
++            ERR_(seh)( "callback %u refused: stack %p is not above the kernel stack %p+%#x\n",
++                       (unsigned int)id, &frame, get_kernel_stack( data ), (unsigned int)min_kernel_stack );
++        return STATUS_STACK_OVERFLOW;
++    }
+ 
+     stack->args              = stack->args_data;
+     stack->len               = len;
+@@ -3101,6 +3110,46 @@ NTSTATUS signal_alloc_thread( TEB *teb )
+ }
+ 
+ 
++/**********************************************************************
++ *		signal_init_thread_frame
++ *
++ * A new thread's syscall frame is made by signal_start_thread at the stack
++ * pointer it finds, which is in the kernel stack that spawn_thread gives the
++ * thread. A pthread_create that replaces that stack with one of its own (the
++ * PS4 title's raises any stack below the main thread's size and drops the
++ * address) would put the frame, and with it every system call's Unix side,
++ * outside the kernel stack: KeUserModeCallback's check then refuses every
++ * callback (STATUS_STACK_OVERFLOW) and is_inside_syscall() never holds. Such
++ * a thread gets its frame at the top of its kernel stack, as the first
++ * thread does in signal_init_process(), and signal_start_thread switches to
++ * it. Threads that run on their kernel stack are left as they are.
++ * WINE_PS5_THREAD_FRAME=0 keeps the old placement, so that one runtime shows
++ * both on the console; the first thread found off its kernel stack says
++ * which was done.
++ */
++void signal_init_thread_frame( struct thread_data *data )
++{
++    static int move = -1;
++    static LONG reported;
++    char *stack = get_kernel_stack( data ), *sp = (char *)&stack;
++
++    if (sp >= stack && sp < stack + kernel_stack_size) return;
++    if (move < 0)
++    {
++        const char *env = getenv( "WINE_PS5_THREAD_FRAME" );
++        move = !env || strcmp( env, "0" );
++    }
++    if (!InterlockedExchange( &reported, 1 ))
++    {
++        if (move) ERR_(seh)( "thread frame moved to the kernel stack (stack %p, kernel stack %p)\n", sp, stack );
++        else ERR_(seh)( "thread frame left in place (switch off; stack %p, kernel stack %p)\n", sp, stack );
++    }
++    if (!move) return;
++    get_teb_data( data )->syscall_frame = (struct syscall_frame *)(stack + kernel_stack_size -
++                                                                    ((frame_size + 63) & ~63));
++}
++
++
+ /**********************************************************************
+  *		signal_free_thread
+  */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 4d486e12e3..b3a655d429 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -365,6 +365,9 @@ extern void signal_free_thread( TEB *teb );
+ extern void signal_disable_syscall_dispatch(void);
+ extern void signal_init_process( TEB *teb );
+ extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, TEB *teb );
++#ifdef __x86_64__
++extern void signal_init_thread_frame( struct thread_data *data );
++#endif
+ extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
+ extern ssize_t wine_write_stderr( const void *buf, size_t len );
+ extern void wine_vprint_stderr( const char *prefix, const char *format, va_list args );
