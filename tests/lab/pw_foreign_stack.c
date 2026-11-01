@@ -12,8 +12,10 @@
  *
  * This library does the same on the host, written from that behaviour: when
  * the caller's attribute has a stack address, the thread is created with a
- * new attribute of $PW_FOREIGN_STACK_MIB MiB (default 16) and the caller's
- * detach state and guard size. On the PS4 the platform's stacks lie below
+ * new attribute of $PW_FOREIGN_STACK_MIB MiB (default 16), or of
+ * $PW_FOREIGN_STACK_KIB KiB when that is set (the layer's "small" policy
+ * gives such a caller 512 KiB), and the caller's detach state and guard
+ * size. On the PS4 the platform's stacks lie below
  * Wine's kernel stacks, and KeUserModeCallback's check compares addresses,
  * so the new stack is mapped in the first free range below the caller's
  * (MAP_FIXED_NOREPLACE, searched downward); when there is none, glibc's own
@@ -66,7 +68,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)
     static create_fn real;
     static atomic_int registered;
     void *addr = NULL, *stack;
-    size_t size = 0, guard = 0, mib = 16;
+    size_t size = 0, guard = 0, bytes = (size_t)16 << 20;
     int detach = PTHREAD_CREATE_JOINABLE, ret;
     const char *env;
     pthread_attr_t fresh;
@@ -74,24 +76,25 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)
     if (!real && !(real = (create_fn)dlsym(RTLD_NEXT, "pthread_create"))) return 11; /* EAGAIN */
     if (!attr || pthread_attr_getstack(attr, &addr, &size) || !addr) return real(thread, attr, start, arg);
 
-    if ((env = getenv("PW_FOREIGN_STACK_MIB")) && atoi(env) > 0) mib = (size_t)atoi(env);
+    if ((env = getenv("PW_FOREIGN_STACK_MIB")) && atoi(env) > 0) bytes = (size_t)atoi(env) << 20;
+    if ((env = getenv("PW_FOREIGN_STACK_KIB")) && atoi(env) > 0) bytes = (size_t)atoi(env) << 10;
     if (pthread_attr_init(&fresh)) return real(thread, attr, start, arg);
     pthread_attr_getdetachstate(attr, &detach);
     pthread_attr_getguardsize(attr, &guard);
     pthread_attr_setdetachstate(&fresh, detach);
     pthread_attr_setguardsize(&fresh, guard);
-    if ((stack = map_below(addr, mib << 20))) pthread_attr_setstack(&fresh, stack, mib << 20);
+    if ((stack = map_below(addr, bytes))) pthread_attr_setstack(&fresh, stack, bytes);
     else
     {
-        pthread_attr_setstacksize(&fresh, mib << 20);
+        pthread_attr_setstacksize(&fresh, bytes);
         atomic_fetch_add(&above, 1);
     }
     ret = real(thread, &fresh, start, arg);
     pthread_attr_destroy(&fresh);
     if (!ret && atomic_fetch_add(&moved, 1) == 0)
     {
-        fprintf(stderr, "pw_foreign_stack: moved a thread off its stack %p+%#zx onto %zu MiB at %p\n",
-                addr, size, mib, stack);
+        fprintf(stderr, "pw_foreign_stack: moved a thread off its stack %p+%#zx onto %zu KiB at %p\n",
+                addr, size, bytes >> 10, stack);
         if (!atomic_exchange(&registered, 1)) atexit(report);
     }
     return ret;

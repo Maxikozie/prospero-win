@@ -46,6 +46,18 @@
  *       -> PS4WINE p5w wincb bits=32 cpu=translator cases=23 cases_ok=N main_ok=N/N new_ok=N/N
  *          ... hold_flex_kib=N threads_created=N threads_raised=N stack_floor_mib=N ...
  *       env.txt's PS4WINE_EXE (any plan) names another program, e.g. C:\wincb64.exe.
+ *   p6  the thread stacks: libkernel's own 16 MiB stack created, joined and
+ *       created again (stack_probe, no Wine), then p5w's wincb32.exe, whose
+ *       8 hold threads come twice (the second 8 after the first have ended)
+ *       -> PS4WINE p6 stacks stack_policy=keep|small|floor hold_flex_kib=N hold_back_kib=N
+ *          hold2_flex_kib=N threads_kept=N threads_small=N threads_keep_refused=N ...
+ *          sp_lib_rc=0x0,0x0 sp_lib_alive1_kib=N sp_lib_kib1=N sp_lib_alive2_kib=N sp_lib_kib2=N ...
+ *       env.txt's WINE_PS5_THREAD_STACK (every plan: read by wine64_main_orbis.c
+ *       and handed to ntdll.prx's pthread layer before Wine starts) chooses what a
+ *       thread whose caller set its stack (Wine's spawn_thread) gets: keep (the
+ *       default), small (512 KiB of the layer's own) or floor (the main thread's
+ *       size, as before). The e line carries the same thread fields and
+ *       libvulkan.prx's own layer: vk_threads_created vk_stack_floor_kib.
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes

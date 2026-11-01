@@ -2,6 +2,7 @@
 #ifndef PW_VULKAN_RADV_ORBIS_H
 #define PW_VULKAN_RADV_ORBIS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* What reached the driver, whichever program presents (libvulkan.prx's
@@ -26,5 +27,12 @@ struct pw_vulkan_stats
 /* Fills *stats up to stats->size bytes; returns 0, or -1 for a NULL or
  * too-small buffer. */
 int pw_vulkan_stats(struct pw_vulkan_stats *stats);
+
+/* The counters of the pthread layer linked into libvulkan.prx (its own copy,
+ * which sees only the threads RADV creates): threads created and raised, and
+ * the floor in bytes, 0 while no thread has resolved it (it is read without
+ * resolving it: resolving would take the reader's own stack). Any pointer
+ * may be NULL. */
+void pw_vulkan_thread_stats(unsigned long *created, unsigned long *raised, size_t *floor_bytes);
 
 #endif

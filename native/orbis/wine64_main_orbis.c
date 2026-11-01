@@ -528,6 +528,17 @@ int main(int argc, char **argv)
         if (set_sink) set_sink(wine_output_sink);
         if (set_exit) set_exit(exit_hook, NULL);
         {
+            /* What ntdll.prx's pthread layer gives a thread whose caller set its
+             * stack (spawn_thread: the kernel stack): keep, small or floor, from
+             * WINE_PS5_THREAD_STACK, before Wine creates its first thread. */
+            const char *(*set_policy)(const char *) =
+                (const char *(*)(const char *))(uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_thread_policy");
+            char asked[16];
+            const char *want = early_setting("WINE_PS5_THREAD_STACK", asked, sizeof(asked));
+            LOG("PW_WINE64 thread_stack asked=%s policy=%s", want ? want : "-",
+                set_policy ? set_policy(want) : "nosym");
+        }
+        {
             /* The user driver's frames (patch 0400's pw_wine_present) to the title's VideoOut. */
             void (*set_present)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *) =
                 (void (*)(int (*)(void *, const void *, uint32_t, uint32_t, uint32_t), void *))(uintptr_t)

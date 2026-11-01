@@ -36,12 +36,14 @@
  *         a window of the main thread, which runs its procedure: 0x1235);
  *   WINCB hold_begin / WINCB hold n=8 alive=N windows=N / WINCB hold_end
  *         windows=N   (8 threads alive at once, each with one window, for the
- *         console title to sample its memory between the markers).
+ *         console title to sample its memory between the markers), then
+ *   WINCB hold2 n=8 alive=N windows=N / WINCB hold2_end windows=N   (8 more
+ *         after the first 8 have ended: whether their stacks are reused).
  *
  * The last line:
  *   WINCB done bits=32|64 cases=N ok=N main_ok=N/N new_ok=N/N direct_main=0|1
  *         direct_new=0|1 cbt_main=N cbt_new=N cross=ok|fail hold_windows=N
- *         first_fail=NN|-
+ *         hold2_windows=N first_fail=NN|-
  *
  * Exit 0 when every case and probe ran (whatever their results), 2 when the
  * program could not set itself up. Built with i686-w64-mingw32-gcc and
@@ -505,21 +507,29 @@ static DWORD WINAPI hold_thread(void *param)
     return 0;
 }
 
-static LONG hold_probe(void)
+/* Round 1 prints hold_begin, hold and hold_end; round 2, run after round 1's
+ * threads have ended, prints hold2 and hold2_end (round 1's end is its
+ * start). */
+static LONG hold_probe(int round)
 {
+    const char *name = round == 1 ? "hold" : "hold2";
     HANDLE threads[HOLD_THREADS];
     DWORD start;
     int i, n = 0;
 
-    printf("WINCB hold_begin\n");
-    fflush(stdout);
-    pump_wait(NULL, 1000);
+    hold_ready = hold_windows = 0;
+    if (round == 1)
+    {
+        printf("WINCB hold_begin\n");
+        fflush(stdout);
+        pump_wait(NULL, 1000);
+    }
     hold_release = CreateEventW(NULL, TRUE, FALSE, NULL);
     for (i = 0; i < HOLD_THREADS; i++)
         if ((threads[n] = CreateThread(NULL, 0, hold_thread, NULL, 0, NULL))) n++;
     start = GetTickCount();
     while (hold_ready < n && GetTickCount() - start < WAIT_MS) pump_wait(NULL, 20);
-    printf("WINCB hold n=%d alive=%ld windows=%ld\n", HOLD_THREADS, (long)hold_ready, (long)hold_windows);
+    printf("WINCB %s n=%d alive=%ld windows=%ld\n", name, HOLD_THREADS, (long)hold_ready, (long)hold_windows);
     fflush(stdout);
     pump_wait(NULL, 2000);
     SetEvent(hold_release);
@@ -527,7 +537,8 @@ static LONG hold_probe(void)
     {
         if (pump_wait(threads[i], WAIT_MS)) CloseHandle(threads[i]);
     }
-    printf("WINCB hold_end windows=%ld\n", (long)hold_windows);
+    CloseHandle(hold_release);
+    printf("WINCB %s_end windows=%ld\n", name, (long)hold_windows);
     fflush(stdout);
     pump_wait(NULL, 1000);
     return hold_windows;
@@ -543,7 +554,7 @@ int main(void)
     struct cross_result cross;
     int i, ok = 0, main_ok = 0, main_n = 0, new_ok = 0, new_n = 0, first_fail = 0;
     BOOL done;
-    LONG held;
+    LONG held, held2;
     char first[8] = "-";
 
     self = GetModuleHandleW(NULL);
@@ -612,15 +623,16 @@ int main(void)
                 cross.gle);
     fflush(stdout);
 
-    held = hold_probe();
+    held = hold_probe(1);
+    held2 = hold_probe(2);
 
     DestroyWindow(target);
     if (first_fail) snprintf(first, sizeof(first), "%02d", first_fail);
     printf("WINCB done bits=%d cases=%d ok=%d main_ok=%d/%d new_ok=%d/%d direct_main=%d direct_new=%d "
-           "cbt_main=%ld cbt_new=%ld cross=%s hold_windows=%ld first_fail=%s\n",
+           "cbt_main=%ld cbt_new=%ld cross=%s hold_windows=%ld hold2_windows=%ld first_fail=%s\n",
            (int)(sizeof(void *) * 8), (int)(sizeof(cases) / sizeof(cases[0])), ok, main_ok, main_n, new_ok, new_n,
            direct_main.ret == 1, direct_new.ran && direct_new.ret == 1, cbt_main.calls, cbt_new.calls,
-           cross.ran && cross.ret && cross.res == 0x1235 ? "ok" : "fail", (long)held, first);
+           cross.ran && cross.ret && cross.res == 0x1235 ? "ok" : "fail", (long)held, (long)held2, first);
     fflush(stdout);
     return 0;
 }

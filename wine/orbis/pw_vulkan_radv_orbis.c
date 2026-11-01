@@ -186,3 +186,16 @@ int pw_vulkan_stats(struct pw_vulkan_stats *out)
     out->size = size;
     return 0;
 }
+
+/* The layer resolves its floor once, from the stack of the first thread that
+ * creates a thread through it; with Wine's threads on their own 1 MiB kernel
+ * stacks that thread can be one of them, and RADV's threads then get 1 MiB. */
+extern void pw_orbis_thread_counts(unsigned long *created, unsigned long *raised)
+    __asm__("_ZN5orbis12threadCountsEPmS0_");
+extern size_t pw_orbis_thread_stack_floor(void) __asm__("_ZN5orbis20threadStackFloorPeekEv");
+
+void pw_vulkan_thread_stats(unsigned long *created, unsigned long *raised, size_t *floor_bytes)
+{
+    pw_orbis_thread_counts(created, raised);
+    if (floor_bytes) *floor_bytes = pw_orbis_thread_stack_floor();   /* read without resolving it */
+}

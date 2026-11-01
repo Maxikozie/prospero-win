@@ -375,7 +375,7 @@ case " $modules " in *" ntdll "*)
         pw_wine_set_audio_sink pw_wine_audio_available pw_wine_audio_output \
         __wine_virtual_stats __wine_virtual_fault_top __wine_ps5_set_output_sink __wine_ps5_memory_stats pw_cwd_set \
         __wine_ps5_set_segv_hook __wine_ps5_set_segv_unresolved_hook pw_wine_set_display_release pw_wine_release_display \
-        pw_wine_set_exit_hook pw_wine_setenv pw_wine_thread_stats
+        pw_wine_set_exit_hook pw_wine_setenv pw_wine_thread_stats pw_wine_thread_policy pw_wine_thread_caller_stacks
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
             pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
@@ -455,7 +455,7 @@ case " $modules " in *" libvulkan "*)
     # The archive is whole: Mesa's entry points are reached through lookup
     # tables, not by name.
     [ -f "$prx/ntdll.shared.elf" ] || fail "libvulkan imports from ntdll: build ntdll in the same run"
-    desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_wine_setenv
+    desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_vulkan_thread_stats pw_wine_setenv
     # shellcheck disable=SC2086
     link_prx libvulkan - "$prx/obj/libvulkan_desc.o $obj/pw_vulkan_radv_orbis.o $obj/pw_emutls_orbis.o \
         $obj/pw_wine_env_orbis.o --whole-archive $PROSPERO_RADV_ARCHIVE --no-whole-archive $PROSPERO_RADV_ZLIB \

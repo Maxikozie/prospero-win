@@ -21,6 +21,13 @@ the host Wine: the PS4 port's phase p5 step "p5w" on the host.
    and the cross-thread send work (with 1100, KeUserModeCallback also logs
    the refusal once, and the first thread found off its kernel stack says
    whether its frame was moved or left in place).
+4. The shim at 512 KiB (PW_FOREIGN_STACK_KIB), the stack the PS4 layer's
+   "small" policy gives a caller that set its own: with 1100 every case and
+   probe passes. Part 2 (no shim) is the layer's "keep" policy, the thread
+   on the stack Wine gives it.
+
+Every run makes its 8 hold threads twice (the second 8 after the first have
+ended): both rounds must make their 8 windows.
 
 Needs i686-w64-mingw32-gcc, x86_64-w64-mingw32-gcc, cc and the installed host
 Wine (.deps/wine-host/install); parts 2 and 3 need .deps/wine-host-drv with
@@ -83,7 +90,8 @@ def check_all_pass(text: str, what: str) -> None:
     assert all(c["def_ret"] == "1" for c in own if c["class"] == "owndef"), f"{what}: def_ret"
     assert done["direct_main"] == done["direct_new"] == "1", f"{what}: {done}"
     assert done["cbt_main"] == done["cbt_new"] == "1" and done["cross"] == "ok", f"{what}: {done}"
-    assert done["hold_windows"] == "8", f"{what}: {done}"
+    assert done["hold_windows"] == done["hold2_windows"] == "8", f"{what}: {done}"
+    assert re.search(r"^WINCB hold2 n=8 alive=8 windows=8$", text, re.M), f"{what}: no second hold line"
 
 
 def check_ps4_failure(text: str, what: str) -> None:
@@ -95,7 +103,7 @@ def check_ps4_failure(text: str, what: str) -> None:
     assert all(c["hwnd"] == "ok" for c in main), f"{what}: main thread: {main}"
     assert all(c["hwnd"] == "0" and c["msgs"] == "-" for c in new), f"{what}: new threads: {new}"
     assert done["direct_new"] == "1" and done["cbt_new"] == "0" and done["cross"] == "ok", f"{what}: {done}"
-    assert done["hold_windows"] == "0", f"{what}: {done}"
+    assert done["hold_windows"] == done["hold2_windows"] == "0", f"{what}: {done}"
 
 
 def run_installed(exe: Path, prefix: Path) -> str:
@@ -152,6 +160,7 @@ def main() -> int:
             assert all(len(v) == 1 for v in top.values()), f"installed {bits}: top-level differs by thread: {top}"
             assert done["direct_main"] == done["direct_new"] == "1" and done["cross"] == "ok", done
             assert done["cbt_main"] == done["cbt_new"] == "1" and done["hold_windows"] == "8", done
+            assert done["hold2_windows"] == "8", done
             print(f"wine wincb: {bits}-bit on the installed Wine: every HWND_MESSAGE case on every thread, "
                   f"top-level windows {'made' if 'ok' in next(iter(top.values())) else 'refused'} on both threads")
 
@@ -190,11 +199,18 @@ def main() -> int:
                                  r"kernel stack 0x\w+\+0x2000", text), f"driver {bits}: no refusal line:\n{text[-2000:]}"
                 assert re.search(r"err:seh:signal_init_thread_frame thread frame left in place \(switch off; "
                                  r"stack 0x\w+, kernel stack 0x\w+\)", text), f"driver {bits}: no 'left' line"
+                # 4. The small policy's 512 KiB stack: the frame moved, every case.
+                text = run_driver(exe, prefix, work / f"frames-{bits}-shim-small", shim, PW_FOREIGN_STACK_KIB="512")
+                assert re.search(r"pw_foreign_stack: moved a thread off its stack 0x\w+\+0x\w+ onto 512 KiB", text), \
+                    f"driver {bits} + shim at 512 KiB: no 512 KiB move:\n{text[-2000:]}"
+                check_all_pass(text, f"driver {bits} + shim at 512 KiB + 1100")
+                assert "refused" not in text, f"driver {bits} + shim at 512 KiB: a callback was refused"
             else:
                 check_ps4_failure(text, f"driver {bits} + shim, ntdll without 1100")
             print(f"wine wincb: {bits}-bit on the user driver and the translator: every case; with "
                   f"{moved.group(1)} threads off their stack: "
-                  + ("every case (patch 1100), and the PS4's failure with WINE_PS5_THREAD_FRAME=0" if fixed
+                  + ("every case (patch 1100, also on 512 KiB stacks), and the PS4's failure with "
+                     "WINE_PS5_THREAD_FRAME=0" if fixed
                      else "the PS4's failure (ntdll without patch 1100)"))
     print("wine wincb passed")
     return 0
