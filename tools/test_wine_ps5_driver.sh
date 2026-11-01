@@ -64,7 +64,8 @@ sink=$(dirname "$frames")/wine_ps5_driver_sink.so
 cc -shared -fPIC -O2 -Wall -Wextra -o "$sink" "$root/tests/wine_ps5_driver_sink.c" -lpthread ||
     fail "the sink does not build"
 
-export WINEPREFIX="$prefix" WINEDEBUG="${WINEDEBUG:--all}" WINEDLLOVERRIDES="winemenubuilder.exe=d"
+# A caller's WINEDLLOVERRIDES (DXVK: d3d11,dxgi=n) is kept; winemenubuilder is always off.
+export WINEPREFIX="$prefix" WINEDEBUG="${WINEDEBUG:--all}" WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}winemenubuilder.exe=d"
 init_wine=$root/.deps/wine-host/install/usr/bin/wine
 if [ ! -f "$prefix/system.reg" ]; then
     [ -x "$init_wine" ] || fail "no plain host Wine at $init_wine to make the prefix"

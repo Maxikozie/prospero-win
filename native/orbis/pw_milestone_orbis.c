@@ -1155,7 +1155,8 @@ static void stage_vk_present(char *fields, size_t size)
 
 /* ---- e2 + e3: winevulkan, win32u's surface, the hand-over through Wine ------------------- */
 
-static int e2_lines_plan(void);
+static int vulkan_plan(void);
+static int dxvk_plan(void);
 
 /* winevulkan.prx's slots against both its exporters (ntdll, then win32u for
  * __wine_get_vulkan_driver). */
@@ -1181,14 +1182,15 @@ static void stage_wv_bind(char *fields, size_t size)
              s.first[0] ? s.first : "-", s.watch_state);
 }
 
-/* The Wine program's own lines (vk64.exe: VK64, VK64S), kept whole: the
- * title remembers only the last stdout line. */
-static char vk64_line[256], vk64s_line[256];
+/* The Wine program's own lines (vk64.exe: VK64, VK64S; d3d11tri64.exe:
+ * D3D11), kept whole: the title remembers only the last stdout line. */
+static char vk64_line[256], vk64s_line[256], d3d11_line[256];
 
 void pw_ms_stdout(const char *line)
 {
     if (!strncmp(line, "VK64 ", 5)) snprintf(vk64_line, sizeof(vk64_line), "%s", line + 5);
     else if (!strncmp(line, "VK64S ", 6)) snprintf(vk64s_line, sizeof(vk64s_line), "%s", line + 6);
+    else if (!strncmp(line, "D3D11 ", 6)) snprintf(d3d11_line, sizeof(d3d11_line), "%s", line + 6);
 }
 
 /* What RADV reads (libvulkan.prx is given ntdll's environment when win32u
@@ -1197,7 +1199,7 @@ void pw_ms_stdout(const char *line)
 void pw_ms_environment(void (*add)(const char *name, const char *value))
 {
     static char cache[512], shot[512];
-    if (!e2_lines_plan()) return;
+    if (!vulkan_plan()) return;
     snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
     mkdir(cache, 0777);
     snprintf(cache, sizeof(cache), "%s/cache/radv", cfg.root);
@@ -1208,6 +1210,8 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     add("ORBIS_WSI_SHOT_PATH", shot);
     add("ORBIS_WSI_SHOT", "300");
     add("WINE_PS5_DESKTOP", "1920x1080");
+    /* Milestone e: DXVK 2.6.2's d3d11.dll and dxgi.dll in the prefix's system32 (prefix.sh --extras). */
+    if (dxvk_plan()) add("WINEDLLOVERRIDES", "d3d11,dxgi=n");
 }
 
 /* libvulkan.prx's present counters, through ntdll's dlsym of a name any
@@ -1261,6 +1265,7 @@ static void d4_lines(void);
 static void d_lines(void);
 static void e1_lines(void);
 static void e2_lines(void);
+static void e_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1307,6 +1312,11 @@ static const PwMsStage e2_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "vk64", 0, NULL, "exit=fault" },
 };
+/* e: milestone e's own line, d3d11tri64.exe under DXVK 2.6.2. */
+static const PwMsStage e_stages[] = {
+    { "display", 15, stage_display, "display=fault" },
+    { "d3d11", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -1314,9 +1324,11 @@ static const PwMsPlan plans[] = {
     { "d", d_stages, sizeof(d_stages) / sizeof(d_stages[0]), "C:\\windows\\system32\\winemine.exe", 0, d_lines },
     { "e1", e1_stages, sizeof(e1_stages) / sizeof(e1_stages[0]), "C:\\hello.exe", 1, e1_lines },
     { "e2", e2_stages, sizeof(e2_stages) / sizeof(e2_stages[0]), "C:\\vk64.exe", 0, e2_lines },
+    { "e", e_stages, sizeof(e_stages) / sizeof(e_stages[0]), "C:\\d3d11tri64.exe", 0, e_lines },
 };
 
-static int e2_lines_plan(void) { return plan && plan->lines == e2_lines; }
+static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
+static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 
 const char *pw_ms_select(const char *name)
 {
@@ -1493,6 +1505,25 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  (unsigned long long)vk.presents, vk.width, vk.height,
                  strstr(vk64s_line, "hang=1") != NULL || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none",
                  release_state, (unsigned long long)gdi_dropped, counted);
+    } else if (plan->lines == e_lines) {
+        /* d3d11tri64.exe's line, its frames and swapchain renamed app_*: frames,
+         * the swapchain and lost devices are what reached the driver; a hang is
+         * a lost device or DXGI's removed/hung/reset device. */
+        static const char *const rename[] = { "frames", "app_frames", "swapchain", "app_swapchain" };
+        struct pw_vulkan_stats vk;
+        char shot[512], line[300];
+        struct stat st;
+        const char *counted = vulkan_stats(&vk);
+        int fb, removed;
+        snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
+        fb = stat(shot, &st) == 0 && st.st_size == (off_t)PW_VIDEOOUT_ORBIS_WIDTH * PW_VIDEOOUT_ORBIS_HEIGHT * 4;
+        removed = strstr(d3d11_line, "hr=0x887a0005") || strstr(d3d11_line, "hr=0x887a0006") ||
+                  strstr(d3d11_line, "hr=0x887a0007");
+        renamed(d3d11_line[0] ? d3d11_line : "app_frames=-", rename, 2, line, sizeof(line));
+        snprintf(fields, sizeof(fields), "exit=%s %s frames=%llu swapchain=%ux%u gpu_hang=%d device_lost=%u fb=%s "
+                 "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, line, (unsigned long long)vk.presents, vk.width,
+                 vk.height, removed || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none", release_state,
+                 (unsigned long long)gdi_dropped, counted);
     } else if (plan->c_line) {
         /* hello.exe: milestone c's regression (d1, e1). */
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
@@ -1645,6 +1676,19 @@ static void e2_lines(void)
     };
     emit_line("PS4WINE e2 vk64", e2_keys, sizeof(e2_keys) / sizeof(e2_keys[0]));
     emit_line("PS4WINE e3 vkclear", e3_keys, sizeof(e3_keys) / sizeof(e3_keys[0]));
+}
+
+/* Milestone e's own line. */
+static void e_lines(void)
+{
+    enum { DISPLAY, D3D11 };
+    static const LineKey keys[] = {
+        { "frames", D3D11 }, { "gpu_hang", D3D11 }, { "swapchain", D3D11 }, { "fb", D3D11 }, { "px_c", D3D11 },
+        { "px_m", D3D11 }, { "hr", D3D11 }, { "at", D3D11 }, { "app_frames", D3D11 }, { "ms_avg", D3D11 },
+        { "level", D3D11 }, { "release", D3D11 }, { "device_lost", D3D11 }, { "gdi_dropped", D3D11 },
+        { "vk_stats", D3D11 }, { "display", DISPLAY }, { "exit", D3D11 },
+    };
+    emit_line("PS4WINE e d3d11", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void pw_ms_emit_lines(void)

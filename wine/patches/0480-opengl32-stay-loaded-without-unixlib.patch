@@ -1,0 +1,62 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: opengl32: stay loaded without the unix library
+
+The PS4 build has no OpenGL (configured --without-opengl), so opengl32's
+unix library does not exist there, and DllMain returned FALSE, which aborts
+every process that loads opengl32. wined3d imports it, and Wine's builtin
+d3dcompiler_47 imports wined3d: the first launch of milestone e's
+d3d11tri64.exe under DXVK ended with "opengl32.dll failed to initialize"
+and STATUS_DLL_INIT_FAILED before main. When the unix library cannot be
+loaded at all, opengl32 now warns and stays loaded without it (thread
+attach and detach skip it); a GL call then has no driver. A unix library
+that loads and fails its process_attach is still an error.
+
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index 2016d0a238..3dd8cd8375 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -3211,6 +3211,11 @@ static NTSTATUS WINAPI call_gl_debug_message_callback( void *args, ULONG size )
+ /***********************************************************************
+  *           OpenGL initialisation routine
+  */
++/* Without its unix library (a console built without OpenGL) the module
++ * still loads, so that modules importing it (wined3d, and through it Wine's
++ * d3dcompiler and DXVK's users) can; a GL call then has no driver. */
++static BOOL no_unixlib;
++
+ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+ {
+     struct process_attach_params params =
+@@ -3223,8 +3228,13 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+     switch(reason)
+     {
+     case DLL_PROCESS_ATTACH:
+-        if ((status = __wine_init_unix_call()) ||
+-            (status = UNIX_CALL( process_attach, &params )))
++        if ((status = __wine_init_unix_call()))
++        {
++            WARN( "no unixlib (status %#lx): OpenGL is not available\n", status );
++            no_unixlib = TRUE;
++            return TRUE;
++        }
++        if ((status = UNIX_CALL( process_attach, &params )))
+         {
+             ERR( "Failed to load unixlib, status %#lx\n", status );
+             return FALSE;
+@@ -3233,6 +3243,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+ 
+         /* fallthrough */
+     case DLL_THREAD_ATTACH:
++        if (no_unixlib) break;
+         if ((status = UNIX_CALL( thread_attach, NtCurrentTeb() )))
+         {
+             WARN( "Failed to initialize thread, status %#lx\n", status );
+@@ -3241,7 +3252,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+         break;
+ 
+     case DLL_PROCESS_DETACH:
+-        if (reserved) break;
++        if (reserved || no_unixlib) break;
+         UNIX_CALL( process_detach, NULL );
+         /* fallthrough */
+     case DLL_THREAD_DETACH:

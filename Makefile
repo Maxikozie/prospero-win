@@ -194,6 +194,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_hello64.py
 	python3 tests/test_wine_gdi64.py
 	python3 tests/test_wine_vk64.py
+	python3 tests/test_wine_d3d11tri64.py
 	python3 tests/test_orbis_libc_stubs.py
 	python3 tests/test_orbis_prx_imports.py
 	python3 tests/test_gen_prx_imports.py
@@ -276,6 +277,7 @@ wine-check: test
 	python3 tests/test_wine_hello64.py
 	python3 tests/test_wine_gdi64.py
 	python3 tests/test_wine_vk64.py
+	python3 tests/test_wine_d3d11tri64.py
 	python3 tests/test_orbis_libc_stubs.py
 	python3 tests/test_orbis_prx_imports.py
 	python3 tests/test_gen_prx_imports.py
