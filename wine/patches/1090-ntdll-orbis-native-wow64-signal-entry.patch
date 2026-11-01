@@ -1,0 +1,212 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: orbis: native WoW64 signal entry (0883, 0903) on the PS4
+
+Patches 0883 (raw signal entries through libkernel's syscall stub, the
+verified frame, the readiness export) and 0903 (keep the FS base of a
+64-bit thread resumed where it was) stay PS5-only in the series. On the PS4
+the title measured everything 0883 relies on (ps4-wine phase p2, LOG.md
+2026-11-01 18:56): libkernel's getppid stub has the same shape and its
+syscall instruction runs other calls; sigaltstack works (with FreeBSD's
+stack_t, which wine/orbis/include has); a signal registered with the
+kernel's own sigaction and SA_ONSTACK arrives on the alternate stack, where
+the entry's 64 KiB round-down finds the thread; the frame holds MXCSR at
+ucontext+320+24 and the FS base at +1152.
+
+So their gates take __ORBIS__ too, with two PS4 differences:
+- libkernel is found as the module whose code holds getppid's stub, from
+  the module list, not by the PS5's handle 0x2001 (the resolver still
+  checks the name, libkernel.sprx on the PS4 too, and the stub);
+- init_thread_pipe ignores sigaltstack's result, so the readiness caps
+  stay 0 unless the main thread's alternate stack is in place and its
+  64 KiB-aligned base holds this thread's TEB (PW_NATIVE_ALTSTACK).
+The provider's summary line is also logged on the err channel once, so a
+title run (WINEDEBUG=err+all) shows why the caps are what they are.
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 62a7f129d6..47221ab220 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -90,7 +90,7 @@ WINE_DECLARE_DEBUG_CHANNEL(seh);
+ 
+ #include "dwarf.h"
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ /* Publish readiness only after successful
+  * signal registration and validation of the kernel's signal frame. */
+ #include "native_libkernel_resolver.c"
+@@ -124,10 +124,33 @@ static void pw_native_resolve_kernel(void)
+     unsigned char info[0x160] = {0};
+     uint64_t size = sizeof(info);
+     struct native_libkernel_ops ops = { pw_native_syscall_at, getpid(), getppid() };
++#ifdef __ORBIS__
++    /* libkernel's handle is 0x2001 on the PS5. On the PS4 take the module
++     * whose code holds getppid's stub, from the module list; the resolver
++     * still checks the name (libkernel.sprx here too) and the stub. */
++    {
++        extern int sceKernelGetModuleList( int32_t *handles, size_t count, size_t *found );
++        int32_t handles[256];
++        size_t count = 0, i;
++
++        if (sceKernelGetModuleList( handles, ARRAY_SIZE(handles), &count )) return;
++        for (i = 0; i < count && i < ARRAY_SIZE(handles); i++)
++        {
++            memset( info, 0, sizeof(info) );
++            memcpy( info, &size, sizeof(size) );
++            if (sceKernelGetModuleInfo( handles[i], info )) continue;
++            if (native_libkernel_resolve( info, sizeof(info), (uintptr_t)getppid,
++                                          (uintptr_t)sysarch, &ops, &pw_native_kernel ))
++                return;
++        }
++        return;
++    }
++#else
+     memcpy( info, &size, sizeof(size) );
+     if (sceKernelGetModuleInfo( 0x2001, info )) return;
+     native_libkernel_resolve( info, sizeof(info), (uintptr_t)getppid,
+                               (uintptr_t)sysarch, &ops, &pw_native_kernel );
++#endif
+ }
+ static int pw_native_sigaction( int signal, const struct sigaction *action,
+                                 struct sigaction *previous )
+@@ -900,7 +923,7 @@ __ASM_GLOBAL_FUNC( clear_alignment_flag,
+                    "ret" )
+ 
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ /* SA_ONSTACK entries obtain the owning TEB without accessing host TLS or
+  * assuming GS has already been installed during thread bootstrap. */
+ C_ASSERT( offsetof( struct thread_data, teb ) == 0 );
+@@ -988,7 +1011,7 @@ static inline struct thread_data *init_handler( void *sigcontext )
+ }
+ 
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ /* The kernel restores the FS base saved in the frame on sigreturn. A context
+  * that the handler sends to Wine's 64-bit code (the exception dispatcher, or
+  * a 64-bit context set on the thread) needs the host's. A thread resumed
+@@ -1040,7 +1063,7 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
+ }
+ 
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+ /* The proven ordinary-title frame has a standard 64-byte header and
+  * 256 bytes of YMM upper halves. Do not advertise Wine allocation padding
+  * or features that the kernel frame cannot contain. */
+@@ -1161,7 +1184,7 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
+     if (FPU_sig(sigcontext))
+     {
+         XSAVE_AREA_HEADER *xs;
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+         unsigned int signal_xstate_size;
+ #endif
+ 
+@@ -1169,7 +1192,7 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
+         memcpy( &context->FltSave, FPU_sig(sigcontext), sizeof(context->FltSave) );
+         context->MxCsr = context->FltSave.MxCsr;
+         if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext)))
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+             && (signal_xstate_size = pw_native_signal_xstate_size( xs ))
+ #endif
+            )
+@@ -1177,7 +1200,7 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
+             /* xcontext and sigcontext are both on the signal stack, so we can
+              * just reference sigcontext without overflowing 32 bit XState.Offset */
+             context_init_xstate( context, xs );
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+             xcontext->c_ex.XState.Length = signal_xstate_size;
+             xcontext->c_ex.All.Length = sizeof(CONTEXT) + xcontext->c_ex.XState.Offset + signal_xstate_size;
+ #endif
+@@ -1233,7 +1256,7 @@ static void restore_context( struct thread_data *data, const struct xcontext *xc
+ {
+     const CONTEXT *context = &xcontext->c;
+     struct amd64_thread_data *amd64_data = amd64_thread_data( data );
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     BOOL resumed = RIP_sig(sigcontext) == context->Rip && CS_sig(sigcontext) == context->SegCs;
+ #endif
+ 
+@@ -1248,7 +1271,7 @@ static void restore_context( struct thread_data *data, const struct xcontext *xc
+     }
+     set_sigcontext( context, sigcontext );
+     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     if (!resumed) pw_set_host_fs( data, sigcontext );
+ #endif
+     leave_handler( data, sigcontext );
+@@ -1802,7 +1825,7 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+     }
+ 
+     CS_sig(sigcontext)  = cs64_sel;
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     pw_set_host_fs( data, sigcontext );
+ #endif
+     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+@@ -3212,7 +3235,7 @@ void signal_init_process( TEB *teb )
+     alloc_syscall_frame( (frame_size + 63) & ~63 );
+     signal_alloc_thread( teb );
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     pw_native_resolve_kernel();
+     if (pw_native_kernel.syscall && !pw_native_frame_verified())
+         memset( &pw_native_kernel, 0, sizeof(pw_native_kernel) );
+@@ -3259,15 +3282,40 @@ void signal_init_process( TEB *teb )
+     }
+ #endif
+ 
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     /* All nine raw registrations succeeded. The CPU backend still checks
+      * its own process/thread prerequisites before entering guest mode. */
++#ifdef __ORBIS__
++    {
++        /* The raw entries find their thread through the alternate signal
++         * stack (rsp rounded down to 64 KiB holds the thread data, whose
++         * first word is the TEB). init_thread_pipe ignores sigaltstack's
++         * result; advertise nothing unless this thread's is in place. */
++        stack_t current = {0};
++        BOOL altstack = !sigaltstack( NULL, &current ) && !(current.ss_flags & SS_DISABLE) && current.ss_size &&
++                        *(TEB **)((ULONG_PTR)current.ss_sp & ~(ULONG_PTR)signal_stack_mask) == teb;
++        unsigned int caps = altstack ? pw_native_ready_caps() : 0;
++        if (!altstack)
++            ERR_(seh)( "PW_NATIVE_ALTSTACK missing sp=%p size=%#lx flags=%#x\n", current.ss_sp,
++                       (unsigned long)current.ss_size, current.ss_flags );
++        __atomic_store_n( &pw_native_caps, caps, __ATOMIC_RELEASE );
++    }
++#else
+     __atomic_store_n( &pw_native_caps, pw_native_ready_caps(), __ATOMIC_RELEASE );
++#endif
+     TRACE_(seh)( "PW_NATIVE_PROVIDER caps=%u syscall=%p sysarch=%p cs=%x ss=%x features=%llx xstate=%u avx_offset=%u avx_size=%u\n",
+                  pw_native_caps, (void *)pw_native_kernel.syscall,
+                  (void *)pw_native_kernel.sysarch, cs64_sel, ds64_sel,
+                  (unsigned long long)user_shared_data->XState.EnabledFeatures, xstate_size,
+                  user_shared_data->XState.Features[2].Offset, user_shared_data->XState.Features[2].Size );
++#ifdef __ORBIS__
++    /* Once per process, on the channel the title's runs log (err+all). */
++    ERR_(seh)( "PW_NATIVE_PROVIDER caps=%u syscall=%p sysarch=%p cs=%x ss=%x features=%llx xstate=%u avx_offset=%u avx_size=%u\n",
++                 pw_native_caps, (void *)pw_native_kernel.syscall,
++                 (void *)pw_native_kernel.sysarch, cs64_sel, ds64_sel,
++                 (unsigned long long)user_shared_data->XState.EnabledFeatures, xstate_size,
++                 user_shared_data->XState.Features[2].Offset, user_shared_data->XState.Features[2].Size );
++#endif
+ #endif
+     return;
+ 
+@@ -3303,7 +3351,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+                                            libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
+         WARN_(seh)( "could not enable syscall user dispatch\n" );
+ #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
+-#ifdef __PROSPERO__
++#if defined(__PROSPERO__) || defined(__ORBIS__)
+     /* Publish the owning thread's host FS before GS installation. Raw
+      * signal entries find this slot through their altstack, including
+      * signals arriving during this bootstrap interval. */

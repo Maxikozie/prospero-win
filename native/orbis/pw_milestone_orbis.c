@@ -78,6 +78,7 @@ static int video_open;
 enum { P_PATH_SCALE, P_PATH_VO720, P_PATH_VO1080 };
 static const char *const p_path_names[] = { "scale", "vo720", "vo1080" };
 static int bench_plan, p_path, p_async;
+static int native_plan(void);   /* p2: 32-bit code on the hardware WoW64 backend */
 static void pause_ms(unsigned ms);
 
 /* ---- the progress file, through stdio ----------------------------------- */
@@ -1353,6 +1354,170 @@ static void *f_script(void *arg)
     return NULL;
 }
 
+/* ---- phase p2: native WoW64 readiness, measured by the title before Wine ------------- */
+
+/* What patch 0883 (PS5) relies on, measured on this PS4 before an Orbis
+ * variant of it is written (docs/ps4/HANDOFF-p.md, p2): libkernel's getppid
+ * stub has the shape "mov $N,%rax; mov %rcx,%r10; syscall; jb; ret", checked
+ * by its bytes; its syscall instruction runs other calls (getpid and getppid
+ * swapped); sigaltstack as system call 53 through it (the libkernel export
+ * returned -1 to Wine in c and d); a signal registered with the kernel's own
+ * sigaction (416) and SA_ONSTACK arrives on that stack, where 0883's entry
+ * finds its thread by rounding the stack pointer down to 64 KiB; and the
+ * frame holds a marked MXCSR at ucontext+320+24 and the FS base at +1152.
+ * FreeBSD's numbers and layouts throughout: the SDK's musl headers number
+ * signals differently. Everything is undone before Wine starts. */
+enum {
+    K_SYS_GETPID = 20, K_SYS_GETPPID = 39, K_SYS_SIGALTSTACK = 53, K_SYS_SIGACTION = 416,
+    K_SIGUSR2 = 31, K_SA_ONSTACK = 0x1, K_SA_SIGINFO = 0x40, K_SS_DISABLE = 0x4,
+    K_SIG_UNBLOCK = 2, K_SIG_SETMASK = 3,   /* FreeBSD's; the SDK's signal.h has musl's 1 and 2 */
+    K_ALT_ALIGN = 0x10000, K_ALT_MARK = 0x5057414c54535431ull & 0xffffffff,
+};
+typedef struct KStack { void *sp; size_t size; int flags; } KStack;                   /* FreeBSD stack_t */
+typedef struct KSigaction { uintptr_t handler; int flags; uint32_t mask[4]; } KSigaction;   /* the kernel's */
+
+/* Runs system call NUMBER through the syscall instruction at ENTRY, inside
+ * libkernel; the stub's own error path follows it (-1, errno set). From
+ * patch 0883's pw_native_syscall_at (this repository, LGPL). */
+extern long pw_ms_syscall_at(uintptr_t entry, long number, long a1, long a2, long a3);
+__asm__(".text\n.globl pw_ms_syscall_at\n.type pw_ms_syscall_at,@function\npw_ms_syscall_at:\n"
+        "movq %rsi,%rax\n movq %rdi,%r11\n movq %rdx,%rdi\n movq %rcx,%rsi\n movq %r8,%rdx\n"
+        "subq $8,%rsp\n callq *%r11\n addq $8,%rsp\n ret\n.size pw_ms_syscall_at,.-pw_ms_syscall_at\n");
+
+static volatile int probe_hits;
+static volatile uintptr_t probe_rsp, probe_found;
+static volatile uint32_t probe_mxcsr;
+static volatile uint64_t probe_fsbase;
+
+static void probe_handler(int signal, siginfo_t *info, void *context)
+{
+    uintptr_t rsp = (uintptr_t)__builtin_frame_address(0);
+    (void)signal;
+    (void)info;
+    probe_rsp = rsp;
+    /* 0883's lookup: the 64 KiB-aligned base of the signal stack holds the thread's data. */
+    probe_found = *(volatile uint64_t *)(rsp & ~(uintptr_t)(K_ALT_ALIGN - 1));
+    memcpy((void *)&probe_mxcsr, (const uint8_t *)context + 320 + 24, 4);
+    memcpy((void *)&probe_fsbase, (const uint8_t *)context + 1152, 8);
+    probe_hits++;
+}
+
+extern int sysarch(int number, void *args);
+
+static void stage_native_probe(char *fields, size_t size)
+{
+    const uint8_t *stub = (const uint8_t *)(uintptr_t)&getppid;
+    uintptr_t entry = 0, base;
+    uint8_t *region;
+    KStack ss, cur, lib;
+    KSigaction act, old;
+    uint32_t unblock[4] = { 1u << (K_SIGUSR2 - 1), 0, 0, 0 }, saved[4] = { 0, 0, 0, 0 };   /* FreeBSD sigset_t */
+    uint64_t fsbase = 0;
+    uint32_t mxcsr, marked;
+    long pid = getpid(), ppid = getppid(), rc;
+    int caps = 0, lib_rc, lib_errno = 0, alt_ok = 0, act_ok = 0, onstack = 0, lookup = 0, frame = 0;
+    char stub_bytes[40];
+    size_t n = 0;
+
+    /* 1. The stub's shape, by its bytes (milestone a read them at getppid). */
+    snprintf(stub_bytes, sizeof(stub_bytes), "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             stub[0], stub[1], stub[2], stub[3], stub[4], stub[5], stub[6], stub[7], stub[8], stub[9], stub[10],
+             stub[11], stub[12], stub[13], stub[14]);
+    if (stub[0] == 0x48 && stub[1] == 0xc7 && stub[2] == 0xc0 && stub[7] == 0x49 && stub[8] == 0x89 &&
+        stub[9] == 0xca && stub[10] == 0x0f && stub[11] == 0x05)
+        entry = (uintptr_t)stub + 10;
+    n += (size_t)snprintf(fields + n, size - n, "stub=%s stub_bytes=%s", entry ? "ok" : "shape", stub_bytes);
+    step("p2 getppid at %p: %s (%s)", (const void *)stub, stub_bytes, entry ? "the stub shape" : "not the stub shape");
+    if (!entry) goto done;
+
+    /* 2. The instruction runs whichever call %rax names. */
+    if (pid <= 0 || pid == ppid || pw_ms_syscall_at(entry, K_SYS_GETPID, 0, 0, 0) != pid ||
+        pw_ms_syscall_at(entry, K_SYS_GETPPID, 0, 0, 0) != ppid) {
+        n += (size_t)snprintf(fields + n, size - n, " raw_syscall=fail");
+        goto done;
+    }
+    n += (size_t)snprintf(fields + n, size - n, " raw_syscall=ok");
+    caps |= 1;
+
+    /* 3. A 64 KiB-aligned stack with a marker at its base, as Wine's signal stack has its thread data. */
+    region = malloc(2 * K_ALT_ALIGN);
+    if (!region) {
+        n += (size_t)snprintf(fields + n, size - n, " altstack53=nomemory");
+        goto done;
+    }
+    base = ((uintptr_t)region + K_ALT_ALIGN - 1) & ~(uintptr_t)(K_ALT_ALIGN - 1);
+    *(volatile uint64_t *)base = K_ALT_MARK;
+    ss.sp = (void *)(base + 4096);
+    ss.size = K_ALT_ALIGN - 4096;
+    ss.flags = 0;
+
+    /* libkernel's sigaltstack (Wine's init_thread_pipe calls it), for comparison, then off again. */
+    errno = 0;
+    lib = ss;
+    lib_rc = sigaltstack((const stack_t *)(void *)&lib, NULL);
+    lib_errno = errno;
+    if (!lib_rc) {
+        KStack off = { NULL, 0, K_SS_DISABLE };
+        sigaltstack((const stack_t *)(void *)&off, NULL);
+    }
+    n += (size_t)snprintf(fields + n, size - n, " altstack_lib=%s%d", lib_rc ? "err:" : "ok", lib_rc ? lib_errno : 0);
+    if (!lib_rc) n -= 1;   /* "ok0" -> "ok" */
+    fields[n] = 0;
+
+    /* 4. System call 53 through the stub, and read back. */
+    errno = 0;
+    rc = pw_ms_syscall_at(entry, K_SYS_SIGALTSTACK, (long)(uintptr_t)&ss, 0, 0);
+    if (rc) {
+        n += (size_t)snprintf(fields + n, size - n, " altstack53=err:%d", errno);
+        goto release;
+    }
+    memset(&cur, 0, sizeof(cur));
+    pw_ms_syscall_at(entry, K_SYS_SIGALTSTACK, 0, (long)(uintptr_t)&cur, 0);
+    alt_ok = cur.sp == ss.sp && cur.size == ss.size && !(cur.flags & K_SS_DISABLE);
+    n += (size_t)snprintf(fields + n, size - n, " altstack53=%s", alt_ok ? "ok" : "readback");
+
+    /* 5. The kernel's own sigaction with SA_ONSTACK, one SIGUSR2 with a marked MXCSR. */
+    memset(&act, 0, sizeof(act));
+    memset(&old, 0, sizeof(old));
+    act.handler = (uintptr_t)probe_handler;
+    act.flags = K_SA_SIGINFO | K_SA_ONSTACK;
+    errno = 0;
+    if (pw_ms_syscall_at(entry, K_SYS_SIGACTION, K_SIGUSR2, (long)(uintptr_t)&act, (long)(uintptr_t)&old)) {
+        n += (size_t)snprintf(fields + n, size - n, " raw_sigaction=err:%d", errno);
+        goto disable;
+    }
+    act_ok = 1;
+    sysarch(128 /* AMD64_GET_FSBASE */, &fsbase);
+    pthread_sigmask(K_SIG_UNBLOCK, (const sigset_t *)(void *)unblock, (sigset_t *)(void *)saved);
+    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));
+    marked = (mxcsr & ~0x6000u) | 0x2000u;   /* round down: visible and harmless */
+    __asm__ volatile("ldmxcsr %0" ::"m"(marked));
+    pthread_kill(pthread_self(), K_SIGUSR2);
+    __asm__ volatile("ldmxcsr %0" ::"m"(mxcsr));
+    pthread_sigmask(K_SIG_SETMASK, (const sigset_t *)(void *)saved, NULL);
+    pw_ms_syscall_at(entry, K_SYS_SIGACTION, K_SIGUSR2, (long)(uintptr_t)&old, 0);
+    onstack = probe_hits == 1 && probe_rsp >= (uintptr_t)ss.sp && probe_rsp < (uintptr_t)ss.sp + ss.size;
+    lookup = probe_hits == 1 && probe_found == K_ALT_MARK;
+    frame = probe_hits == 1 && probe_mxcsr == marked && fsbase && probe_fsbase == fsbase;
+    n += (size_t)snprintf(fields + n, size - n, " raw_sigaction=ok hits=%d onstack=%d lookup=%d frame_check=%s "
+                          "mxcsr=%x/%x fsbase=%llx/%llx", probe_hits, onstack, lookup, frame ? "ok" : "bad",
+                          (unsigned)probe_mxcsr, (unsigned)marked, (unsigned long long)probe_fsbase,
+                          (unsigned long long)fsbase);
+    if (alt_ok && onstack && lookup) caps |= 2;
+    if (frame) caps |= 4;
+disable:
+    {
+        KStack off = { NULL, 0, K_SS_DISABLE };
+        pw_ms_syscall_at(entry, K_SYS_SIGALTSTACK, (long)(uintptr_t)&off, 0, 0);
+    }
+release:
+    /* The region stays allocated: a late signal on it must not land in freed memory. */
+    (void)act_ok;
+done:
+    snprintf(fields + n, size - n, " probe_caps=%d", caps);
+    step("p2 native probe: %s", fields);
+}
+
 /* ---- phase p: the benchmark segment ------------------------------------------------ */
 
 /* Pinball as plan f has it, but no pad bindings until the segment is over:
@@ -1878,6 +2043,9 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     /* Milestone f: Pinball's window (about 600x470) fits 960x540, which fills
      * 1920x1080 at twice its size. */
     if (pinball_plan()) add("WINE_PS5_DESKTOP", bench_plan && p_path == P_PATH_VO720 ? "1280x720" : "960x540");
+    /* p2: 32-bit code on the hardware backend (patch 0611); wow64 falls back to
+     * the prefix's wowprospero.dll when it does not start (0614). */
+    if (native_plan()) add("WINE_PS5_WOW64_CPU", "wow64native.dll");
     if (!vulkan_plan()) return;
     snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
     mkdir(cache, 0777);
@@ -1985,6 +2153,7 @@ static void e_lines(void);
 static void f1_lines(void);
 static void f_lines(void);
 static void p1_lines(void);
+static void p2_lines(void);
 static void p3_lines(void);
 static void p4_lines(void);
 
@@ -2060,6 +2229,15 @@ static const PwMsStage p_stages[] = {
     { "pattern", 15, stage_pattern, "vo_flip=fault" },
     { "pinball", 0, NULL, "exit=fault" },
 };
+/* p2: native WoW64 readiness measured before Wine, then the benchmark on
+ * whatever CPU the prefix gives (the translator until an Orbis native
+ * backend exists). */
+static const PwMsStage p2_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "native_probe", 15, stage_native_probe, "probe_caps=fault" },
+    { "pinball", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -2072,6 +2250,7 @@ static const PwMsPlan plans[] = {
     { "f", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, f_lines },
     /* p1: plan f's Pinball as the benchmark (p_script): the segment's measurements. */
     { "p1", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p1_lines },
+    { "p2", p2_stages, sizeof(p2_stages) / sizeof(p2_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p2_lines },
     /* p3, p4: the benchmark on another present path, after the HDMI test pattern. */
     { "p3", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p3_lines },
     { "p4", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p4_lines },
@@ -2081,9 +2260,11 @@ static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
 {
-    return plan && (plan->lines == p1_lines || plan->lines == p3_lines || plan->lines == p4_lines);
+    return plan && (plan->lines == p1_lines || plan->lines == p2_lines || plan->lines == p3_lines ||
+                    plan->lines == p4_lines);
 }
 static int pinball_plan(void) { return plan && (plan->lines == f_lines || p_plan()); }
+static int native_plan(void) { return plan && plan->lines == p2_lines; }
 
 /* The Wine stage's watchdog (wine64_main_orbis.c), 0 for its default of
  * 180 s: f plays up to F_PLAY_S, and its play loop sends the line itself
@@ -2304,12 +2485,20 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
          * the stage's fields). */
         uint64_t wow[PW_WOW_STAT_COUNT];
         const char *counted = wow_stats(wow);
+        char caps[16] = "-";
+        void *caps_fn = NULL;
+        /* Patch 0883's readiness export, when the ntdll has one. */
+        if (!strcmp(ntdll_symbol("__wine_prospero_native_wow64_caps", &caps_fn), "ok") && caps_fn)
+            snprintf(caps, sizeof(caps), "%u", ((unsigned (*)(unsigned))(uintptr_t)caps_fn)(1));
         save_last_drawn();
         pthread_mutex_lock(&present_lock);
-        snprintf(fields, sizeof(fields), "exit=%s cpu=%s wow_stats=%s faults_unresolved=%llu faults_guest=%llu "
-                 "faults_marked=%llu faults_host=%llu faults_smc=%llu dbt_errors=%llu frames=%llu pad=%s fb=%s "
-                 "frame=%ux%u", exit_text,
-                 strcmp(counted, "ok") ? counted : wow[PW_WOW_STAT_THREADS] ? "translator" : "none", counted,
+        snprintf(fields, sizeof(fields), "exit=%s native_caps=%s cpu=%s wow_stats=%s faults_unresolved=%llu "
+                 "faults_guest=%llu faults_marked=%llu faults_host=%llu faults_smc=%llu dbt_errors=%llu frames=%llu "
+                 "pad=%s fb=%s frame=%ux%u", exit_text, caps,
+                 /* native: no thread on the translator (or no translator loaded through
+                  * Wine at all: its counters answer nosym) and wow64native.prx loaded */
+                 !strcmp(counted, "ok") && wow[PW_WOW_STAT_THREADS] ? "translator"
+                 : module_loaded("wow64native") == 1 ? "native" : strcmp(counted, "ok") ? counted : "none", counted,
                  (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_GUEST],
                  (unsigned long long)wow[PW_WOW_STAT_FAULTS_MARKED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_HOST],
                  (unsigned long long)wow[PW_WOW_STAT_FAULTS_SMC], (unsigned long long)wow[PW_WOW_STAT_DBT_ERRORS],
@@ -2609,6 +2798,23 @@ static void p34_line(const char *head)
 }
 
 static void p3_lines(void) { p34_line("PS4WINE p3 bench pinball"); }
+
+/* p2: the probe's fields, Wine's native caps (0883's export; "-" while the
+ * Orbis ntdll has none), then p1's fields. */
+static void p2_lines(void)
+{
+    enum { WOW, DISPLAY, PROBE, PINBALL };
+    static const LineKey keys[] = {
+        { "native_caps", PINBALL }, { "cpu", PINBALL }, { "faults_unresolved", PINBALL },
+        { "probe_caps", PROBE }, { "stub", PROBE }, { "raw_syscall", PROBE }, { "altstack_lib", PROBE },
+        { "altstack53", PROBE }, { "raw_sigaction", PROBE }, { "hits", PROBE }, { "onstack", PROBE },
+        { "lookup", PROBE }, { "frame_check", PROBE }, { "mxcsr", PROBE }, { "fsbase", PROBE }, { "stub_bytes", PROBE },
+        { "faults_guest", PINBALL }, { "faults_marked", PINBALL }, { "faults_host", PINBALL },
+        { "faults_smc", PINBALL }, { "dbt_errors", PINBALL }, { "frames", PINBALL }, { "pad", PINBALL },
+        { "fb", PINBALL }, { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY }, { "exit", PINBALL },
+    };
+    emit_line_with("PS4WINE p2 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
+}
 static void p4_lines(void) { p34_line("PS4WINE p4 bench pinball"); }
 
 void pw_ms_emit_lines(void)

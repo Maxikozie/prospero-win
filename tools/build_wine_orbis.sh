@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u wowprospero${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
+modules="ntdll wineserver win32u wowprospero wow64native${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -367,6 +367,7 @@ case " $modules " in *" ntdll "*)
     desc ntdll __wine_main pw_wine_dl_adopt dlopen dlsym dlerror \
         pw_wine_heap_stats pw_wine_heap_malloc pw_wine_heap_free \
         pw_wine_set_present_sink pw_wine_post_input pw_wine_sink_stats pw_wine_set_flush_sink pw_wine_note_flush \
+        __wine_prospero_native_wow64_caps \
         pw_wine_present pw_wine_next_input pw_wine_input_fd \
         pw_wine_set_pad pw_wine_rumble pw_wine_pad pw_wine_set_rumble pw_wine_set_menu pw_wine_menu \
         pw_wine_set_pad_at pw_wine_rumble_at pw_wine_pad_at pw_wine_set_rumble_at pw_wine_pads_wanted \
@@ -492,6 +493,26 @@ case " $modules " in *" wowprospero "*)
     # shellcheck disable=SC2086
     link_prx wowprospero - "$prx/obj/wowprospero_desc.o $wow_objects $obj/pw_emutls_orbis.o $obj/pw_wine_env_orbis.o \
         $exit_wraps $import_wraps" ntdll
+    ;;
+esac
+case " $modules " in *" wow64native "*)
+    # The hardware WoW64 backend's Unix side (wine/wow64native/unix.c), loaded
+    # by ntdll as the PE wow64native.dll's unix library like wowprospero. It
+    # enables itself only when ntdll's __wine_prospero_native_wow64_caps
+    # (patch 0883, on the PS4 through 1090) reports all three bits; its
+    # __thread state is emulated as wowprospero's is. Its environment comes
+    # from ntdll's (pw_wine_setenv: PW_NATIVE_PROFILE).
+    [ -f "$prx/ntdll.shared.elf" ] || fail "wow64native imports from ntdll: build ntdll in the same run"
+    mkdir -p "$obj/wow64native"
+    "$cc" -std=gnu11 -O2 -Wall -femulated-tls -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT -I"$root/wine/wow64native" \
+        -I"$build/include" -I"$tree/include" -c "$root/wine/wow64native/unix.c" -o "$obj/wow64native/unix.o" ||
+        fail "cannot compile wine/wow64native/unix.c"
+    llvm-nm "$obj/wow64native/unix.o" | grep -q ' U __emutls_get_address$' ||
+        fail "wow64native's unix.c keeps a native __thread (needs -femulated-tls)"
+    desc wow64native __wine_unix_call_funcs pw_wine_setenv
+    # shellcheck disable=SC2086
+    link_prx wow64native - "$prx/obj/wow64native_desc.o $obj/wow64native/unix.o $obj/pw_emutls_orbis.o \
+        $obj/pw_wine_env_orbis.o $exit_wraps $import_wraps" ntdll
     ;;
 esac
 

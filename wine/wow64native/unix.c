@@ -12,7 +12,7 @@
 #include <time.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
-#ifdef __PROSPERO__
+#if defined(__PROSPERO__) || defined(__ORBIS__)
 #include <dlfcn.h>
 #endif
 
@@ -139,7 +139,7 @@ static void profile_report(void *arg)
         __atomic_store_n(&clock_next_tsc, p->last_tsc + 60 * profile_tsc_hz, __ATOMIC_RELAXED);
         report_cpu_clock(state->tid);
     }
-#ifndef __PROSPERO__
+#if !defined(__PROSPERO__) && !defined(__ORBIS__)
     (void)profile_frame;    /* only the console has a module to hook */
 #else
     if (!__atomic_load_n(&frame_hook_installed, __ATOMIC_ACQUIRE))
@@ -158,7 +158,7 @@ static void profile_report(void *arg)
 static NTSTATUS capture_host_fs(unsigned long long *base)
 {
     *base = 0;
-#ifdef __PROSPERO__
+#if defined(__PROSPERO__) || defined(__ORBIS__)
     extern int sysarch(int, void *);
     /* Called with host FS active, never from a guest-FS transition. */
     if (sysarch(128 /* AMD64_GET_FSBASE */, base)) return STATUS_UNSUCCESSFUL;
@@ -182,7 +182,7 @@ static NTSTATUS process_init(void *args)
     params->transitions_ready = 0;
     params->fs32_selector = 0;
     params->fs_set_proc = 0;
-#ifdef __PROSPERO__
+#if defined(__PROSPERO__) || defined(__ORBIS__)
     {
         extern int sysarch(int, void *);
         unsigned int (*query)(unsigned int);
