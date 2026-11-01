@@ -178,3 +178,31 @@ void pw_audio_mix_store(const float *accumulator,int16_t *output,uint32_t frames
         output[i]=(int16_t)(value>=0?value+0.5f:value-0.5f);
     }
 }
+
+void pw_audio_starve_grain(PwAudioStarve *starve,PwAudioStarveStats *stats,uint32_t got,uint32_t frames,
+                           uint64_t grain)
+{
+    if(!starve || !stats || got>=frames)return;
+    if(!starve->grains)starve->first=grain;
+    starve->grains++;
+    starve->frames+=frames-got;
+    stats->starved++;
+}
+
+int pw_audio_starve_data(PwAudioStarve *starve,PwAudioStarveStats *stats,PwAudioStarve *ended)
+{
+    if(!starve || !stats || !starve->grains)return 0;
+    stats->underruns++;
+    stats->underrun_grains+=starve->grains;
+    if(ended)*ended=*starve;
+    memset(starve,0,sizeof(*starve));
+    return 1;
+}
+
+void pw_audio_starve_stop(PwAudioStarve *starve,PwAudioStarveStats *stats)
+{
+    if(!starve || !stats || !starve->grains)return;
+    stats->drains++;
+    stats->drain_grains+=starve->grains;
+    memset(starve,0,sizeof(*starve));
+}

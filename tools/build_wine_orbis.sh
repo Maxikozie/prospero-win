@@ -516,7 +516,7 @@ case " $modules " in *" wineps5 "*)
             -o "$obj/wineps5/$(basename "${unit%.c}").o" || fail "cannot compile $unit"
         audio_objects="$audio_objects $obj/wineps5/$(basename "${unit%.c}").o"
     done
-    desc wineps5 __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    desc wineps5 __wine_unix_call_funcs __wine_unix_call_wow64_funcs pw_wineps5_stats
     # shellcheck disable=SC2086
     link_prx wineps5 - "$prx/obj/wineps5_desc.o $audio_objects $exit_wraps $import_wraps" ntdll
     ;;

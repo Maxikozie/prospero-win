@@ -65,4 +65,34 @@ uint32_t pw_audio_mix_add(PwAudioMixStream *stream,float *accumulator,uint32_t f
 /* Clamp frames accumulated stereo frames into 16-bit output. */
 void pw_audio_mix_store(const float *accumulator,int16_t *output,uint32_t frames);
 
+/* Silence inside a sound. A started stream whose ring runs out during a
+ * grain leaves part of it silent. A stretch of such grains ends either with
+ * more data while the stream is still started (an underrun: the program was
+ * late and the silence fell inside its sound) or with a stop or reset (a
+ * drain: the sound's own end, before the program stopped the stream; winmm
+ * stops its client only once the last block has played). Between two sounds
+ * no stream is started and nothing is counted. The driver keeps one
+ * PwAudioStarve per stream and one PwAudioStarveStats, under its lock. */
+typedef struct PwAudioStarve {
+    uint32_t grains;            /* short grains in the current stretch, 0 when there is none */
+    uint32_t frames;            /* frames missing in them */
+    uint64_t first;             /* the grain number the stretch began at */
+} PwAudioStarve;
+
+typedef struct PwAudioStarveStats {
+    uint64_t grains;            /* grains mixed: the driver counts them */
+    uint64_t starved;           /* stream grains that came up short */
+    uint64_t underruns,underrun_grains;
+    uint64_t drains,drain_grains;
+} PwAudioStarveStats;
+
+/* got of frames had data in grain number grain of a started stream. */
+void pw_audio_starve_grain(PwAudioStarve *starve,PwAudioStarveStats *stats,uint32_t got,uint32_t frames,
+                           uint64_t grain);
+/* More data for a started stream: 1 when it ended a stretch as an underrun
+ * (the stretch copied to *ended when ended is not NULL), else 0. */
+int pw_audio_starve_data(PwAudioStarve *starve,PwAudioStarveStats *stats,PwAudioStarve *ended);
+/* The stream stopped, was reset or released: a stretch ends as a drain. */
+void pw_audio_starve_stop(PwAudioStarve *starve,PwAudioStarveStats *stats);
+
 #endif

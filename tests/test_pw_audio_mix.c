@@ -266,6 +266,48 @@ static void test_mix_and_store(void)
     assert(out[0]==16384 && out[1]==-16384 && out[2]==0 && out[3]==-1);
 }
 
+/* Silence inside a sound (an underrun) against a sound's end (a drain). */
+static void test_starve(void)
+{
+    PwAudioMixFormat f=pcm(48000,2,16);
+    int16_t ring[2*32];
+    PwAudioMixStream st;
+    PwAudioStarve starve={0},ended;
+    PwAudioStarveStats stats={0};
+    uint64_t grain=0;
+    uint32_t got;
+
+    memset(ring,0,sizeof(ring));
+    for(int i=0;i<32;i++){ring[2*i]=1000;ring[2*i+1]=-1000;}
+    assert(pw_audio_mix_stream_init(&st,&f,(const uint8_t *)ring,32)==PW_OK);
+    /* 20 frames held, grains of 8: two full grains, then one with 4, then none. */
+    st.held=20;
+    for(int i=0;i<2;i++){got=mix(&st,8);pw_audio_starve_grain(&starve,&stats,got,8,grain++);assert(got==8);}
+    assert(!starve.grains && !stats.starved);
+    got=mix(&st,8);pw_audio_starve_grain(&starve,&stats,got,8,grain++);
+    assert(got==4 && starve.grains==1 && starve.frames==4 && starve.first==2 && stats.starved==1);
+    got=mix(&st,8);pw_audio_starve_grain(&starve,&stats,got,8,grain++);
+    assert(got==0 && starve.grains==2 && starve.frames==12 && stats.starved==2);
+    /* More data while started: the stretch was an underrun. */
+    st.held+=8;
+    assert(pw_audio_starve_data(&starve,&stats,&ended)==1);
+    assert(ended.grains==2 && ended.frames==12 && ended.first==2);
+    assert(stats.underruns==1 && stats.underrun_grains==2 && !starve.grains);
+    assert(pw_audio_starve_data(&starve,&stats,NULL)==0 && stats.underruns==1);
+    /* The ring runs out again and the stream is stopped: a drain, not an underrun. */
+    got=mix(&st,8);pw_audio_starve_grain(&starve,&stats,got,8,grain++);
+    got=mix(&st,8);pw_audio_starve_grain(&starve,&stats,got,8,grain++);
+    assert(starve.grains==1 && starve.first==5 && stats.starved==3);
+    pw_audio_starve_stop(&starve,&stats);
+    assert(stats.drains==1 && stats.drain_grains==1 && stats.underruns==1 && !starve.grains);
+    pw_audio_starve_stop(&starve,&stats);
+    assert(stats.drains==1);
+    /* NULLs are refused. */
+    pw_audio_starve_grain(NULL,&stats,0,8,0);
+    assert(pw_audio_starve_data(NULL,&stats,NULL)==0);
+    pw_audio_starve_stop(&starve,NULL);
+}
+
 int main(void)
 {
     test_format_check();
@@ -278,6 +320,7 @@ int main(void)
     test_downsample();
     test_wrap_underrun_reset();
     test_mix_and_store();
+    test_starve();
     puts("audio mix passed");
     return 0;
 }

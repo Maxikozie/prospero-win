@@ -62,6 +62,7 @@ struct ps5_stream
 
     /* The ring: mix.offset is where valid data starts, mix.held how much. */
     PwAudioMixStream mix;
+    PwAudioStarve starve;   /* short grains since the ring last ran out (pw_audio_mix.h) */
     struct ps5_stream *next;
 };
 
@@ -77,6 +78,9 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t started = PTHREAD_COND_INITIALIZER;
 static struct ps5_stream *streams;
 static HANDLE mixer_thread;
+/* Silence inside sounds (underruns) and at their ends (drains), for the
+ * title's lines through pw_wineps5_stats; under the lock. */
+static PwAudioStarveStats starve_stats;
 
 static int (*audio_available)(void);
 static int (*audio_output)(const int16_t *frames);
@@ -342,6 +346,7 @@ static NTSTATUS ps5_release_stream(void *args)
 
     /* the mixer only touches streams under the lock */
     pthread_mutex_lock(&lock);
+    pw_audio_starve_stop(&stream->starve, &starve_stats);
     for (link = &streams; *link; link = &(*link)->next)
         if (*link == stream)
         {
@@ -379,8 +384,11 @@ static void mixer_loop(void *args)
         memset(accumulator, 0, sizeof(accumulator));
         for (stream = streams; stream; stream = stream->next)
         {
+            UINT32 got;
+
             if (!stream->playing) continue;
-            pw_audio_mix_add(&stream->mix, accumulator, PW_WINE_AUDIO_GRAIN);
+            got = pw_audio_mix_add(&stream->mix, accumulator, PW_WINE_AUDIO_GRAIN);
+            pw_audio_starve_grain(&stream->starve, &starve_stats, got, PW_WINE_AUDIO_GRAIN, starve_stats.grains);
             stream->since_event += PW_WINE_AUDIO_GRAIN;
             if (stream->since_event >= stream->period_output_frames)
             {
@@ -389,6 +397,7 @@ static void mixer_loop(void *args)
             }
         }
         pw_audio_mix_store(accumulator, grain, PW_WINE_AUDIO_GRAIN);
+        starve_stats.grains++;
         pthread_mutex_unlock(&lock);
 
         if (!audio_output || audio_output(grain))
@@ -439,6 +448,7 @@ static NTSTATUS ps5_stop(void *args)
         return unlock_result(&params->result, S_FALSE);
 
     stream->playing = FALSE;
+    pw_audio_starve_stop(&stream->starve, &starve_stats);
 
     return unlock_result(&params->result, S_OK);
 }
@@ -460,8 +470,45 @@ static NTSTATUS ps5_reset(void *args)
     stream->last_pos_frames = 0;
     stream->since_event = 0;
     pw_audio_mix_stream_reset(&stream->mix);
+    pw_audio_starve_stop(&stream->starve, &starve_stats);
 
     return unlock_result(&params->result, S_OK);
+}
+
+/* An underrun ended (more data for a started stream whose ring had run out):
+ * the first 64 are logged, then every 1024th, with where they fell in the
+ * output (grain numbers since the mixer started, and their time at 48 kHz). */
+static void log_underrun(const struct ps5_stream *stream, const PwAudioStarve *ended)
+{
+    UINT64 n = starve_stats.underruns;
+
+    if (n > 64 && (n & 1023)) return;
+    ERR("underrun %llu: stream %p silent for %u grain(s), %u frames short, from grain %llu (%llu ms of output) "
+        "to grain %llu\n", (unsigned long long)n, stream, ended->grains, ended->frames,
+        (unsigned long long)ended->first,
+        (unsigned long long)(ended->first * PW_WINE_AUDIO_GRAIN * 1000 / PW_WINE_AUDIO_RATE),
+        (unsigned long long)starve_stats.grains);
+}
+
+/* The counts for the console title's lines (its descriptor exports this):
+ * out[0] grains mixed, [1] stream grains that came up short, [2] underruns
+ * and [3] their grains, [4] drains and [5] their grains (pw_audio_mix.h's
+ * PwAudioStarveStats, in that order). Fills min(count, 6); returns 6. */
+DECLSPEC_EXPORT unsigned int pw_wineps5_stats(UINT64 *out, unsigned int count)
+{
+    UINT64 all[6];
+    unsigned int i;
+
+    pthread_mutex_lock(&lock);
+    all[0] = starve_stats.grains;
+    all[1] = starve_stats.starved;
+    all[2] = starve_stats.underruns;
+    all[3] = starve_stats.underrun_grains;
+    all[4] = starve_stats.drains;
+    all[5] = starve_stats.drain_grains;
+    pthread_mutex_unlock(&lock);
+    for (i = 0; out && i < count && i < 6; i++) out[i] = all[i];
+    return 6;
 }
 
 static void silence_buffer(struct ps5_stream *stream, BYTE *buffer, UINT32 frames)
@@ -576,6 +623,11 @@ static NTSTATUS ps5_release_render_buffer(void *args)
     stream->mix.held += written_frames;
     stream->written_frames += written_frames;
     stream->getbuf_last = 0;
+    if (stream->playing)
+    {
+        PwAudioStarve ended;
+        if (pw_audio_starve_data(&stream->starve, &starve_stats, &ended)) log_underrun(stream, &ended);
+    }
 
     return unlock_result(&params->result, S_OK);
 }

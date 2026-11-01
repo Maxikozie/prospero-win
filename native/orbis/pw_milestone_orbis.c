@@ -83,6 +83,7 @@ static int native_plan(void);   /* p2: 32-bit code on the hardware WoW64 backend
 static void p5_lines(void);
 static void p5w_lines(void);
 static void hold_sample(int alive);
+static const char *ntdll_symbol(const char *name, void **address);
 static void pause_ms(unsigned ms);
 
 /* ---- the progress file, through stdio ----------------------------------- */
@@ -1545,12 +1546,14 @@ enum { AUDIO_USER_SYSTEM = 0xff, AUDIO_PORT_MAIN = 0, AUDIO_GRAIN = 256, AUDIO_R
        AUDIO_GRAIN_NS = AUDIO_GRAIN * 1000000000ull / AUDIO_RATE };
 static int p_audio = -1;              /* PS4WINE_AUDIO: 1 on, 0 off (p5: on) */
 static int32_t audio_handle = -1;
-static volatile uint64_t audio_grains, audio_nonzero, audio_errors, audio_underruns, audio_gap_max_ns;
+static volatile uint64_t audio_grains, audio_nonzero, audio_errors, audio_gaps, audio_gap_max_ns;
 static uint64_t audio_last_ns;
 
-/* A gap between two grains longer than two grains, but shorter than a
- * second, is a grain the port did not get in time (an underrun); the mixer
- * also stops when no stream plays, and those pauses are longer. */
+/* gaps: a pause between two grains longer than two grains and shorter than
+ * a second. It is not an underrun: the mixer also waits whenever no stream
+ * is started, between two sounds (p5's first count, 13 at 2026-11-01 21:00,
+ * mixed both). The underruns, silence inside a sound, are the driver's
+ * (pw_wineps5_stats). */
 int pw_ms_audio(void *context, const int16_t *frames)
 {
     uint64_t now = cfg.now_ns();
@@ -1560,7 +1563,7 @@ int pw_ms_audio(void *context, const int16_t *frames)
     if (audio_handle < 0) return -1;
     if (audio_last_ns) {
         uint64_t gap = now - audio_last_ns;
-        if (gap > 2 * AUDIO_GRAIN_NS && gap < 1000000000ull) audio_underruns++;
+        if (gap > 2 * AUDIO_GRAIN_NS && gap < 1000000000ull) audio_gaps++;
         if (gap < 1000000000ull && gap > audio_gap_max_ns) audio_gap_max_ns = gap;
     }
     for (unsigned i = 0; i < 2 * AUDIO_GRAIN && !nonzero; i++) nonzero = frames[i] != 0;
@@ -1833,13 +1836,27 @@ static void p_bench_fields(char *out, size_t size)
                  (unsigned long long)p_snap_slot_waits, (unsigned long long)video.flip_errors,
                  (unsigned long long)video.slot_timeouts, (unsigned long long)video.status_errors);
     }
-    if (n < size && p_audio >= 0)
-        snprintf(out + n, size - n, " audio_driver=ps5 grains=%llu grains_nonzero=%llu grains_tail=%llu underruns=%llu "
-                 "gap_max_us=%llu audio_errors=%llu tail_keys=%d tail_s=%.1f midi=untested",
+    if (n < size && p_audio >= 0) {
+        /* The driver's counts (wine/wineps5 pw_wineps5_stats, src/pw_audio_mix.h): grains mixed, stream
+         * grains that came up short, underruns (a stretch of them ended by more data while the stream
+         * was started: silence inside a sound) and drains (ended by a stop: the sound's end). */
+        uint64_t st[6] = { 0 };
+        void *fn = NULL;
+        const char *found = ntdll_symbol("pw_wineps5_stats", &fn);
+        char v[6][24];
+        for (int i = 0; i < 6; i++) snprintf(v[i], sizeof(v[i]), "-");
+        if (!strcmp(found, "ok") && fn) {
+            ((unsigned (*)(uint64_t *, unsigned))(uintptr_t)fn)(st, 6);
+            for (int i = 0; i < 6; i++) snprintf(v[i], sizeof(v[i]), "%llu", (unsigned long long)st[i]);
+        }
+        snprintf(out + n, size - n, " audio_driver=ps5 grains=%llu grains_nonzero=%llu grains_tail=%llu underruns=%s "
+                 "underrun_grains=%s drains=%s drain_grains=%s starved_grains=%s mixed_grains=%s audio_stats=%s "
+                 "gaps=%llu gap_max_us=%llu audio_errors=%llu tail_keys=%d tail_s=%.1f midi=untested",
                  (unsigned long long)audio_grains, (unsigned long long)audio_nonzero,
-                 (unsigned long long)(audio_nonzero - p_tail_nonzero0), (unsigned long long)audio_underruns,
-                 (unsigned long long)(audio_gap_max_ns / 1000), (unsigned long long)audio_errors, p_tail_keys,
-                 p_tail_s);
+                 (unsigned long long)(audio_nonzero - p_tail_nonzero0), v[2], v[3], v[4], v[5], v[1], v[0], found,
+                 (unsigned long long)audio_gaps, (unsigned long long)(audio_gap_max_ns / 1000),
+                 (unsigned long long)audio_errors, p_tail_keys, p_tail_s);
+    }
 }
 
 /* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
