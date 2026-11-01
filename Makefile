@@ -8,7 +8,7 @@ BUILD := build/host
 WINE_SOURCE ?= .deps/wine/source
 HEADERS := $(wildcard include/*.h src/*.h native/*.h tests/*.h)
 
-.PHONY: all test wine-check sanitize audit check-whitespace native native-release box86-catalog clean
+.PHONY: all test test-nobmi2 wine-check sanitize audit check-whitespace native native-release box86-catalog clean
 
 all: test
 	$(MAKE) audit check-whitespace
@@ -183,6 +183,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	$(BUILD)/dbt_differential < tests/fixtures/dbt_differential_forms.txt
 	$(BUILD)/dbt_differential global < tests/fixtures/dbt_differential_forms.txt
 	$(BUILD)/dbt_differential reencode < tests/fixtures/dbt_differential_forms.txt
+	$(MAKE) test-nobmi2
 	python3 tests/test_pw_sse_matrix.py
 	python3 tests/test_mesa_zink_build.py
 	python3 tests/test_package_mesa_zink.py
@@ -193,6 +194,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_hello64.py
 	python3 tests/test_wine_gdi64.py
+	python3 tests/test_wine_wow32.py
 	python3 tests/test_wine_vk64.py
 	python3 tests/test_wine_d3d11tri64.py
 	python3 tests/test_orbis_libc_stubs.py
@@ -276,6 +278,7 @@ wine-check: test
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_hello64.py
 	python3 tests/test_wine_gdi64.py
+	python3 tests/test_wine_wow32.py
 	python3 tests/test_wine_vk64.py
 	python3 tests/test_wine_d3d11tri64.py
 	python3 tests/test_orbis_libc_stubs.py
@@ -306,6 +309,19 @@ check-whitespace:
 
 # Keep sanitizer objects in their own tree: no stale normal binary can satisfy
 # the instrumented gate, and subsequent sanitizer runs can reuse its objects.
+# The translator's tests again with the encodings of a host without BMI2,
+# the PS4's Jaguar (pw_x86_reencode.c host_bmi2): this host may have BMI2,
+# the console has none.
+NOBMI2_TESTS := test_pw_x86_engine test_pw_x86_chaining test_pw_x86_residency test_pw_x86_global_residency \
+	test_pw_x86_reencode test_pw_x86_smc test_pw_x86_fault_markers test_pw_x86_lazyflags test_pw_wow_thread_budget
+test-nobmi2:
+	$(MAKE) BUILD=$(BUILD)-nobmi2 CFLAGS='$(CFLAGS) -DPW_X86_NO_BMI2' \
+		$(addprefix $(BUILD)-nobmi2/,$(NOBMI2_TESTS)) $(BUILD)-nobmi2/dbt_differential
+	@set -e; for test in $(addprefix $(BUILD)-nobmi2/,$(NOBMI2_TESTS)); do $$test; done
+	$(BUILD)-nobmi2/dbt_differential < tests/fixtures/dbt_differential_forms.txt
+	$(BUILD)-nobmi2/dbt_differential global < tests/fixtures/dbt_differential_forms.txt
+	$(BUILD)-nobmi2/dbt_differential reencode < tests/fixtures/dbt_differential_forms.txt
+
 sanitize:
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) test BUILD=build/sanitize CC=clang CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -fno-omit-frame-pointer -fsanitize=address,undefined'
 

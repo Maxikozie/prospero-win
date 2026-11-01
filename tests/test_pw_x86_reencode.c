@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include "pw_test_bmi2.h"
 
 enum { SPAN = 0x40000, CODE = 0x1000, DATA = 0x20000, STACK_TOP = 0x3f000 };
 
@@ -315,7 +316,11 @@ static void test_options(void)
     assert(block.instructions == 1 && block.source_bytes == 1);
     assert(block.exit.kind == PW_X86_EXIT_DIRECT_JUMP && block.exit.target_pc == 0x401001);
     assert(pw_x86_reencode(high, sizeof(high), 0x401000, out, sizeof(out), &block, &o) == PW_OK);
-    assert(block.instructions == 3 && block.exit.kind == PW_X86_EXIT_DYNAMIC);
+    if (host_has_bmi2())
+        assert(block.instructions == 3 && block.exit.kind == PW_X86_EXIT_DYNAMIC);
+    else  /* bh beside memory needs rorx: the block ends before it, as for tail */
+        assert(block.instructions == 1 && block.exit.kind == PW_X86_EXIT_DIRECT_JUMP &&
+               block.exit.target_pc == 0x401001);
     assert(pw_x86_reencode(divide, sizeof(divide), 0x401000, out, sizeof(out), &block, &o) == PW_OK);
     assert(block.instructions == 2 && block.exit.kind == PW_X86_EXIT_DYNAMIC);
     o.no_counters = 0;
@@ -1810,6 +1815,10 @@ static void reencodes_all(const uint8_t *code, size_t bytes)
     PwX86TranslateOptions o;
     PwX86Block block;
 
+    /* The sequences given here (high bytes beside memory, bit strings) are
+     * re-encoded through BMI2; without it they are the emitter's, which
+     * compare() checks. */
+    if (!host_has_bmi2()) return;
     memset(&o, 0, sizeof(o));
     o.flat_low = low; o.flat_high = low + SPAN; o.no_counters = 1;
     o.indirect_targets = targets; o.chain_targets = targets; o.indirect_mask = 15;
@@ -1910,6 +1919,7 @@ static void test_high_bytes(void)
     hostexec_fallback = 1;
     compare(code, sizeof(code));
     hostexec_fallback = 0;
+    if (!host_has_bmi2()) return;  /* the emitter's, as compare() ran them */
     r = run(code, sizeof(code), 1);
     assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
     /* The four stores below esp, then the loads into the high bytes alone. */
@@ -1942,6 +1952,14 @@ static void test_high_byte_cmpxchg(void)
         0x8b, 0x54, 0x24, 0xfc,             /* mov edx, [esp-4] */
         0xc3,
     };
+    if (!host_has_bmi2()) {
+        /* Without BMI2 (Jaguar) nothing takes it: the guest is refused the
+         * instruction. A known gap, kept visible here. */
+        hostexec_fallback = 1;
+        assert(run(code, sizeof(code), 1).status == PW_ERR_UNSUPPORTED);
+        hostexec_fallback = 0;
+        return;
+    }
     for (unsigned production = 0; production < 2; production++) {
         Run r = production ? run_production(code, sizeof(code)) : run(code, sizeof(code), 1);
         assert(r.status == PW_OK && r.state.eip == 0xdead0000u && r.reencoded);
@@ -1968,6 +1986,13 @@ static void test_high_bytes_fs(void)
     for (unsigned markers = 0; markers < 2; markers++) {
         fault_markers = markers;
         r = run(code, sizeof(code), 1);
+        if (!host_has_bmi2()) {
+            /* Without BMI2 (Jaguar) a high byte loaded through fs is refused
+             * by every path, the host fallback included. A known gap, kept
+             * visible here; TEB accesses through fs are dwords in practice. */
+            assert(r.status == PW_ERR_UNSUPPORTED);
+            continue;
+        }
         assert(r.status == PW_OK && r.state.eip == 0xdead0000u && r.reencoded);
         assert(r.data[0x204] == 0xd0);
         assert(r.state.gpr[0] == (0x44330011u | (uint32_t)(uint8_t)(0x208 * 7 + 3) << 8));
@@ -2039,6 +2064,7 @@ static void test_bit_strings(void)
     hostexec_fallback = 1;
     compare(code, sizeof(code));
     hostexec_fallback = 0;
+    if (!host_has_bmi2()) return;  /* the emitter's, as compare() ran them */
     r = run_production(code, sizeof(code));
     assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
     {

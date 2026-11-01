@@ -24,10 +24,14 @@ static const uint8_t host_of[8] = { 0, 1, 2, 3, R12, 5, 6, R13 };
 /* Whether the host has BMI2, whose rorx and sarx move and shift without
  * touching the flags: ah-bh beside a memory operand and bt m,r go through
  * them (emit_memory, emit_bit_string), and without it they stay the
- * emitter's. Found once; every thread finds the same answer. */
+ * emitter's. Found once; every thread finds the same answer. Built with
+ * -DPW_X86_NO_BMI2, a host that has it takes the other encodings, as the
+ * PS4's Jaguar (no BMI2) does: the tests run them that way too. */
 static unsigned host_bmi2(void)
 {
-#if defined(__x86_64__)
+#if defined(PW_X86_NO_BMI2)
+    return 0;
+#elif defined(__x86_64__)
     static int known = -1;
     int value = __atomic_load_n(&known, __ATOMIC_RELAXED);
     if (value < 0) {

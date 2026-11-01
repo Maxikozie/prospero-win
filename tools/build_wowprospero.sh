@@ -17,6 +17,10 @@
 #
 # Usage:
 #   tools/build_wowprospero.sh [--build DIR] [--source DIR] [--jobs N] [--output DIR]
+#                              [--cflags FLAGS]
+#
+#   --cflags FLAGS  added to the Unix library's compile, e.g. -DPW_X86_NO_BMI2
+#                   for the encodings of a host without BMI2 (the PS4's Jaguar)
 set -eu
 
 WINE_COMMIT=490f6d5dcbb2a5047345b8af88d114bbcaad69a8
@@ -24,6 +28,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 output_dir=
+extra_cflags=
 jobs=$(nproc 2>/dev/null || echo 4)
 
 fail() { echo "build_wowprospero: $*" >&2; exit 1; }
@@ -34,6 +39,7 @@ while [ $# -gt 0 ]; do
     --source) source_dir=$2; shift 2 ;;
     --jobs) jobs=$2; shift 2 ;;
     --output) output_dir=$2; shift 2 ;;
+    --cflags) extra_cflags=$2; shift 2 ;;
     *) fail "unknown argument $1" ;;
     esac
 done
@@ -59,7 +65,7 @@ out=$(CDPATH= cd -- "$out" && pwd)
 dbt="src/pw_x86_engine.c src/pw_x86_block.c src/pw_x86_cache.c src/pw_x86_hostexec.c
      src/pw_x86_reencode.c src/pw_x87.c src/pw_guest_fp.c src/pw_vm.c src/pw_vm_posix.c"
 (cd "$root" && gcc -m64 -O2 -g -fPIC -shared -Wl,-Bsymbolic -Wl,-soname,wowprospero.so \
-    -Wl,-z,defs -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT \
+    -Wl,-z,defs -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT $extra_cflags \
     -I"$module" -I"$build_dir/include" -I"$source_dir/include" -Isrc -Iinclude \
     "$module/unix.c" $dbt "$build_dir/dlls/ntdll/ntdll.so" -o "$out/wowprospero.so") ||
     fail "Unix library build failed"

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <ucontext.h>
+#include "pw_test_bmi2.h"
 
 enum { SPAN = 0x40000, CODE = 0x1000, DATA = 0x20000, STACK_TOP = 0x3f000 };
 
@@ -423,6 +424,7 @@ static void test_high_bytes_and_bit_strings(void)
                                     0x66, 0x0f, 0xb3, 0x07, 0xc3 };
     Run marked;
 
+    if (!host_has_bmi2()) return;  /* the emitter's without BMI2: nothing re-encoded to mark */
     compare("high byte load", load, sizeof(load), 4, 8, 0, -1);
     compare("high byte store", store, sizeof(store), 4, 8, 1, -1);
     compare("high byte adc", modify, sizeof(modify), 4, 0x10, 0, -1);

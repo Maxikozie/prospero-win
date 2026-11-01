@@ -8,6 +8,7 @@
 #include "pw_wine_prx.h"
 #include "pw_wine_display.h"
 #include "pw_wine_exit_orbis.h"
+#include "../../wine/wowprospero/wow_stats.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -29,6 +30,16 @@ extern uint32_t sceKernelLoadStartModule(const char *path, size_t argc, const vo
 extern int sceKernelGetModuleInfo(int32_t handle, void *info);
 extern int sceKernelDlsym(int32_t handle, const char *symbol, void **address);
 extern int sceKernelGetModuleList(int32_t *handles, size_t size, size_t *count);
+/* libkernel's SceKernelVirtualQueryInfo (OpenOrbis _types/kernel.h): the
+ * region, then what backs it. Flags 1: the region at or after the address. */
+typedef struct VqInfo {
+    void *start, *end;
+    int64_t offset;
+    int32_t protection, type;
+    uint32_t kind;           /* flexible, direct, stack, pooled, committed: bits 0-4 */
+    char name[32];
+} VqInfo;
+extern int sceKernelVirtualQuery(const void *address, int flags, VqInfo *info, size_t size);
 
 typedef void (*StageFn)(char *fields, size_t size);
 /* A stage: its name, time limit, what it runs (NULL: the Wine stage, last)
@@ -1182,15 +1193,86 @@ static void stage_wv_bind(char *fields, size_t size)
              s.first[0] ? s.first : "-", s.watch_state);
 }
 
+/* ---- f1: wowprospero.prx, the address space below 4 GiB ------------------------------------ */
+
+/* wowprospero.prx's slots, all from ntdll (the hooks of patches 0610/0710,
+ * __wine_ps5_mprotect, the Nt* calls); the unresolved-fault hook's own state. */
+static void stage_wow_bind(char *fields, size_t size)
+{
+    int result;
+    int32_t ntdll = load("ntdll", &result), wow;
+    void *stats = NULL;
+    Module m;
+    Slots s;
+
+    if (ntdll <= 0) { snprintf(fields, size, "wow_load=nontdll wow_bound=-"); return; }
+    wow = load("wowprospero", &result);
+    step("wow_bind wowprospero load=0x%x result=%d", (unsigned)wow, result);
+    if (wow <= 0) { snprintf(fields, size, "wow_load=0x%x wow_bound=-", (unsigned)wow); return; }
+    if (module_info(wow, &m)) { snprintf(fields, size, "wow_load=ok wow_bound=nomoduleinfo"); return; }
+    check_slots("wowprospero", &m, ntdll, &s, "__wine_ps5_set_segv_unresolved_hook");
+    slot_step("wow_bind", &s);
+    sceKernelDlsym(wow, "pw_wow_stats", &stats);
+    snprintf(fields, size, "wow_load=ok wow_bound=%u/%u wow_first=%s wow_hook=%s wow_sym=%d", s.bound, s.total,
+             s.first[0] ? s.first : "-", s.watch_state, stats != NULL);
+}
+
+/* What is mapped between 64 KiB and 4 GiB before Wine reserves anything:
+ * Wine's i386 side needs its images and heaps there (patches 0601, 0895).
+ * The free total, the largest hole, the number of regions, and the first
+ * few regions in the log. */
+static void stage_low_map(char *fields, size_t size)
+{
+    const uint64_t top = 1ull << 32;
+    uint64_t at = 0x10000, free_bytes = 0, hole_base = 0, hole_size = 0, used = 0;
+    unsigned maps = 0;
+
+    while (at < top) {
+        VqInfo info;
+        uint64_t start, end;
+
+        memset(&info, 0, sizeof(info));
+        if (sceKernelVirtualQuery((const void *)(uintptr_t)at, 1, &info, sizeof(info)) != 0) break;
+        start = (uint64_t)(uintptr_t)info.start;
+        end = (uint64_t)(uintptr_t)info.end;
+        if (end <= start || end <= at) break;
+        if (start >= top) break;
+        if (start > at) {
+            free_bytes += start - at;
+            if (start - at > hole_size) { hole_size = start - at; hole_base = at; }
+        }
+        if (maps < 8)
+            step("low_map region 0x%llx-0x%llx prot=0x%x type=%d kind=0x%x name=%.32s", (unsigned long long)start,
+                 (unsigned long long)end, (unsigned)info.protection, info.type, info.kind & 0x1f, info.name);
+        maps++;
+        used += (end < top ? end : top) - (start > at ? start : at);
+        at = end;
+    }
+    if (at < top) {
+        free_bytes += top - at;
+        if (top - at > hole_size) { hole_size = top - at; hole_base = at; }
+    }
+    snprintf(fields, size, "low_map=ok low_free_mib=%llu low_used_mib=%llu low_maps=%u low_hole=0x%llx+%llu",
+             (unsigned long long)(free_bytes >> 20), (unsigned long long)(used >> 20), maps,
+             (unsigned long long)hole_base, (unsigned long long)(hole_size >> 20));
+}
+
 /* The Wine program's own lines (vk64.exe: VK64, VK64S; d3d11tri64.exe:
- * D3D11), kept whole: the title remembers only the last stdout line. */
+ * D3D11; wow32.exe: HELLO32, HELLO32S, GDI32), kept whole: the title
+ * remembers only the last stdout line. */
 static char vk64_line[256], vk64s_line[256], d3d11_line[256];
+static char hello32_line[160], hello32s_line[160], gdi32_line[320];
+static int hello32_done;
 
 void pw_ms_stdout(const char *line)
 {
     if (!strncmp(line, "VK64 ", 5)) snprintf(vk64_line, sizeof(vk64_line), "%s", line + 5);
     else if (!strncmp(line, "VK64S ", 6)) snprintf(vk64s_line, sizeof(vk64s_line), "%s", line + 6);
     else if (!strncmp(line, "D3D11 ", 6)) snprintf(d3d11_line, sizeof(d3d11_line), "%s", line + 6);
+    else if (!strncmp(line, "HELLO32 ", 8)) snprintf(hello32_line, sizeof(hello32_line), "%s", line + 8);
+    else if (!strncmp(line, "HELLO32S ", 9)) snprintf(hello32s_line, sizeof(hello32s_line), "%s", line + 9);
+    else if (!strncmp(line, "GDI32 ", 6)) snprintf(gdi32_line, sizeof(gdi32_line), "%s", line + 6);
+    else if (!strcmp(line, "Hello from PE32")) hello32_done = 1;
 }
 
 /* What RADV reads (libvulkan.prx is given ntdll's environment when win32u
@@ -1219,24 +1301,61 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
  * counters are then zeros). ntdll's handle by name, else by loading its
  * path again (the first e2 launch read zeros: the name look-up is
  * unmeasured, the path load is what e1's stages use). */
-static const char *vulkan_stats(struct pw_vulkan_stats *stats)
+static const char *ntdll_symbol(const char *name, void **address)
 {
     const PwPrxDescriptor *descriptor = NULL;
     void *(*sym)(void *, const char *);
-    int (*read)(struct pw_vulkan_stats *) = NULL;
     int32_t ntdll = module_handle("ntdll");
     Module m;
     int result;
 
-    memset(stats, 0, sizeof(*stats));
-    stats->size = sizeof(*stats);
+    *address = NULL;
     if (ntdll < 0) ntdll = load("ntdll", &result);
     if (ntdll <= 0 || module_info(ntdll, &m)) return "nontdll";
-    step("vk_stats ntdll handle=0x%x name=%s", (unsigned)ntdll, m.name);
+    step("%s: ntdll handle=0x%x name=%s", name, (unsigned)ntdll, m.name);
     if (pw_prx_find_descriptor(m.segments, m.count, &descriptor) != PW_PRX_OK) return "nodescriptor";
     if (!(sym = (void *(*)(void *, const char *))(uintptr_t)pw_prx_lookup(descriptor, "dlsym"))) return "nodlsym";
-    if (!(read = (int (*)(struct pw_vulkan_stats *))(uintptr_t)sym(NULL, "pw_vulkan_stats"))) return "nosym";
-    return read(stats) ? "readfailed" : "ok";
+    if (!(*address = sym(NULL, name))) return "nosym";
+    return "ok";
+}
+
+static const char *vulkan_stats(struct pw_vulkan_stats *stats)
+{
+    void *address;
+    const char *found = ntdll_symbol("pw_vulkan_stats", &address);
+
+    memset(stats, 0, sizeof(*stats));
+    stats->size = sizeof(*stats);
+    if (strcmp(found, "ok")) return found;
+    return ((int (*)(struct pw_vulkan_stats *))(uintptr_t)address)(stats) ? "readfailed" : "ok";
+}
+
+/* wowprospero's counters (wow_stats.h) from the instance Wine loaded, found
+ * through ntdll's dlsym as libvulkan's are; zeros and the reason otherwise. */
+static const char *wow_stats(uint64_t out[PW_WOW_STAT_COUNT])
+{
+    void *address;
+    const char *found = ntdll_symbol("pw_wow_stats", &address);
+
+    memset(out, 0, sizeof(uint64_t) * PW_WOW_STAT_COUNT);
+    if (strcmp(found, "ok")) return found;
+    ((pw_wow_stats_fn)(uintptr_t)address)(out, PW_WOW_STAT_COUNT);
+    return "ok";
+}
+
+/* The value of KEY in a "k=v k=v" line, "-" when absent. */
+static const char *pick(const char *line, const char *key, char *out, size_t size)
+{
+    size_t n = strlen(key);
+    for (const char *p = line; p && *p; p = strchr(p, ' ') ? strchr(p, ' ') + 1 : NULL) {
+        if (!strncmp(p, key, n) && p[n] == '=') {
+            const char *v = p + n + 1, *end = strchr(v, ' ');
+            snprintf(out, size, "%.*s", (int)(end ? (size_t)(end - v) : strlen(v)), v);
+            return out;
+        }
+    }
+    snprintf(out, size, "-");
+    return out;
 }
 
 /* "key=value ..." with each KEY of RENAME (pairs: from, to) renamed. */
@@ -1266,6 +1385,7 @@ static void d_lines(void);
 static void e1_lines(void);
 static void e2_lines(void);
 static void e_lines(void);
+static void f1_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1317,6 +1437,15 @@ static const PwMsStage e_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "d3d11", 0, NULL, "exit=fault" },
 };
+/* f1 and f2 from one launch of wow32.exe (32-bit, on the translator):
+ * wowprospero's slots and the address space below 4 GiB before Wine
+ * starts, the display for the GDI picture. */
+static const PwMsStage f1_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "low_map", 10, stage_low_map, "low_map=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "wow32", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -1325,6 +1454,7 @@ static const PwMsPlan plans[] = {
     { "e1", e1_stages, sizeof(e1_stages) / sizeof(e1_stages[0]), "C:\\hello.exe", 1, e1_lines },
     { "e2", e2_stages, sizeof(e2_stages) / sizeof(e2_stages[0]), "C:\\vk64.exe", 0, e2_lines },
     { "e", e_stages, sizeof(e_stages) / sizeof(e_stages[0]), "C:\\d3d11tri64.exe", 0, e_lines },
+    { "f1", f1_stages, sizeof(f1_stages) / sizeof(f1_stages[0]), "C:\\wow32.exe", 0, f1_lines },
 };
 
 static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
@@ -1524,6 +1654,30 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, line, (unsigned long long)vk.presents, vk.width,
                  vk.height, removed || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none", release_state,
                  (unsigned long long)gdi_dropped, counted);
+    } else if (plan->lines == f1_lines) {
+        /* wow32.exe: the translator's counters, HELLO32/HELLO32S's checks,
+         * then GDI32's picture with the sink's counts. cpu=translator once a
+         * thread ran on wowprospero. */
+        uint64_t wow[PW_WOW_STAT_COUNT];
+        const char *counted = wow_stats(wow);
+        char fp[40], thread[40], seh[40], screen[24], pixel[16], window[32], fonts[12];
+        save_last_drawn();
+        pthread_mutex_lock(&present_lock);
+        snprintf(fields, sizeof(fields), "exit=%s server=%s cpu=%s wow_stats=%s wow_threads=%llu faults_unresolved=%llu "
+                 "faults_guest=%llu faults_marked=%llu faults_host=%llu faults_smc=%llu dbt_errors=%llu fp=%s "
+                 "thread=%s seh=%s hello=%s frames=%llu drawn=%llu frame=%ux%u fb=%s screen=%s pixel=%s window=%s "
+                 "fonts=%s", exit_text, server_connected ? "inprocess" : "none",
+                 strcmp(counted, "ok") ? counted : wow[PW_WOW_STAT_THREADS] ? "translator" : "none", counted,
+                 (unsigned long long)wow[PW_WOW_STAT_THREADS], (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_GUEST], (unsigned long long)wow[PW_WOW_STAT_FAULTS_MARKED],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_HOST], (unsigned long long)wow[PW_WOW_STAT_FAULTS_SMC],
+                 (unsigned long long)wow[PW_WOW_STAT_DBT_ERRORS], pick(hello32_line, "fp", fp, sizeof(fp)),
+                 pick(hello32_line, "thread", thread, sizeof(thread)), pick(hello32s_line, "seh", seh, sizeof(seh)),
+                 hello32_done ? "ok" : "-", (unsigned long long)frames, (unsigned long long)drawn, frame_width,
+                 frame_height, fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail",
+                 pick(gdi32_line, "screen", screen, sizeof(screen)), pick(gdi32_line, "pixel", pixel, sizeof(pixel)),
+                 pick(gdi32_line, "window", window, sizeof(window)), pick(gdi32_line, "fonts", fonts, sizeof(fonts)));
+        pthread_mutex_unlock(&present_lock);
     } else if (plan->c_line) {
         /* hello.exe: milestone c's regression (d1, e1). */
         int ok = !strcmp(exit_text, "0") && server_connected && !strcmp(last_stdout, "Hello from PE64");
@@ -1689,6 +1843,33 @@ static void e_lines(void)
         { "vk_stats", D3D11 }, { "display", DISPLAY }, { "exit", D3D11 },
     };
     emit_line("PS4WINE e d3d11", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* f1: wow32.exe's checks on the translator; f2: its GDI picture through
+ * wow64win (gdi64.exe's, built for i686). */
+static void f1_lines(void)
+{
+    enum { WOW, LOW, DISPLAY, WOW32 };
+    static const LineKey f1_keys[] = {
+        { "cpu", WOW32 }, { "wow_bound", WOW }, { "fp", WOW32 }, { "thread", WOW32 }, { "seh", WOW32 },
+        { "faults_unresolved", WOW32 }, { "faults_guest", WOW32 }, { "faults_marked", WOW32 },
+        { "faults_host", WOW32 }, { "faults_smc", WOW32 }, { "dbt_errors", WOW32 }, { "wow_threads", WOW32 },
+        { "exit", WOW32 }, { "hello", WOW32 }, { "wow_first", WOW }, { "wow_hook", WOW }, { "low_free_mib", LOW },
+        { "low_hole", LOW }, { "low_maps", LOW },
+    };
+    static const LineKey f2_keys[] = {
+        { "pixel", WOW32 }, { "window", WOW32 }, { "screen", WOW32 }, { "frames", WOW32 }, { "drawn", WOW32 },
+        { "frame", WOW32 }, { "fb", WOW32 }, { "fonts", WOW32 }, { "server", WOW32 }, { "display", DISPLAY },
+        { "exit", WOW32 },
+    };
+    char head[96], pixel[32];
+
+    emit_line("PS4WINE f1 hello32", f1_keys, sizeof(f1_keys) / sizeof(f1_keys[0]));
+    value(WOW32, "pixel", pixel, sizeof(pixel));
+    /* win32u=ok: the program got as far as drawing and reading back a pixel. */
+    snprintf(head, sizeof(head), "PS4WINE f2 gdi32 win32u=%s",
+             strcmp(pixel, "-") && strcmp(pixel, "crash") && strcmp(pixel, "hang") ? "ok" : "fail");
+    emit_line(head, f2_keys, sizeof(f2_keys) / sizeof(f2_keys[0]));
 }
 
 void pw_ms_emit_lines(void)

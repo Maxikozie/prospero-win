@@ -21,6 +21,14 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The same program built for i686 (gdi32.exe, and inside wow32.exe for the
+ * PS4 port's f2) says GDI32: it runs under WoW64, through wow64win. */
+#ifdef _WIN64
+#define GDI_LABEL "GDI64"
+#else
+#define GDI_LABEL "GDI32"
+#endif
+
 static int font_families, tahoma;
 
 static int CALLBACK count_family(const LOGFONTW *font, const TEXTMETRICW *metrics, DWORD type, LPARAM param)
@@ -168,7 +176,7 @@ int main(void)
         font_families = 0;
         if (screen) EnumFontFamiliesExW(screen, &all, count_family, 0, 0);
     }
-    printf("GDI64 screen=%dx%d pixel=%02x%02x%02x fonts=%d tahoma=%d text_px=%d window=%s dir=%d:%lu open=%lu "
+    printf(GDI_LABEL " screen=%dx%d pixel=%02x%02x%02x fonts=%d tahoma=%d text_px=%d window=%s dir=%d:%lu open=%lu "
            "add=%d:%lu fonts_after=%d\n",
            GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
            pixel == CLR_INVALID ? 0 : GetRValue(pixel), pixel == CLR_INVALID ? 0 : GetGValue(pixel),

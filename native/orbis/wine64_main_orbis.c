@@ -576,11 +576,15 @@ int main(int argc, char **argv)
             uint64_t mem[10] = { 0 }, vm[8] = { 0 };
             unsigned m = start.memory_stats ? start.memory_stats(mem, 10) : 0;
             unsigned v = start.virtual_stats ? start.virtual_stats(vm, 8) : 0;
-            LOG("PW_WINE64 alive t=%llu server=%d stage=%d dmem=%llu heap=%llu heap_dmem=%llu vm=%llu/%llu",
+            /* dmem_low: direct memory backed below 4 GiB now and at most (the
+             * i386 side's, milestone f); dmem_fail: refused direct-memory calls. */
+            LOG("PW_WINE64 alive t=%llu server=%d stage=%d dmem=%llu dmem_low=%llu dmem_low_peak=%llu dmem_fail=%llu "
+                "heap=%llu heap_dmem=%llu vm=%llu/%llu",
                 (unsigned long long)((now - start_ns) / 1000000000ull), server_connected, start.stage,
-                m ? (unsigned long long)mem[0] : 0ull, m ? (unsigned long long)mem[4] : 0ull,
-                m ? (unsigned long long)mem[8] : 0ull, v ? (unsigned long long)vm[0] : 0ull,
-                v ? (unsigned long long)vm[1] : 0ull);
+                m ? (unsigned long long)mem[0] : 0ull, m > 6 ? (unsigned long long)mem[6] : 0ull,
+                m > 7 ? (unsigned long long)mem[7] : 0ull, m > 3 ? (unsigned long long)mem[3] : 0ull,
+                m ? (unsigned long long)mem[4] : 0ull, m ? (unsigned long long)mem[8] : 0ull,
+                v ? (unsigned long long)vm[0] : 0ull, v ? (unsigned long long)vm[1] : 0ull);
             next_alive = now + 1000000000ull;
         }
         pw_diagnostics_tick(now);

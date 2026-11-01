@@ -42,6 +42,21 @@
 #include "tsc_clock.h"
 #include "call_top.h"
 #include "host_memory.h"
+#include "wow_stats.h"
+
+/* The consoles, PS5 (__PROSPERO__) and PS4 (__ORBIS__): Wine's own SIGSEGV
+ * handler calls this backend through hooks (patches 0610 and 0710), ntdll's
+ * mprotect reaches direct memory, and a title, which passes Wine no
+ * environment of its own, enables options with trigger files in <data>:
+ * /data/prospero-win on the PS5, /data/ps4-wine on the PS4. */
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+#define PW_WOW_CONSOLE 1
+#endif
+#ifdef __ORBIS__
+#define PW_WOW_TRIGGER_DIR "/data/ps4-wine/"
+#else
+#define PW_WOW_TRIGGER_DIR "/data/prospero-win/"
+#endif
 
 /* The guest range every translated access is checked against (load_state). */
 enum { GUEST_LOW = 0x10000u, GUEST_HIGH = 0xfffff000u };
@@ -116,10 +131,17 @@ static uint64_t next_cache_report_id;
 enum { MAX_ARENAS = 1024 };
 static struct { uintptr_t low, high; PwX86Engine *engine; PwX86State *state; PwX86HotspotProfile *profile;
                 volatile int *retry; } arenas[MAX_ARENAS];
-#ifndef __PROSPERO__
+#ifndef PW_WOW_CONSOLE
 static struct sigaction wine_segv;
 #endif
 static int fault_markers;
+/* pw_wow_stats (wow_stats.h): atomic adds only, from the fault hooks too;
+ * nothing is logged or locked in a handler. */
+static uint64_t wow_stats[PW_WOW_STAT_COUNT];
+static inline void wow_count( enum pw_wow_stat stat )
+{
+    __atomic_add_fetch( &wow_stats[stat], 1, __ATOMIC_RELAXED );
+}
 static void register_arena( struct pw_thread *thread, int add );
 static void profile_add_thread( struct pw_thread *thread );
 static PwWowHostMemory host_memory;
@@ -538,29 +560,29 @@ static struct pw_thread *get_thread(void)
                                    (!getenv( "PW_WOW_SUPERBLOCKS" ) || strcmp( getenv( "PW_WOW_SUPERBLOCKS" ), "0" )) );
     /* Calls through a register or memory learn their target in the same
      * writable code, as side exits do; off unless PW_WOW_CALL_PREDICT=1 or,
-     * on the console, /data/prospero-win/pw_wow_call_predict exists. */
+     * on the console, <data>/pw_wow_call_predict exists. */
     {
         int predict = getenv( "PW_WOW_CALL_PREDICT" ) && !strcmp( getenv( "PW_WOW_CALL_PREDICT" ), "1" );
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
         struct stat predict_st;
 
-        if (!stat( "/data/prospero-win/pw_wow_call_predict", &predict_st )) predict = 1;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_call_predict", &predict_st )) predict = 1;
 #endif
         pw_x86_engine_set_call_predict( &thread->engine, thread->engine.superblocks && predict );
     }
     /* Switches go through a copy of their jump table in the code, and import
      * thunks (jmp [iat]) learn their target, in the same writable code as
      * side exits (PW_WOW_JUMP_TABLES=0 and PW_WOW_JUMP_PREDICT=0, or on the
-     * console /data/prospero-win/pw_wow_no_jump_tables and
+     * console <data>/pw_wow_no_jump_tables and
      * pw_wow_no_jump_predict, keep the lookup). */
     {
         int tables = !getenv( "PW_WOW_JUMP_TABLES" ) || strcmp( getenv( "PW_WOW_JUMP_TABLES" ), "0" );
         int jumps = !getenv( "PW_WOW_JUMP_PREDICT" ) || strcmp( getenv( "PW_WOW_JUMP_PREDICT" ), "0" );
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
         struct stat jump_st;
 
-        if (!stat( "/data/prospero-win/pw_wow_no_jump_tables", &jump_st )) tables = 0;
-        if (!stat( "/data/prospero-win/pw_wow_no_jump_predict", &jump_st )) jumps = 0;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_no_jump_tables", &jump_st )) tables = 0;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_no_jump_predict", &jump_st )) jumps = 0;
 #endif
         pw_x86_engine_set_jump_tables( &thread->engine, thread->engine.superblocks && tables );
         pw_x86_engine_set_jump_predict( &thread->engine, thread->engine.superblocks && jumps );
@@ -600,14 +622,14 @@ static struct pw_thread *get_thread(void)
     {
         int dispatch = getenv( "PW_WOW_DISPATCH_PROFILE" ) != NULL;
         int enabled = getenv( "PW_WOW_EXEC_TIMING" ) != NULL;
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
         struct stat dispatch_st;
-        if (!stat( "/data/prospero-win/pw_wow_dispatch_profile", &dispatch_st )) dispatch = 1;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_dispatch_profile", &dispatch_st )) dispatch = 1;
 #endif
         pw_x86_engine_set_dispatch_profile( &thread->engine, dispatch );
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
         struct stat st;
-        if (!stat( "/data/prospero-win/pw_wow_exec_timing", &st )) enabled = 1;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_exec_timing", &st )) enabled = 1;
 #endif
         if (enabled)
         {
@@ -623,6 +645,7 @@ static struct pw_thread *get_thread(void)
         }
     }
     profile_add_thread( thread );
+    wow_count( PW_WOW_STAT_THREADS );
     return self = thread;
 }
 
@@ -686,6 +709,14 @@ static void store_state( const PwX86State *state, I386_CONTEXT *ctx )
     ctx->Eip = state->eip;
     ctx->EFlags = (ctx->EFlags & ~0x00000cd5) | (state->eflags & 0x00000cd5);
 }
+
+#if defined(__ORBIS__)
+/* The PS4's signal frame as milestone a measured it (the PS5's): mcontext at
+ * 64, RIP at +224, RSP at +248; the FreeBSD branches below read it through
+ * wine/orbis/include's ucontext_t. */
+C_ASSERT( offsetof(ucontext_t, uc_mcontext.mc_rip) == 224 );
+C_ASSERT( offsetof(ucontext_t, uc_mcontext.mc_rsp) == 248 );
+#endif
 
 /* The saved RIP in a signal context, or NULL where it is not known. */
 /* The saved RSP, in the same layout. */
@@ -760,9 +791,14 @@ static int redirect_fault( siginfo_t *info, void *context )
     const uintptr_t address = (uintptr_t)info->si_addr;
     uintptr_t *rip = context_rip( context ), target = 0;
     PwX86State *state = NULL;
+    int translated = 0;
     uint32_t eip;
 
-    if (smc_write_fault( address, context )) return 1;
+    if (smc_write_fault( address, context ))
+    {
+        wow_count( PW_WOW_STAT_FAULTS_SMC );
+        return 1;
+    }
     for (unsigned int i = 0; i < MAX_ARENAS && !target; i++)
     {
         uintptr_t high = __atomic_load_n( &arenas[i].high, __ATOMIC_ACQUIRE );
@@ -770,18 +806,26 @@ static int redirect_fault( siginfo_t *info, void *context )
         if (low && high && *rip >= low && *rip < high)
         {
             uintptr_t rsp;
+            translated = 1;
             /* A call that ran out of call stack: start it again. */
             if (context_rsp( context ) &&
                 pw_x86_engine_call_stack_fault( arenas[i].engine, address, &rsp ))
             {
                 *context_rsp( context ) = rsp;
+                wow_count( PW_WOW_STAT_FAULTS_CALL_STACK );
                 return 1;
             }
             target = pw_x86_engine_fault_redirect( arenas[i].engine, *rip );
             state = arenas[i].state;
         }
     }
-    if (!target) return 0;
+    if (!target)
+    {
+        /* An instruction the host refused in translated code (one the
+         * translator emitted that this processor lacks): no one resolves it. */
+        if (translated && info->si_signo == SIGILL) wow_count( PW_WOW_STAT_FAULTS_UNRESOLVED );
+        return 0;
+    }
     if (address >= GUEST_LOW && address < GUEST_HIGH)
     {
         /* Wine's to handle (a guard page, a write watch); the block stored
@@ -790,10 +834,11 @@ static int redirect_fault( siginfo_t *info, void *context )
         return 0;
     }
     *rip = target;
+    wow_count( PW_WOW_STAT_FAULTS_MARKED );
     return 1;
 }
 
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
 /* An access violation Wine could not resolve, at a marked access in our code
  * (a real guest fault, not a guard page or write watch): resume it at the
  * access's refused-access path, which leaves translated code with the exact
@@ -803,6 +848,7 @@ static int redirect_fault( siginfo_t *info, void *context )
 static int redirect_unresolved( siginfo_t *info, void *context )
 {
     uintptr_t *rip = context_rip( context ), target = 0;
+    int translated = 0;
 
     (void)info;
     for (unsigned int i = 0; i < MAX_ARENAS && !target; i++)
@@ -810,10 +856,20 @@ static int redirect_unresolved( siginfo_t *info, void *context )
         uintptr_t high = __atomic_load_n( &arenas[i].high, __ATOMIC_ACQUIRE );
         uintptr_t low = __atomic_load_n( &arenas[i].low, __ATOMIC_ACQUIRE );
         if (low && high && *rip >= low && *rip < high)
+        {
+            translated = 1;
             target = pw_x86_engine_fault_redirect( arenas[i].engine, *rip );
+        }
     }
-    if (!target) return 0;
+    if (!target)
+    {
+        /* Wine raises it next: from translated code it cannot be dispatched
+         * (the process ends), elsewhere it is Wine's own exception. */
+        wow_count( translated ? PW_WOW_STAT_FAULTS_UNRESOLVED : PW_WOW_STAT_FAULTS_HOST );
+        return 0;
+    }
     *rip = target;
+    wow_count( PW_WOW_STAT_FAULTS_MARKED );
     return 1;
 }
 
@@ -845,7 +901,7 @@ enum { PROFILE_PERIOD_MS = 5000, PROFILE_CALIBRATION_NS = 20000000, PROFILE_ROWS
        PROFILE_CUMULATIVE_WINDOWS = 12, PROFILE_CUMULATIVE_MIN = 2 };
 static uint64_t profile_tsc_rate, profile_period_ticks;
 #include <sys/time.h>
-#ifndef __PROSPERO__
+#ifndef PW_WOW_CONSOLE
 #include <dlfcn.h>
 #endif
 /* Native PCs are process-wide and cumulative. Keys never move or disappear;
@@ -925,10 +981,10 @@ static uint64_t profile_calibrate(void)
 static void profile_start(void)
 {
     profile_path = getenv("PW_WOW_PROFILE");
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
     if(!profile_path) {
         struct stat st;
-        if(!stat("/data/prospero-win/pw_wow_profile", &st)) profile_path = "1";
+        if(!stat(PW_WOW_TRIGGER_DIR "pw_wow_profile", &st)) profile_path = "1";
     }
 #endif
     if(!profile_path || !*profile_path) { profile_path = NULL; return; }
@@ -1000,7 +1056,7 @@ static void profile_native_dump(uint64_t now, FILE *out)
     for(unsigned i = 0; i < 12 && rows[i].samples; i++) {
         const char *module = "?", *symbol = "?";
         uintptr_t offset = rows[i].pc;
-#ifndef __PROSPERO__
+#ifndef PW_WOW_CONSOLE
         Dl_info info;
         if(dladdr((void *)rows[i].pc, &info)) {
             if(info.dli_fname) module = info.dli_fname;
@@ -1077,7 +1133,7 @@ static void profile_maybe_dump(void)
         verify_samples += snapshot->slots[i].verify;
     }
     qsort(snapshot->slots, PW_X86_HOTSPOT_SLOTS, sizeof(snapshot->slots[0]), compare_hotspots);
-#ifndef __PROSPERO__
+#ifndef PW_WOW_CONSOLE
     if(strcmp(profile_path, "1")) {
         snprintf(path, sizeof(path), "%s.%04x", profile_path, tid);
         out = fopen(path, "w");
@@ -1158,7 +1214,7 @@ static void register_arena( struct pw_thread *thread, int add )
     }
 }
 
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
 /* wine/ps5/pw_wine_dmem_ps5.c, in ntdll.prx: the mprotect Wine's own calls go
  * through (direct memory needs sceKernelMprotect). */
 extern int __wine_ps5_mprotect( void *addr, size_t len, int prot );
@@ -1166,7 +1222,7 @@ extern int __wine_ps5_mprotect( void *addr, size_t len, int prot );
 
 static int smc_host_protect( void *address, size_t bytes, int prot )
 {
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
     return __wine_ps5_mprotect( address, bytes, prot );
 #else
     return mprotect( address, bytes, prot );
@@ -1184,17 +1240,17 @@ static uint64_t smc_now_ms( void )
 
 /* Write protection for writable code needs the fault handler (fault
  * markers). PW_WOW_SMC_PROTECT=0, or on the console the file
- * /data/prospero-win/pw_wow_smc_check, keeps every such page on the checks. */
+ * <data>/pw_wow_smc_check, keeps every such page on the checks. */
 static void smc_start( void )
 {
     static const PwSmcOps ops = { smc_host_protect, smc_now_ms };
     const char *option = getenv( "PW_WOW_SMC_PROTECT" );
 
     if (!fault_markers || (option && !strcmp( option, "0" ))) return;
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
     {
         struct stat st;
-        if (!stat( "/data/prospero-win/pw_wow_smc_check", &st )) return;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_smc_check", &st )) return;
     }
 #endif
     if (pw_smc_init( &smc, host_memory.page, &ops ))
@@ -1218,7 +1274,7 @@ static NTSTATUS process_init( void *args )
 
         if (!markers || strcmp( markers, "0" ))
         {
-#ifdef __PROSPERO__
+#ifdef PW_WOW_CONSOLE
             __wine_ps5_set_segv_hook( redirect_fault );
             __wine_ps5_set_segv_unresolved_hook( redirect_unresolved );
             fault_markers = 1;
@@ -1248,8 +1304,8 @@ static NTSTATUS process_init( void *args )
  * time outside it after a Unix call (OpenGL, Vulkan, audio...) or a system
  * call, with the rate and mean cost of each, and how often the translations
  * were discarded. */
-#ifdef __PROSPERO__
-#define PW_WOW_TIMING_TRIGGER "/data/prospero-win/pw_wow_timing"
+#ifdef PW_WOW_CONSOLE
+#define PW_WOW_TIMING_TRIGGER PW_WOW_TRIGGER_DIR "pw_wow_timing"
 #endif
 static int timing_enabled = -1;
 
@@ -1270,8 +1326,8 @@ static void timing_init(void)
         struct stat st;  /* access() is refused to a title */
 
         if (!stat( PW_WOW_TIMING_TRIGGER, &st )) timing_enabled = 1;
-        if (!stat( "/data/prospero-win/pw_wow_exec_timing", &st )) timing_enabled = 1;
-        if (!stat( "/data/prospero-win/pw_wow_dispatch_profile", &st )) timing_enabled = 1;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_exec_timing", &st )) timing_enabled = 1;
+        if (!stat( PW_WOW_TRIGGER_DIR "pw_wow_dispatch_profile", &st )) timing_enabled = 1;
     }
 #endif
 }
@@ -1572,6 +1628,8 @@ static NTSTATUS run( void *args )
             continue;
         }
         pw_wow_report_error(params, status, state->eip, state->fault_address, state->fault_write);
+        if (params->reason == PW_WOW_FAULT) wow_count( PW_WOW_STAT_FAULTS_GUEST );
+        else if (params->reason != PW_WOW_X87_TRAP) wow_count( PW_WOW_STAT_DBT_ERRORS );
         break;
     }
     pw_x86_commit_canonical_flags( state );
@@ -1797,6 +1855,15 @@ static NTSTATUS thread_term( void *args )
     if (thread->call_stack) release( thread->call_stack, 0 );
     free( thread );
     return STATUS_SUCCESS;
+}
+
+/* wow_stats.h. Exported for a title that loads this module itself (on the PS4
+ * the PRX descriptor names it, for sceKernelDlsym). */
+DECLSPEC_EXPORT unsigned int pw_wow_stats( uint64_t *out, unsigned int count )
+{
+    for (unsigned int i = 0; out && i < count && i < PW_WOW_STAT_COUNT; i++)
+        out[i] = __atomic_load_n( &wow_stats[i], __ATOMIC_RELAXED );
+    return PW_WOW_STAT_COUNT;
 }
 
 const unixlib_entry_t __wine_unix_call_funcs[] =

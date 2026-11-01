@@ -14,7 +14,7 @@
 #
 # Usage:
 #   tools/build_wine_orbis.sh [--check-patches] [--jobs N] [--work DIR]
-#       [--modules "ntdll wineserver win32u [libvulkan]"] [--allow-unbound]
+#       [--modules "ntdll wineserver win32u wowprospero [libvulkan winevulkan]"] [--allow-unbound]
 #
 # Environment:
 #   OO_PS4_TOOLCHAIN       the OpenOrbis toolchain (required)
@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
+modules="ntdll wineserver win32u wowprospero${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -217,9 +217,11 @@ case " $modules " in *" libvulkan "*)
     [ -f "${PW_VULKAN_INCLUDE:-}/vulkan/vulkan.h" ] || fail "libvulkan needs PW_VULKAN_INCLUDE (vulkan/vulkan.h)"
     "$cc" $shim_cflags -I"$root/wine/orbis" -I"$PW_VULKAN_INCLUDE" -c "$root/wine/orbis/pw_vulkan_radv_orbis.c" \
         -o "$obj/pw_vulkan_radv_orbis.o" || fail "cannot compile pw_vulkan_radv_orbis.c"
-    compile_shim "$root/wine/orbis/pw_emutls_orbis.c"
     ;;
 esac
+# The emulated-TLS runtime: RADV's -femulated-tls build (libvulkan) and
+# wowprospero's unix.c call it.
+compile_shim "$root/wine/orbis/pw_emutls_orbis.c"
 heap="$obj/pw_wine_heap.o $obj/pw_wine_heap_libc.o"
 dmem="$obj/pw_wine_dmem.o $obj/pw_wine_dmem_ps5.o"
 
@@ -451,6 +453,40 @@ case " $modules " in *" libvulkan "*)
     # shellcheck disable=SC2086
     link_prx libvulkan - "$prx/obj/libvulkan_desc.o $obj/pw_vulkan_radv_orbis.o $obj/pw_emutls_orbis.o \
         $obj/pw_wine_env_orbis.o --whole-archive $PROSPERO_RADV_ARCHIVE --no-whole-archive $PROSPERO_RADV_ZLIB \
+        $exit_wraps $import_wraps" ntdll
+    ;;
+esac
+
+case " $modules " in *" wowprospero "*)
+    # wowprospero (milestone f): the WoW64 CPU backend's Unix side around the
+    # IA-32 translator (the PS5 recipe's units, tools/build_wine_ps5.sh),
+    # loaded by ntdll as the PE wowprospero.dll's unix library (pw_wine_dl:
+    # x86_64-unix/wowprospero.so becomes .prx). unix.c's one __thread is
+    # emulated (-femulated-tls, pw_emutls_orbis: native TLS is broken in an
+    # app PRX); its executable memory is Wine's (NtAllocateVirtualMemoryEx,
+    # direct memory under patch 0600) and its fault handling ntdll's hooks
+    # (0610, 0710), all imports from ntdll. ntdll's environment is replayed
+    # into its own (pw_wine_setenv: PW_WOW_*). pw_wow_stats is for the title.
+    [ -f "$prx/ntdll.shared.elf" ] || fail "wowprospero imports from ntdll: build ntdll in the same run"
+    mkdir -p "$obj/wowprospero"
+    wow_objects=
+    for unit in wine/wowprospero/unix.c src/pw_x86_engine.c src/pw_x86_block.c src/pw_x86_cache.c \
+            src/pw_x86_hostexec.c src/pw_x86_reencode.c src/pw_x87.c src/pw_guest_fp.c src/pw_vm.c src/pw_vm_posix.c; do
+        wow_tls=
+        [ "$unit" != wine/wowprospero/unix.c ] || wow_tls=-femulated-tls
+        # shellcheck disable=SC2086
+        "$cc" -std=gnu11 -O2 -Wall $wow_tls -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT -I"$root/wine/wowprospero" \
+            -I"$build/include" -I"$tree/include" -I"$root/src" -I"$root/include" -c "$root/$unit" \
+            -o "$obj/wowprospero/$(basename "${unit%.c}").o" || fail "cannot compile $unit"
+        wow_objects="$wow_objects $obj/wowprospero/$(basename "${unit%.c}").o"
+    done
+    # A native __thread would link without an import (lld relaxes it to
+    # local-exec, wrong in an app PRX), so the report cannot see it: check.
+    llvm-nm "$obj/wowprospero/unix.o" | grep -q ' U __emutls_get_address$' ||
+        fail "wowprospero's unix.c keeps a native __thread (needs -femulated-tls)"
+    desc wowprospero __wine_unix_call_funcs pw_wow_stats pw_wine_setenv
+    # shellcheck disable=SC2086
+    link_prx wowprospero - "$prx/obj/wowprospero_desc.o $wow_objects $obj/pw_emutls_orbis.o $obj/pw_wine_env_orbis.o \
         $exit_wraps $import_wraps" ntdll
     ;;
 esac

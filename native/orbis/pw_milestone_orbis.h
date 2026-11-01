@@ -17,6 +17,9 @@
  *   e2  winevulkan's slots, the display, vk64.exe (Wine's Vulkan, then a
  *       Win32 swapchain) -> PS4WINE e2 vk64 ... and PS4WINE e3 vkclear ...
  *   e   the display, d3d11tri64.exe under DXVK 2.6.2 -> PS4WINE e d3d11 frames=N gpu_hang=0|1 ...
+ *   f1  wowprospero.prx's slots, the address space below 4 GiB, the display,
+ *       wow32.exe (32-bit, on the translator: checks, then gdi64's picture)
+ *       -> PS4WINE f1 hello32 cpu=translator ... and PS4WINE f2 gdi32 ...
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
