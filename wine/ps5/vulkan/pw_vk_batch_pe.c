@@ -28,6 +28,11 @@ static struct pw_vk_template_cache templates;
 static struct pw_vk_retirement retirement;
 static unsigned char *scratch;
 static BOOL enabled,stats_enabled;
+/* PW_VK_BATCH_STATS_EVERY=N: the PW_VK_BATCH line on the first present and every Nth (1..100000; default 1,
+ * every present). The counters are cumulative, so a reader still gets exact deltas between the lines it
+ * sees; the PS4 title reads them that way at N=60 (a line per present costs a crossing and a log record
+ * there). tools/summarize_vk_batch.py wants consecutive presents, so it takes N=1 logs only. */
+static UINT64 stats_every=1;
 static _Atomic int negotiated,async_backend;
 /* Only the existing gated fallback path owns these arrays. */
 static BOOL fallback_profile;
@@ -85,6 +90,11 @@ static BOOL CALLBACK initialize(INIT_ONCE *o,void *p,void **ctx)
  char env[8];(void)o;(void)p;(void)ctx;
  stats_enabled=GetEnvironmentVariableA("PW_VK_BATCH_STATS",env,sizeof(env))==1&&env[0]=='1';
  fallback_profile=stats_enabled&&GetEnvironmentVariableA("PW_VK_BATCH_FALLBACK_PROFILE",env,sizeof(env))==1&&env[0]=='1';
+ if(stats_enabled){
+  DWORD n=GetEnvironmentVariableA("PW_VK_BATCH_STATS_EVERY",env,sizeof(env));unsigned long every=0;DWORD i;
+  for(i=0;n&&n<sizeof(env)&&i<n&&env[i]>='0'&&env[i]<='9';i++)every=every*10+(unsigned long)(env[i]-'0');
+  if(n&&n<sizeof(env)&&i==n&&every>=1&&every<=100000)stats_every=every;
+ }
  enabled=GetEnvironmentVariableA("PW_VK_BATCH",env,sizeof(env))==1&&env[0]=='1'&&!pw_vk_stream_environment_unsafe();
  if(!read_opcode_mask())enabled=FALSE; /* Invalid explicit masks fail closed. */
  if(!enabled)return TRUE;
@@ -320,7 +330,7 @@ static void snapshot(unsigned int code,void *args)
 {
  if(stats_enabled&&code==unix_vkQueuePresentKHR){
   struct vkQueuePresentKHR_params *q=args;UINT64 ordinal=InterlockedIncrement64((LONG64 *)&present);
-  WINE_MESSAGE("PW_VK_BATCH version=1 scope=process tid=%lu present=%llu result=%d enabled=%u negotiated=%u records=%llu enqueued=%llu batch_dispatches=%llu piggybacks=%llu standalone_flushes=%llu arena_full=%llu fallback=%llu wine_unix_crossings=%llu\n",GetCurrentThreadId(),ordinal,q->result,enabled&&!sticky_disabled,negotiated,records_total,enqueued_total,dispatches_total,piggyback_total,dispatches_total-piggyback_total,full_total,fallback_total,InterlockedCompareExchange64((LONG64 *)&crossings_total,0,0));
+  if(ordinal==1||!(ordinal%stats_every))WINE_MESSAGE("PW_VK_BATCH version=1 scope=process tid=%lu present=%llu result=%d enabled=%u negotiated=%u records=%llu enqueued=%llu batch_dispatches=%llu piggybacks=%llu standalone_flushes=%llu arena_full=%llu fallback=%llu wine_unix_crossings=%llu\n",GetCurrentThreadId(),ordinal,q->result,enabled&&!sticky_disabled,negotiated,records_total,enqueued_total,dispatches_total,piggyback_total,dispatches_total-piggyback_total,full_total,fallback_total,InterlockedCompareExchange64((LONG64 *)&crossings_total,0,0));
   fallback_snapshot(ordinal);
  }
 }

@@ -10,6 +10,8 @@
 #include "pw_wine_exit_orbis.h"
 #include "../../wine/wowprospero/wow_stats.h"
 #include "pw_hist.h"
+#include "pw_game_profile.h"
+#include "pw_hid_ps5.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -90,6 +92,16 @@ static void p6_lines(void);
 static void hold_sample(int at);
 static const char *ntdll_symbol(const char *name, void **address);
 static void pause_ms(unsigned ms);
+/* Milestone g (docs/ps4/HANDOFF-g.md in ps4-wine). */
+static int g_plan(void);
+static int g1_plans(void);
+static void *g_script(void *arg);
+static void g1n_lines(void);
+static void g1m_lines(void);
+static void g1_lines(void);
+static void g_lines(void);
+/* session_s counts from here when set (g: from the gameplay mark), else from the title's start. */
+static uint64_t session_base_ns;
 
 /* ---- the progress file, through stdio ----------------------------------- */
 
@@ -2181,6 +2193,7 @@ void pw_ms_stdout(const char *line)
     if (!strncmp(line, "VK64 ", 5)) snprintf(vk64_line, sizeof(vk64_line), "%s", line + 5);
     else if (!strncmp(line, "VK64S ", 6)) snprintf(vk64s_line, sizeof(vk64s_line), "%s", line + 6);
     else if (!strncmp(line, "D3D11 ", 6)) snprintf(d3d11_line, sizeof(d3d11_line), "%s", line + 6);
+    else if (!strncmp(line, "D3D9 ", 5)) snprintf(d3d11_line, sizeof(d3d11_line), "%s", line + 5);
     else if (!strncmp(line, "HELLO32 ", 8)) snprintf(hello32_line, sizeof(hello32_line), "%s", line + 8);
     else if (!strncmp(line, "HELLO32S ", 9)) snprintf(hello32s_line, sizeof(hello32s_line), "%s", line + 9);
     else if (!strncmp(line, "GDI32 ", 6)) snprintf(gdi32_line, sizeof(gdi32_line), "%s", line + 6);
@@ -2205,6 +2218,16 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     /* p2: 32-bit code on the hardware backend (patch 0611); wow64 falls back to
      * the prefix's wowprospero.dll when it does not start (0614). */
     if (native_plan()) add("WINE_PS5_WOW64_CPU", "wow64native.dll");
+    if (g1_plans() || g_plan()) {
+        /* Milestone g: the native CPU (g's comes from its profile; env.txt's
+         * WINE_PS5_WOW64_CPU=wowprospero.dll chooses the translator), Vulkan
+         * batching, and its counters on every 60th present (the title reads
+         * them in pw_ms_wine_line). */
+        if (g1_plans()) add("WINE_PS5_WOW64_CPU", "wow64native.dll");
+        add("PW_VK_BATCH", "1");
+        add("PW_VK_BATCH_STATS", "1");
+        add("PW_VK_BATCH_STATS_EVERY", "60");
+    }
     if (!vulkan_plan()) return;
     snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
     mkdir(cache, 0777);
@@ -2213,11 +2236,20 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
     add("MESA_SHADER_CACHE_DIR", cache);
     add("MESA_DISK_CACHE_DATABASE", "1");
-    add("ORBIS_WSI_SHOT_PATH", shot);
-    add("ORBIS_WSI_SHOT", "300");
+    /* Not in g: writing the shot costs the present a few hundred ms (e's "long scan-out copy"). */
+    if (!g_plan()) {
+        add("ORBIS_WSI_SHOT_PATH", shot);
+        add("ORBIS_WSI_SHOT", "300");
+    }
     add("WINE_PS5_DESKTOP", "1920x1080");
     /* Milestone e: DXVK 2.6.2's d3d11.dll and dxgi.dll in the prefix's system32 (prefix.sh --extras). */
     if (dxvk_plan()) add("WINEDLLOVERRIDES", "d3d11,dxgi=n");
+    /* g1: DXVK 2.6.2's 32-bit d3d9.dll in syswow64 (prefix.sh), with the three settings of its
+     * built-in vampire.exe profile, which d3d9tri32.exe's name does not match. */
+    if (plan->lines == g1_lines) {
+        add("WINEDLLOVERRIDES", "d3d9=n");
+        add("DXVK_CONFIG_FILE", "C:\\g1\\dxvk.conf");
+    }
 }
 
 /* libvulkan.prx's present counters, through ntdll's dlsym of a name any
@@ -2434,6 +2466,419 @@ static void renamed(const char *in, const char *const *rename, size_t pairs, cha
     }
 }
 
+/* ---- milestone g: CPU time per thread (recorded) ------------------------------------ */
+
+/* The kernel's per-thread records: sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID |
+ * KERN_PROC_INC_THREAD, pid) gives one struct kinfo_proc per thread, with its id
+ * (ki_tid), name (ki_tdname: what libthr's rename set) and run time (ki_runtime,
+ * microseconds). The SDK has no kinfo_proc and FreeBSD 9's offsets are not
+ * trusted here: cpu_probe measures them on a thread it names and keeps busy for
+ * CPU_PROBE_US, and the census uses what it found (or stays off: "-"). */
+extern int sysctl(const int *name, unsigned namelen, void *old, size_t *oldlen, const void *new_value,
+                  size_t newlen);
+extern void *scePthreadSelf(void);
+extern int scePthreadRename(void *thread, const char *name);
+extern int pthread_getthreadid_np(void);
+enum { K_CTL_KERN = 1, K_KERN_PROC = 14, K_KERN_PROC_PID = 1, K_KERN_PROC_INC_THREAD = 0x10,
+       CPU_PROBE_US = 200000, CENSUS_BYTES = 256 * 1024, CENSUS_NAME = 16 };
+static uint8_t census_buf[CENSUS_BYTES];
+static pthread_mutex_t census_lock = PTHREAD_MUTEX_INITIALIZER;
+static int census_size, census_name_off = -1, census_runtime_off = -1, census_tid_off = -1;
+
+/* The records into census_buf; how many, or -1 (errno kept). */
+static int census_read(size_t *record)
+{
+    int mib[4] = { K_CTL_KERN, K_KERN_PROC, K_KERN_PROC_PID | K_KERN_PROC_INC_THREAD, (int)getpid() };
+    size_t length = sizeof(census_buf);
+    int size;
+
+    if (sysctl(mib, 4, census_buf, &length, NULL, 0) != 0 || length < sizeof(int)) return -1;
+    memcpy(&size, census_buf, sizeof(size));   /* ki_structsize */
+    if (size < 512 || size > 4096) { errno = EPROTO; return -1; }
+    *record = (size_t)size;
+    return (int)(length / (size_t)size);
+}
+
+/* Thread CPU through getrusage(RUSAGE_THREAD), in microseconds (p1's measure). */
+static uint64_t self_cpu_us(void)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_THREAD, &ru)) return 0;
+    return (uint64_t)ru.ru_utime.tv_sec * 1000000u + (uint64_t)ru.ru_utime.tv_usec +
+           (uint64_t)ru.ru_stime.tv_sec * 1000000u + (uint64_t)ru.ru_stime.tv_usec;
+}
+
+static volatile int probe_tid, probe_state;   /* 1 spun, 2 may end */
+static volatile uint64_t probe_self_us;
+
+static void *probe_spin(void *arg)
+{
+    volatile uint64_t sink = 0;
+    uint64_t start;
+    (void)arg;
+    scePthreadRename(scePthreadSelf(), "pwcpuprobe");
+    probe_tid = pthread_getthreadid_np();
+    start = self_cpu_us();
+    while (self_cpu_us() - start < CPU_PROBE_US)
+        for (int i = 0; i < 10000; i++) sink += (uint64_t)i;
+    probe_self_us = self_cpu_us();
+    __atomic_store_n(&probe_state, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&probe_state, __ATOMIC_ACQUIRE) != 2) pause_ms(5);
+    return NULL;
+}
+
+/* A title stage: does the kernel report another thread's run time, and where
+ * in its record are the name, the id and the run time? */
+static void stage_cpu_probe(char *fields, size_t size)
+{
+    pthread_t thread;
+    size_t record = 0;
+    int count, found = -1, waited = 0;
+
+    if (pthread_create(&thread, NULL, probe_spin, NULL)) { snprintf(fields, size, "cpu_probe=nothread"); return; }
+    while (__atomic_load_n(&probe_state, __ATOMIC_ACQUIRE) != 1 && waited++ < 600) pause_ms(5);
+    count = census_read(&record);
+    if (count > 0) {
+        for (int i = 0; i < count && found < 0; i++) {
+            const uint8_t *r = census_buf + (size_t)i * record;
+            for (size_t off = 0; off + 11 <= record; off++)
+                if (!memcmp(r + off, "pwcpuprobe", 11)) { census_name_off = (int)off; found = i; break; }
+        }
+    }
+    if (found >= 0) {
+        const uint8_t *r = census_buf + (size_t)found * record;
+        uint64_t self = probe_self_us, v;
+        int32_t t;
+        /* ki_runtime: FreeBSD 9's place first, else any u64 that agrees with the thread's own clock. */
+        memcpy(&v, r + 328, 8);
+        if (record > 336 && v >= self * 8 / 10 && v <= self * 13 / 10) census_runtime_off = 328;
+        for (size_t off = 0; census_runtime_off < 0 && off + 8 <= record; off += 8) {
+            memcpy(&v, r + off, 8);
+            if (v >= self * 8 / 10 && v <= self * 13 / 10) census_runtime_off = (int)off;
+        }
+        for (size_t off = 96; off + 4 <= record; off += 4) {
+            memcpy(&t, r + off, 4);
+            if (t == probe_tid) { census_tid_off = (int)off; break; }
+        }
+        census_size = (int)record;
+    }
+    __atomic_store_n(&probe_state, 2, __ATOMIC_RELEASE);
+    pthread_join(thread, NULL);
+    {
+        uint64_t runtime = 0;
+        if (found >= 0 && census_runtime_off >= 0)
+            memcpy(&runtime, census_buf + (size_t)found * record + census_runtime_off, 8);
+        snprintf(fields, size, "cpu_probe=%s census_threads=%d census_size=%zu name_off=%d runtime_off=%d tid_off=%d "
+                 "probe_runtime_us=%llu probe_self_us=%llu",
+                 count < 0 ? "nosysctl" : found < 0 ? "noname" : census_runtime_off < 0 ? "noruntime" : "ok",
+                 count, record, census_name_off, census_runtime_off, census_tid_off, (unsigned long long)runtime,
+                 (unsigned long long)probe_self_us);
+        if (count < 0) { size_t n = strlen(fields); snprintf(fields + n, size - n, " census_errno=%d", errno); }
+    }
+    if (found < 0 || census_runtime_off < 0) census_size = 0;   /* the census stays off */
+}
+
+/* The run time of the threads by role: Wine's main thread (wine-main: the
+ * game's main thread), DXVK's CS thread (dxvk-cs), its submission thread
+ * (dxvk-submit, which presents), and all others. 0, or -1 without a census. */
+enum { ROLE_MAIN, ROLE_CS, ROLE_SUBMIT, ROLE_OTHER, ROLES };
+static int census_roles(uint64_t out[ROLES])
+{
+    size_t record;
+    int count;
+
+    memset(out, 0, sizeof(uint64_t) * ROLES);
+    if (!census_size) return -1;
+    pthread_mutex_lock(&census_lock);
+    count = census_read(&record);
+    for (int i = 0; count > 0 && (size_t)census_size == record && i < count; i++) {
+        const uint8_t *r = census_buf + (size_t)i * record;
+        char name[CENSUS_NAME + 1];
+        uint64_t runtime;
+        memcpy(name, r + census_name_off, CENSUS_NAME);
+        name[CENSUS_NAME] = 0;
+        memcpy(&runtime, r + census_runtime_off, 8);
+        if (!strcmp(name, "wine-main")) out[ROLE_MAIN] += runtime;
+        else if (!strncmp(name, "dxvk-cs", 7)) out[ROLE_CS] += runtime;
+        else if (!strncmp(name, "dxvk-submit", 11)) out[ROLE_SUBMIT] += runtime;
+        else out[ROLE_OTHER] += runtime;
+    }
+    pthread_mutex_unlock(&census_lock);
+    return count > 0 && (size_t)census_size == record ? 0 : -1;
+}
+
+/* ---- milestone g: the profile, Wine's lines, the window --------------------------- */
+
+/* The game's profile the title loaded (wine64_main_orbis.c), for the input preset and the CPU. */
+static const PwGameProfile *g_profile;
+static char g_profile_id[PW_APP_ID_CAPACITY] = "-", g_profile_status[48] = "-";
+
+void pw_ms_set_profile(const PwGameProfile *profile, const char *id, const char *status)
+{
+    g_profile = profile;
+    snprintf(g_profile_id, sizeof(g_profile_id), "%s", id && id[0] ? id : "-");
+    snprintf(g_profile_status, sizeof(g_profile_status), "%s", status && status[0] ? status : "-");
+}
+
+/* 32-bit winevulkan's counters (wine/ps5/vulkan/pw_vk_batch_pe.c, PW_VK_BATCH_STATS=1):
+ * cumulative, so the difference between any two records is exact whatever
+ * PW_VK_BATCH_STATS_EVERY drops between them. */
+typedef struct BatchRec {
+    uint64_t present, records, crossings, ns;
+    int enabled, negotiated, seen;
+} BatchRec;
+static pthread_mutex_t batch_lock = PTHREAD_MUTEX_INITIALIZER;
+static BatchRec batch_first, batch_last;
+static uint64_t batch_lines;
+/* Wine's reports of an exception nobody handled: on the native CPU a guest
+ * fault that the guest's SEH did not catch ends there, so this is g's
+ * unresolved-fault count beside the translator's own. */
+static uint32_t wine_unhandled;
+/* DXVK's out-of-memory reports (memoryTrackTest makes D3D9 refuse images). */
+static uint32_t dxvk_oom;
+/* +loaddll: where the game's program landed (0x400000 is the eboot's), its
+ * UP loader plugins (.vtm), Bink and Miles. */
+static char exe_base[24] = "-";
+static uint32_t g_vtm, g_bink, g_miles;
+
+static uint64_t field_u64(const char *line, const char *key, int *found)
+{
+    const char *p = strstr(line, key);
+    *found = p != NULL;
+    return p ? strtoull(p + strlen(key), NULL, 10) : 0;
+}
+
+void pw_ms_wine_line(const char *line)
+{
+    const char *p;
+
+    if ((p = strstr(line, "PW_VK_BATCH version=1 "))) {
+        BatchRec r = { 0 };
+        int found, all = 1;
+        r.present = field_u64(p, " present=", &found); all &= found;
+        r.records = field_u64(p, " records=", &found); all &= found;
+        r.crossings = field_u64(p, " wine_unix_crossings=", &found); all &= found;
+        r.enabled = (int)field_u64(p, " enabled=", &found); all &= found;
+        r.negotiated = (int)field_u64(p, " negotiated=", &found); all &= found;
+        if (!all) return;
+        r.ns = cfg.now_ns ? cfg.now_ns() : 0;
+        r.seen = 1;
+        pthread_mutex_lock(&batch_lock);
+        if (!batch_first.seen) batch_first = r;
+        batch_last = r;
+        batch_lines++;
+        pthread_mutex_unlock(&batch_lock);
+        return;
+    }
+    if (strstr(line, "Unhandled exception") || strstr(line, "wine: Unhandled") || strstr(line, "Unhandled page fault"))
+        __atomic_add_fetch(&wine_unhandled, 1, __ATOMIC_RELAXED);
+    if (strstr(line, "OUTOFVIDEOMEMORY") || strstr(line, "Failed to allocate"))
+        __atomic_add_fetch(&dxvk_oom, 1, __ATOMIC_RELAXED);
+    if (strstr(line, "Loaded L\"")) {
+        if ((p = strstr(line, "Vampire.exe\" at "))) {
+            size_t n = strspn(p + 16, "0123456789abcdefABCDEF");
+            snprintf(exe_base, sizeof(exe_base), "0x%.*s", (int)(n < 20 ? n : 20), p + 16);
+        }
+        if (strstr(line, ".vtm\"")) __atomic_add_fetch(&g_vtm, 1, __ATOMIC_RELAXED);
+        if (strstr(line, "binkw32.dll\"")) g_bink = 1;
+        if (strstr(line, "Mss32.dll\"") || strstr(line, "mss32.dll\"")) g_miles = 1;
+    }
+}
+
+static BatchRec batch_snapshot(int first)
+{
+    BatchRec r;
+    pthread_mutex_lock(&batch_lock);
+    r = first ? batch_first : batch_last;
+    pthread_mutex_unlock(&batch_lock);
+    return r;
+}
+
+/* Crossings per present between two records, "-" without two distinct ones. */
+static const char *crossings_between(const BatchRec *a, const BatchRec *b, char *out, size_t size)
+{
+    if (!a->seen || !b->seen || b->present <= a->present || b->crossings < a->crossings) snprintf(out, size, "-");
+    else snprintf(out, size, "%.0f", (double)(b->crossings - a->crossings) / (double)(b->present - a->present));
+    return out;
+}
+
+/* 1, or 0: batching enabled and negotiated in the last record, with records replayed. */
+static int batch_on(const BatchRec *r) { return r->seen && r->enabled && r->negotiated && r->records > 0; }
+
+/* Placed CPU aliases (mesa-ps4 patch 0003) through libvulkan.prx; map32=ok once
+ * one was made and none refused. */
+static void alias_fields(char *out, size_t size)
+{
+    void *address;
+    uint32_t made = 0, live = 0, failed = 0;
+    uint64_t live_bytes = 0, peak_bytes = 0;
+    const char *found = ntdll_symbol("pw_vulkan_alias_stats", &address);
+
+    if (strcmp(found, "ok")) { snprintf(out, size, "map32=- alias_stats=%s", found); return; }
+    ((void (*)(uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint32_t *))(uintptr_t)address)(&made, &live,
+                                                                                                &live_bytes,
+                                                                                                &peak_bytes, &failed);
+    snprintf(out, size, "map32=%s aliases=%u aliases_live=%u alias_live_kib=%llu alias_peak_kib=%llu "
+             "aliases_failed=%u", made && !failed ? "ok" : failed ? "fail" : "none", made, live,
+             (unsigned long long)(live_bytes >> 10), (unsigned long long)(peak_bytes >> 10), failed);
+}
+
+/* The CPU a 32-bit program ran on: the translator when a thread ran on it,
+ * native when wow64native.prx is loaded, else why neither. */
+static const char *wow_cpu(void)
+{
+    uint64_t wow[PW_WOW_STAT_COUNT];
+    const char *counted = wow_stats(wow);
+    if (!strcmp(counted, "ok") && wow[PW_WOW_STAT_THREADS]) return "translator";
+    return module_loaded("wow64native") == 1 ? "native" : strcmp(counted, "ok") ? counted : "none";
+}
+
+/* Unresolved faults: the translator's own count plus Wine's unhandled reports. */
+static unsigned long long faults_unresolved_g(void)
+{
+    uint64_t wow[PW_WOW_STAT_COUNT];
+    wow_stats(wow);
+    return (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED] +
+           __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED);
+}
+
+/* A point of g's window: the time, RADV's presents and present intervals, the last batch record. */
+typedef struct GSnap {
+    uint64_t ns, presents;
+    BatchRec batch;
+    uint64_t hist[PW_VULKAN_HIST_BUCKETS];
+    int hist_ok;
+    uint64_t roles[ROLES];   /* the census: run time by role (main, cs, submit, other) */
+    int census_ok;
+} GSnap;
+
+static void g_snap(GSnap *s, int reset_max, uint64_t *max_ns)
+{
+    struct pw_vulkan_stats vk;
+    void *address;
+
+    memset(s, 0, sizeof(*s));
+    s->ns = cfg.now_ns();
+    vulkan_stats(&vk);
+    s->presents = vk.presents;
+    s->batch = batch_snapshot(0);
+    s->census_ok = census_roles(s->roles) == 0;
+    if (!strcmp(ntdll_symbol("pw_vulkan_present_hist", &address), "ok")) {
+        uint64_t max = 0;
+        s->hist_ok = ((size_t (*)(uint64_t *, size_t, uint64_t *, int))(uintptr_t)address)(
+                         s->hist, PW_VULKAN_HIST_BUCKETS, &max, reset_max) == PW_VULKAN_HIST_BUCKETS;
+        if (max_ns) *max_ns = max;
+    }
+}
+
+/* The window [a, b]: presents per second (fps_avg: RADV's counter, one per D3D9
+ * Present), the frame times from the present intervals (p95 as the upper edge
+ * of its 1 ms bucket; max only where the window reset it: max_ns, else "-"),
+ * frames of 50 ms or more, crossings per present. */
+#define G_NO_MAX UINT64_MAX
+static void g_window(const GSnap *a, const GSnap *b, uint64_t max_ns, const char *prefix, char *out, size_t size)
+{
+    double seconds = b->ns > a->ns ? (double)(b->ns - a->ns) / 1e9 : 0.0;
+    uint64_t presents = b->presents - a->presents, total = 0, cum = 0, hitches = 0;
+    char crossings[24], p95[24] = "-", max[24] = "-";
+
+    if (a->hist_ok && b->hist_ok) {
+        for (size_t i = 0; i < PW_VULKAN_HIST_BUCKETS; i++) total += b->hist[i] - a->hist[i];
+        for (size_t i = 0; i < PW_VULKAN_HIST_BUCKETS && total; i++) {
+            uint64_t d = b->hist[i] - a->hist[i];
+            if (i >= 50) hitches += d;
+            cum += d;
+            if (p95[0] == '-' && cum * 100 >= total * 95) snprintf(p95, sizeof(p95), "%u", (unsigned)(i + 1) * 1000u);
+        }
+    }
+    if (max_ns != G_NO_MAX && a->hist_ok) snprintf(max, sizeof(max), "%llu", (unsigned long long)(max_ns / 1000));
+    crossings_between(&a->batch, &b->batch, crossings, sizeof(crossings));
+    {
+        /* CPU time per frame by role (the census), "-" without it on both ends. */
+        static const char *const role_key[ROLES] = { "main", "cs", "submit", "other" };
+        char cpu[200] = "";
+        size_t m = 0;
+        for (int r = 0; r < ROLES && m < sizeof(cpu); r++) {
+            if (a->census_ok && b->census_ok && presents && b->roles[r] >= a->roles[r])
+                m += (size_t)snprintf(cpu + m, sizeof(cpu) - m, " %s%s_cpu_us_avg=%.0f", prefix, role_key[r],
+                                      (double)(b->roles[r] - a->roles[r]) / (double)presents);
+            else
+                m += (size_t)snprintf(cpu + m, sizeof(cpu) - m, " %s%s_cpu_us_avg=-", prefix, role_key[r]);
+        }
+        snprintf(out, size, "%s", cpu);
+    }
+    {
+    size_t used = strlen(out);
+    out += used;
+    size -= used;
+    snprintf(out, size, " %sfps_avg=%.1f %spresents=%llu %swindow_s=%.0f %scrossings_per_frame=%s %sframe_us_avg=%.0f "
+             "%sframe_us_p95=%s %sframe_us_max=%s %shitches_50ms=%s%llu", prefix,
+             seconds > 0 ? (double)presents / seconds : 0.0, prefix, (unsigned long long)presents, prefix, seconds,
+             prefix, crossings, prefix, presents ? seconds * 1e6 / (double)presents : 0.0, prefix, p95, prefix, max,
+             prefix, total ? "" : "-", total ? (unsigned long long)hitches : 0ull);
+    if (!total) {
+        char *zero = strstr(out, "hitches_50ms=-0");
+        if (zero) zero[14] = 0;   /* "-", not "-0" */
+    }
+    }
+}
+
+/* Wine's live threads now and at the most (patch 1110's pw_wine_thread_live). */
+static void live_thread_fields(char *out, size_t size)
+{
+    void *address;
+    int32_t live = -1, peak = -1;   /* Wine's LONG: 32 bits on the Unix side (L1 read 64 and printed garbage) */
+    if (strcmp(ntdll_symbol("pw_wine_thread_live", &address), "ok")) {
+        snprintf(out, size, "threads_live=- threads_live_peak=-");
+        return;
+    }
+    ((void (*)(int32_t *, int32_t *))(uintptr_t)address)(&live, &peak);
+    snprintf(out, size, "threads_live=%d threads_live_peak=%d", (int)live, (int)peak);
+}
+
+/* Wine's direct memory: the peaks, total and below 4 GiB (__wine_ps5_memory_stats). */
+static void dmem_fields(char *out, size_t size)
+{
+    void *address;
+    uint64_t mem[10] = { 0 };
+    if (strcmp(ntdll_symbol("__wine_ps5_memory_stats", &address), "ok") ||
+        ((unsigned (*)(uint64_t *, unsigned))(uintptr_t)address)(mem, 10) < 8) {
+        snprintf(out, size, "dmem_peak_mib=- dmem_low_peak_mib=-");
+        return;
+    }
+    snprintf(out, size, "dmem_peak_mib=%llu dmem_low_peak_mib=%llu", (unsigned long long)(mem[1] >> 20),
+             (unsigned long long)(mem[7] >> 20));
+}
+
+/* Milestone g's own constants: the window after the gameplay mark, a segment's
+ * warm-up and length, how long plan g plays. */
+enum { G_WINDOW_S = 300, G_SEG_WARM_S = 10, G_SEG_S = 60, G_PLAY_S = 7200 };
+
+/* g1n, g1m, g1: what their lines add to f1's, e2's and e's stage fields (which
+ * would overflow the stage's own buffer): the CPU, the native readiness, the
+ * unresolved faults (the translator's and Wine's unhandled reports), and for
+ * the Vulkan programs the batching and the placed maps. */
+static char g_extra[1200];
+
+static void g1_extra_fields(char *out, size_t size)
+{
+    BatchRec a = batch_snapshot(1), b = batch_snapshot(0);
+    char caps[16] = "-", crossings[24], alias[200] = "";
+    void *caps_fn = NULL;
+    size_t n;
+
+    if (!strcmp(ntdll_symbol("__wine_prospero_native_wow64_caps", &caps_fn), "ok") && caps_fn)
+        snprintf(caps, sizeof(caps), "%u", ((unsigned (*)(unsigned))(uintptr_t)caps_fn)(1));
+    char live[64];
+    live_thread_fields(live, sizeof(live));
+    n = (size_t)snprintf(out, size, " cpu=%s native_caps=%s faults_unresolved=%llu faults_unhandled=%u %s", wow_cpu(),
+                         caps, faults_unresolved_g(), __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), live);
+    if (plan->lines == g1n_lines || n >= size) return;
+    alias_fields(alias, sizeof(alias));
+    snprintf(out + n, size - n, " batch=%d crossings_per_frame=%s batch_lines=%llu %s", batch_on(&b),
+             crossings_between(&a, &b, crossings, sizeof(crossings)), (unsigned long long)batch_lines, alias);
+}
+
 /* ---- the plans -------------------------------------------------------------------- */
 
 static void d1_lines(void);
@@ -2449,6 +2894,10 @@ static void p1_lines(void);
 static void p2_lines(void);
 static void p3_lines(void);
 static void p4_lines(void);
+static void g1n_lines(void);
+static void g1m_lines(void);
+static void g1_lines(void);
+static void g_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -2611,6 +3060,34 @@ static const PwMsStage p6_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "wincb", 0, NULL, "exit=fault" },
 };
+/* Milestone g (docs/ps4/HANDOFF-g.md in ps4-wine). g1n: f1's stages, wow32.exe on the native
+ * CPU; g1m: e2's, vk32.exe; g1: the display, d3d9tri32.exe under DXVK's 32-bit d3d9; g:
+ * wowprospero's slots (the translator is the fallback CPU), the display, Bloodlines. */
+static const PwMsStage g1n_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "low_map", 10, stage_low_map, "low_map=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "wow32", 0, NULL, "exit=fault" },
+};
+static const PwMsStage g1m_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "w32u_bind", 20, stage_w32u_bind, "w32u_load=fault w32u_bound=fault" },
+    { "wv_bind", 20, stage_wv_bind, "wv_load=fault wv_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "vk32", 0, NULL, "exit=fault" },
+};
+static const PwMsStage g1_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "d3d9", 0, NULL, "exit=fault" },
+};
+static const PwMsStage g_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "vtmb", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -2627,13 +3104,28 @@ static const PwMsPlan plans[] = {
     /* p3, p4: the benchmark on another present path, after the HDMI test pattern. */
     { "p3", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p3_lines },
     { "p4", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p4_lines },
+    /* Milestone g: g's program comes from its profile (<root>/profiles/vtmb.ini). */
+    { "g1n", g1n_stages, sizeof(g1n_stages) / sizeof(g1n_stages[0]), "C:\\wow32.exe", 0, g1n_lines },
+    { "g1m", g1m_stages, sizeof(g1m_stages) / sizeof(g1m_stages[0]), "C:\\vk32.exe", 0, g1m_lines },
+    { "g1", g1_stages, sizeof(g1_stages) / sizeof(g1_stages[0]), "C:\\d3d9tri32.exe", 0, g1_lines },
+    { "g", g_stages, sizeof(g_stages) / sizeof(g_stages[0]), "C:\\VTMB\\Vampire.exe", 0, g_lines },
     /* p6 and p5w before p5: the last plan is the default. */
     { "p6", p6_stages, sizeof(p6_stages) / sizeof(p6_stages[0]), "C:\\wincb32.exe", 0, p6_lines },
     { "p5w", p5w_stages, sizeof(p5w_stages) / sizeof(p5w_stages[0]), "C:\\wincb32.exe", 0, p5w_lines },
     { "p5", p5_stages, sizeof(p5_stages) / sizeof(p5_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p5_lines },
 };
 
-static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
+static int g1_plans(void)
+{
+    return plan && (plan->lines == g1n_lines || plan->lines == g1m_lines || plan->lines == g1_lines);
+}
+static int g_plan(void) { return plan && plan->lines == g_lines; }
+static int vulkan_plan(void)
+{
+    return plan && (plan->lines == e2_lines || plan->lines == e_lines || plan->lines == g1m_lines ||
+                    plan->lines == g1_lines || g_plan());
+}
+const char *pw_ms_profile_id(void) { return g_plan() ? "vtmb" : NULL; }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
 {
@@ -2648,7 +3140,11 @@ static int wincb_plan(void) { return plan && (plan->lines == p5w_lines || plan->
  * 180 s: f plays up to F_PLAY_S, and its play loop sends the line itself
  * (the first f launch's line came from the default watchdog at 180 s, in
  * the middle of the play, with play_s=0). */
-unsigned pw_ms_wine_watchdog_s(void) { return pinball_plan() ? F_PLAY_S + 60 : 0; }
+unsigned pw_ms_wine_watchdog_s(void)
+{
+    /* g: a 300 s window after the user reaches the first map, then segments; h reuses it. */
+    return pinball_plan() ? F_PLAY_S + 60 : g_plan() ? G_PLAY_S + 60 : 0;
+}
 
 const char *pw_ms_select(const char *name)
 {
@@ -2795,6 +3291,10 @@ void pw_ms_wine_begin(void)
     flex_start = flex_free();
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
+    if (g_plan()) {
+        pthread_t thread;
+        if (!pthread_create(&thread, NULL, g_script, NULL)) pthread_detach(thread);
+    }
     if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines || p_plan()) {
         pthread_t thread;
         if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : plan->lines == d_lines ? d_script
@@ -2829,7 +3329,7 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", d4_board_opened < 0 ? 0 : d4_board_opened,
                  (unsigned)d4_before, (unsigned)d4_after, d4_refused, d4_posted);
         pthread_mutex_unlock(&present_lock);
-    } else if (plan->lines == e2_lines) {
+    } else if (plan->lines == e2_lines || plan->lines == g1m_lines) {
         /* vk64.exe's two lines, its frames and hang renamed app_*: frames, the
          * swapchain and the lost-device count are what reached the driver. */
         static const char *const rename[] = { "frames", "app_frames", "swapchain", "app_swapchain", "hang", "app_hang" };
@@ -2846,7 +3346,7 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  (unsigned long long)vk.presents, vk.width, vk.height,
                  strstr(vk64s_line, "hang=1") != NULL || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none",
                  release_state, (unsigned long long)gdi_dropped, counted);
-    } else if (plan->lines == e_lines) {
+    } else if (plan->lines == e_lines || plan->lines == g1_lines) {
         /* d3d11tri64.exe's line, its frames and swapchain renamed app_*: frames,
          * the swapchain and lost devices are what reached the driver; a hang is
          * a lost device or DXGI's removed/hung/reset device. */
@@ -2929,7 +3429,7 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", frame_width, frame_height,
                  present_n ? present_sum_ns / (double)present_n / 1e6 : 0.0);
         pthread_mutex_unlock(&present_lock);
-    } else if (plan->lines == f1_lines) {
+    } else if (plan->lines == f1_lines || plan->lines == g1n_lines) {
         /* wow32.exe: the translator's counters, HELLO32/HELLO32S's checks,
          * then GDI32's picture with the sink's counts. cpu=translator once a
          * thread ran on wowprospero. */
@@ -2953,6 +3453,9 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  pick(gdi32_line, "screen", screen, sizeof(screen)), pick(gdi32_line, "pixel", pixel, sizeof(pixel)),
                  pick(gdi32_line, "window", window, sizeof(window)), pick(gdi32_line, "fonts", fonts, sizeof(fonts)));
         pthread_mutex_unlock(&present_lock);
+    } else if (g_plan()) {
+        /* Bloodlines: its exit here; the line's fields are g's window (g_lines). */
+        snprintf(fields, sizeof(fields), "exit=%s server=%s", exit_text, server_connected ? "inprocess" : "none");
     } else if (wincb_plan()) {
         /* wincb.exe (p5w, p6): its summary (its "ok" renamed cases_ok), the
          * hold probe's samples and the thread stacks' fields; cpu as in the p
@@ -2982,6 +3485,7 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  frame_width, frame_height, fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", gdi);
         pthread_mutex_unlock(&present_lock);
     }
+    if (g1_plans()) g1_extra_fields(g_extra, sizeof(g_extra));
     pw_stage_end(&run, wine_stage(), fields);
     pw_ms_emit_lines();
 }
@@ -3015,7 +3519,7 @@ static void emit_line_with(const char *head, const LineKey *keys, size_t count, 
     pw_stage_summary(&run, summary, sizeof(summary));
     if (n < sizeof(line))
         snprintf(line + n, sizeof(line) - n, " build=%s %s session_s=%llu", cfg.build_id, summary,
-                 (unsigned long long)((cfg.now_ns() - start_ns) / 1000000000ull));
+                 (unsigned long long)((cfg.now_ns() - (session_base_ns ? session_base_ns : start_ns)) / 1000000000ull));
     cfg.emit(line);
 }
 
@@ -3297,6 +3801,385 @@ static void p2_lines(void)
     emit_line_with("PS4WINE p2 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
 }
 static void p4_lines(void) { p34_line("PS4WINE p4 bench pinball"); }
+
+/* ---- milestone g: the lines and the play ------------------------------------------- */
+
+/* g1n: wow32.exe on the native CPU, f1's checks; cpu, native_caps and the
+ * unresolved faults come from g_extra. */
+static void g1n_lines(void)
+{
+    enum { PROBE, WOW, LOW, DISPLAY, WOW32 };
+    static const LineKey keys[] = {
+        { "wow_bound", WOW }, { "fp", WOW32 }, { "thread", WOW32 }, { "seh", WOW32 }, { "hello", WOW32 },
+        { "exit", WOW32 }, { "wow_threads", WOW32 }, { "faults_guest", WOW32 }, { "faults_marked", WOW32 },
+        { "faults_host", WOW32 }, { "low_free_mib", LOW }, { "display", DISPLAY }, { "cpu_probe", PROBE },
+        { "census_threads", PROBE }, { "name_off", PROBE }, { "runtime_off", PROBE }, { "tid_off", PROBE },
+        { "probe_runtime_us", PROBE }, { "probe_self_us", PROBE },
+    };
+    emit_line_with("PS4WINE g1n hello32", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
+}
+
+/* g1m: vk32.exe (wine_vk64.c for i686), e2's and e3's fields in one line. */
+static void g1m_lines(void)
+{
+    enum { PROBE, W32U, WV, DISPLAY, VK32 };
+    static const LineKey keys[] = {
+        { "bits", VK32 }, { "inst", VK32 }, { "api", VK32 }, { "dev", VK32 }, { "submit", VK32 }, { "map", VK32 },
+        { "surface", VK32 }, { "present", VK32 }, { "frames", VK32 }, { "gpu_hang", VK32 }, { "swapchain", VK32 },
+        { "fb", VK32 }, { "app_frames", VK32 }, { "device_lost", VK32 }, { "release", VK32 }, { "vk_stats", VK32 },
+        { "wv_bound", WV }, { "w32u_bound", W32U }, { "display", DISPLAY }, { "exit", VK32 },
+        { "cpu_probe", PROBE },
+    };
+    emit_line_with("PS4WINE g1m vk32", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
+}
+
+/* g1: d3d9tri32.exe under DXVK's 32-bit d3d9, e's fields. */
+static void g1_lines(void)
+{
+    enum { PROBE, DISPLAY, D3D9 };
+    static const LineKey keys[] = {
+        { "bits", D3D9 }, { "frames", D3D9 }, { "gpu_hang", D3D9 }, { "swapchain", D3D9 }, { "fb", D3D9 },
+        { "px_c", D3D9 }, { "px_m", D3D9 }, { "hr", D3D9 }, { "at", D3D9 }, { "app_frames", D3D9 },
+        { "ms_avg", D3D9 }, { "device_lost", D3D9 }, { "release", D3D9 }, { "vk_stats", D3D9 },
+        { "display", DISPLAY }, { "exit", D3D9 }, { "flex_mib_start", D3D9 }, { "flex_mib", D3D9 },
+        { "threads_created", D3D9 }, { "threads_kept", D3D9 }, { "threads_keep_refused", D3D9 },
+        { "vk_threads_created", D3D9 }, { "vk_stack_floor_kib", D3D9 }, { "cpu_probe", PROBE },
+    };
+    emit_line_with("PS4WINE g1 d3d9", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
+}
+
+/* g's state, written by g_script and read by g_lines: the marks (the first at
+ * the menu, the second in the first map), the window's start, the segments. */
+static volatile int g_marks, g2_sent, g_line_sent;
+static GSnap g_window_a;
+static uint64_t g_window_ns;
+static long long g_flex_min = -1;
+static char g_seg[2][640];
+/* The main thread's CPU time per frame in each second of the window (the census). */
+static uint32_t g_main_samples[G_WINDOW_S + 16];
+static unsigned g_main_n;
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static const char *g_main_p95(char *out, size_t size)
+{
+    uint32_t sorted[G_WINDOW_S + 16];
+    unsigned n = g_main_n < G_WINDOW_S + 16 ? g_main_n : G_WINDOW_S + 16;
+    if (!n) { snprintf(out, size, "-"); return out; }
+    memcpy(sorted, g_main_samples, n * sizeof(sorted[0]));
+    qsort(sorted, n, sizeof(sorted[0]), cmp_u32);
+    snprintf(out, size, "%u", sorted[(n * 95 + 99) / 100 - 1]);
+    return out;
+}   /* int, hub: the latest segment's fields, "" before one */
+static uint32_t g_inputs, g_kbm_events, g_pad_events;
+static const char *g_input_from = "-";
+/* The USB keyboard and mouse (native/pw_hid_ps5.c, the PS5's reader: the same
+ * system modules and layouts on the PS4, unmeasured here before g). */
+static PwHidPs5 g_hid;
+static int g_hid_status = -1;
+
+static void g_hid_log(const char *line) { step("g hid %s", line); }
+
+/* What the player used: kbm, pad, both, or none yet. */
+static const char *g_input_used(void)
+{
+    return g_kbm_events && g_pad_events ? "kbm+pad" : g_kbm_events ? "kbm" : g_pad_events ? "pad" : "none";
+}
+
+/* The menu line: the first mark (menu=1), or with g's line when there was none. */
+static void g2_emit(int menu, const char *exit_text)
+{
+    char extra[600];
+    struct pw_vulkan_stats vk;
+
+    if (__atomic_exchange_n(&g2_sent, 1, __ATOMIC_ACQ_REL)) return;
+    vulkan_stats(&vk);
+    snprintf(extra, sizeof(extra), " menu=%d faults_unresolved=%llu faults_unhandled=%u exit=%s presents=%llu "
+             "exe_base=%s vtm=%u bink=%u miles=%u ws2_32=%s cpu=%s profile=%s profile_status=%s dxvk_oom=%u kbd=%s "
+             "mouse=%s input=%s", menu,
+             faults_unresolved_g(), __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), exit_text,
+             (unsigned long long)vk.presents, exe_base, g_vtm, g_bink, g_miles,
+             module_loaded("ws2_32") == 1 ? "loaded" : "no", wow_cpu(), g_profile_id, g_profile_status, dxvk_oom,
+             g_hid.keyboard >= 0 ? "ok" : "no", g_hid.mouse >= 0 ? "ok" : "no", g_input_used());
+    emit_line_with("PS4WINE g2 vtmb", NULL, 0, extra);
+}
+
+/* Milestone g's own line: the window from the gameplay mark to now (300 s when
+ * g_script sends it), session_s counted from the mark. */
+static void g_lines(void)
+{
+    enum { PROBE, WOW, DISPLAY, VTMB };
+    static const LineKey keys[] = { { "exit", VTMB }, { "wow_bound", WOW }, { "display", DISPLAY },
+                                    { "cpu_probe", PROBE } };
+    char extra[1900], window[600] = "", dmem[80], alias[200], threads[400], vk_threads[160], exit_text[32], p95[24],
+         live[64];
+    GSnap b;
+    uint64_t max_ns = 0;
+    long long flex = flex_free();
+    size_t n;
+
+    value(VTMB, "exit", exit_text, sizeof(exit_text));
+    g2_emit(0, exit_text);
+    if (g_marks >= 2) {
+        g_snap(&b, 0, &max_ns);
+        g_window(&g_window_a, &b, max_ns, "", window, sizeof(window));
+    } else {
+        snprintf(window, sizeof(window), " fps_avg=- crossings_per_frame=-");
+    }
+    dmem_fields(dmem, sizeof(dmem));
+    alias_fields(alias, sizeof(alias));
+    thread_fields(threads, sizeof(threads));
+    vk_thread_fields(vk_threads, sizeof(vk_threads));
+    live_thread_fields(live, sizeof(live));
+    if (flex >= 0 && (g_flex_min < 0 || flex < g_flex_min)) g_flex_min = flex;
+    {
+        BatchRec last = batch_snapshot(0);
+        n = (size_t)snprintf(extra, sizeof(extra), " batch=%d gameplay=%d faults_unresolved=%llu faults_unhandled=%u%s",
+                             batch_on(&last), g_marks >= 2, faults_unresolved_g(),
+                             __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), window);
+    }
+    if (n < sizeof(extra))
+        n += (size_t)snprintf(extra + n, sizeof(extra) - n,
+                              " cpu=%s input=%s kbd=%s mouse=%s bindings=%s exe_base=%s flex_mib_start=%lld "
+                              "flex_mib_min=%lld flex_mib=%lld %s "
+                              "dxvk_oom=%u %s %s %s %s batch_lines=%llu main_cpu_us_p95=%s gpu_us_avg=- "
+                              "gpu_us_p95=- ib_dw_max=- wsi_us_max=- heaps_mib=-%s%s",
+                              wow_cpu(), g_input_used(), g_hid.keyboard >= 0 ? "ok" : "no",
+                              g_hid.mouse >= 0 ? "ok" : "no", g_input_from, exe_base,
+                              flex_start >= 0 ? flex_start >> 20 : -1,
+                              g_flex_min >= 0 ? g_flex_min >> 20 : -1, flex >= 0 ? flex >> 20 : -1, dmem, dxvk_oom,
+                              alias, live, threads, vk_threads, (unsigned long long)batch_lines,
+                              g_main_p95(p95, sizeof(p95)),
+                              g_seg[0][0] ? g_seg[0] : " int_fps_avg=-", g_seg[1][0] ? g_seg[1] : " hub_fps_avg=-");
+    session_base_ns = g_marks >= 2 ? g_window_ns : 0;
+    emit_line_with("PS4WINE g vtmb", keys, sizeof(keys) / sizeof(keys[0]), extra);
+    session_base_ns = 0;
+}
+
+/* Bloodlines' DS4 bindings when no keyboard and mouse are used: the profile's
+ * preset (<root>/input/<preset>.input) under its own [input] lines, else
+ * these. The d-pad walks (W A S D), the right stick looks (relative mouse
+ * moves), R2/L2 are the mouse buttons, cross jumps, circle uses (E), L1
+ * crouches, R1 reloads, options is Escape. The touchpad, square and triangle
+ * are the title's marks, never bound. */
+static const char g_preset[] =
+    "[input]\n"
+    "mode = keyboard\n"
+    "mouse = right_stick\n"
+    "mouse_speed = 1600\n"
+    "up = w\ndown = s\nleft = a\nright = d\n"
+    "cross = space\ncircle = e\nl1 = ctrl\nr1 = r\n"
+    "r2 = mouse_left\nl2 = mouse_right\noptions = escape\nl3 = shift\nr3 = f5\n";
+
+static void g_bindings(PwGameInput *input)
+{
+    static uint8_t text[4096];
+    char path[512];
+    FILE *file;
+
+    pw_game_input_init(input);
+    g_input_from = "builtin";
+    if (g_profile && g_profile->input.preset[0]) {
+        snprintf(path, sizeof(path), "%s/input/%s.input", cfg.root, g_profile->input.preset);
+        if ((file = fopen(path, "rb"))) {
+            size_t got = fread(text, 1, sizeof(text), file);
+            fclose(file);
+            if (pw_game_input_parse(text, got, input) == PW_OK) g_input_from = "file";
+            else { step("g %s does not parse: the built-in bindings", path); pw_game_input_init(input); }
+        }
+    }
+    if (strcmp(g_input_from, "file") && pw_game_input_parse((const uint8_t *)g_preset, sizeof(g_preset) - 1, input))
+        step("g: the built-in bindings do not parse");
+    if (g_profile) pw_game_input_overlay(input, &g_profile->input);
+    pw_game_input_default_mode(input);
+    /* The marks are the title's. */
+    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
+        if (i == 2 || i == 3 || i == 16) input->bindings[i].kind = PW_GAME_BIND_NONE;
+}
+
+/* A segment: SEG_WARM_S after its button, a snapshot, SEG_S later another; the
+ * player is to stand still (the inputs between are counted). */
+typedef struct GSeg { int kind; uint64_t start_ns; int have_a; GSnap a; uint32_t inputs_a; } GSeg;
+
+static void g_seg_end(GSeg *seg)
+{
+    static const char *const names[] = { "int", "hub" };
+    char window[600], extra[800];
+    GSnap b;
+    long long flex = flex_free();
+
+    g_snap(&b, 0, NULL);
+    g_window(&seg->a, &b, G_NO_MAX, "", window, sizeof(window));
+    snprintf(extra, sizeof(extra), " seg=%s%s seg_inputs=%u flex_mib=%lld cpu=%s gpu_us_avg=-", names[seg->kind],
+             window, g_inputs - seg->inputs_a, flex >= 0 ? flex >> 20 : -1, wow_cpu());
+    emit_line_with("PS4WINE gseg vtmb", NULL, 0, extra);
+    g_window(&seg->a, &b, G_NO_MAX, seg->kind ? "hub_" : "int_", window, sizeof(window));
+    snprintf(g_seg[seg->kind], sizeof(g_seg[0]), "%s %s_seg_inputs=%u", window, names[seg->kind],
+             g_inputs - seg->inputs_a);
+    seg->kind = -1;
+}
+
+/* A mark (the DS4's touchpad, or Pause on the keyboard): the first at the
+ * main menu sends g2's line, the second, with the player in control in the
+ * first map, starts g's window. */
+static void g_mark(uint64_t now, uint64_t started)
+{
+    int mark = __atomic_add_fetch(&g_marks, 1, __ATOMIC_ACQ_REL);
+    step("g mark %d at t=%llus", mark, (unsigned long long)((now - started) / 1000000000ull));
+    if (mark == 1) g2_emit(1, "running");
+    if (mark == 2) {
+        g_snap(&g_window_a, 1, NULL);
+        g_window_ns = g_window_a.ns;
+    }
+}
+
+extern int32_t sceUserServiceInitialize(const void *parameters);
+extern int32_t sceUserServiceGetInitialUser(int32_t *user);
+
+static void *g_script(void *arg)
+{
+    const uint32_t touchpad = pw_game_button_mask(16), square = pw_game_button_mask(2),
+                   triangle = pw_game_button_mask(3);
+    PwPadOrbis pad;
+    PwPadOrbisState state;
+    PwGameInput input;
+    PwWinePointer pointer = { 0, 0 };
+    GSeg seg = { -1, 0, 0, { 0 }, 0 };
+    uint32_t held = 0;
+    uint64_t started = cfg.now_ns(), last = started, next_s = started, next_hid = started;
+    int32_t user = -1;
+    int have_pad;
+    (void)arg;
+
+    g_bindings(&input);
+    have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
+    if (have_pad) user = pad.user;
+    else if (sceUserServiceInitialize(NULL), sceUserServiceGetInitialUser(&user)) user = -1;
+    pw_hid_ps5_preload(g_hid_log);
+    g_hid_status = pw_hid_ps5_open(&g_hid, pw_hid_ps5_system_ops(g_hid_log), user);
+    step("g play: pad=%s user=%d keyboard=%s mouse=%s bindings=%s (touchpad or Pause: mark the menu, then the "
+         "first map; square: interior segment; triangle: hub segment)", have_pad ? "ok" : pad.failed, (int)user,
+         g_hid.keyboard >= 0 ? "ok" : "no", g_hid.mouse >= 0 ? "ok" : "no", g_input_from);
+    for (;;) {
+        uint64_t now = cfg.now_ns();
+
+        if (now >= next_s) {
+            struct pw_vulkan_stats vk;
+            long long flex = flex_free();
+            if (flex >= 0 && (g_flex_min < 0 || flex < g_flex_min)) g_flex_min = flex;
+            if (g_marks >= 2 && !g_line_sent && census_size) {
+                /* One second of the window: the main thread's CPU time per frame. */
+                static uint64_t prev_main, prev_presents;
+                static int have_prev;
+                uint64_t roles[ROLES];
+                vulkan_stats(&vk);
+                if (!census_roles(roles)) {
+                    if (have_prev && vk.presents > prev_presents && roles[ROLE_MAIN] >= prev_main &&
+                        g_main_n < sizeof(g_main_samples) / sizeof(g_main_samples[0]))
+                        g_main_samples[g_main_n++] =
+                            (uint32_t)((roles[ROLE_MAIN] - prev_main) / (vk.presents - prev_presents));
+                    prev_main = roles[ROLE_MAIN];
+                    prev_presents = vk.presents;
+                    have_prev = 1;
+                }
+            }
+            if ((now - started) / 1000000000ull % 10 == 0) {
+                vulkan_stats(&vk);
+                step("g t=%llus marks=%d presents=%llu flex_mib=%lld batch_lines=%llu unhandled=%u inputs=%u "
+                     "kbm=%u pad=%u seg=%d", (unsigned long long)((now - started) / 1000000000ull), g_marks,
+                     (unsigned long long)vk.presents, flex >= 0 ? flex >> 20 : -1, (unsigned long long)batch_lines,
+                     __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), g_inputs, g_kbm_events, g_pad_events,
+                     seg.kind);
+            }
+            next_s = now + 1000000000ull;
+        }
+        /* A keyboard or mouse plugged in after the start. */
+        if ((g_hid.keyboard < 0 || g_hid.mouse < 0) && now >= next_hid) {
+            pw_hid_ps5_retry(&g_hid);
+            next_hid = now + 5000000000ull;
+        }
+        if (g_hid.keyboard >= 0 || g_hid.mouse >= 0) {
+            PwHidPs5Poll poll;
+            pw_hid_ps5_poll(&g_hid, &poll);
+            for (size_t i = 0; i < poll.count; i++) {
+                const PwHidEvent *e = &poll.events[i];
+                if (e->kind == PW_HID_EVENT_KEY && e->code == 0x13) {   /* Pause: the title's mark */
+                    if (e->down) g_mark(now, started);
+                    continue;
+                }
+                post(e->kind == PW_HID_EVENT_KEY ? 1u : 3u, e->code, 0, 0, e->down);   /* KEY, MOUSE_BUTTON */
+                g_kbm_events++;
+                g_inputs++;
+            }
+            if (poll.dx || poll.dy) {
+                post(2, 0, poll.dx, poll.dy, 0);   /* MOUSE_MOVE: relative pixels */
+                g_kbm_events++;
+                g_inputs++;
+            }
+            if (poll.wheel) {
+                post(4, 0, poll.wheel, 0, 0);      /* MOUSE_WHEEL: detents */
+                g_kbm_events++;
+                g_inputs++;
+            }
+        }
+        if (have_pad) {
+            memset(&state, 0, sizeof(state));
+            if (!pw_pad_orbis_read(&pad, &state)) {
+                uint32_t pressed = state.buttons & ~held;
+                PwWineInput move;
+
+                d_pad_reads++;
+                if (pressed & touchpad) g_mark(now, started);
+                if ((pressed & (square | triangle)) && seg.kind < 0) {
+                    seg.kind = (pressed & triangle) ? 1 : 0;
+                    seg.start_ns = now;
+                    seg.have_a = 0;
+                    step("g segment %s from t=%llus", seg.kind ? "hub" : "int",
+                         (unsigned long long)((now - started) / 1000000000ull));
+                }
+                if (input.mouse != PW_GAME_STICK_NONE &&
+                    pw_wine_pointer_step(&pointer, input.mouse == PW_GAME_STICK_LEFT ? state.left_x : state.right_x,
+                                         input.mouse == PW_GAME_STICK_LEFT ? state.left_y : state.right_y,
+                                         input.mouse_speed ? input.mouse_speed : 1200,
+                                         (uint32_t)((now - last) / 1000), &move)) {
+                    post(move.type, move.code, move.x, move.y, 0);
+                    g_pad_events++;
+                    g_inputs++;
+                }
+                for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
+                    const PwGameBinding *bind = &input.bindings[i];
+                    uint32_t mask = pw_game_button_mask(i), down = state.buttons & mask;
+                    if (!mask || down == (held & mask)) continue;
+                    if (bind->kind == PW_GAME_BIND_KEY) post(1, bind->code, 0, 0, down != 0);
+                    else if (bind->kind == PW_GAME_BIND_MOUSE) post(3, bind->code, 0, 0, down != 0);
+                    else continue;
+                    g_pad_events++;
+                    g_inputs++;
+                }
+                held = state.buttons;
+            }
+        }
+        last = now;
+        if (seg.kind >= 0 && !seg.have_a && now - seg.start_ns >= (uint64_t)G_SEG_WARM_S * 1000000000ull) {
+            g_snap(&seg.a, 0, NULL);
+            seg.inputs_a = g_inputs;
+            seg.have_a = 1;
+        }
+        if (seg.kind >= 0 && seg.have_a &&
+            now - seg.start_ns >= (uint64_t)(G_SEG_WARM_S + G_SEG_S) * 1000000000ull)
+            g_seg_end(&seg);
+        if (g_marks >= 2 && !g_line_sent && now - g_window_ns >= (uint64_t)G_WINDOW_S * 1000000000ull) {
+            g_line_sent = 1;
+            pw_ms_wine_end("running", "", -1);
+        }
+        pause_ms(8);
+    }
+    return NULL;
+}
 
 void pw_ms_emit_lines(void)
 {

@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u wowprospero wow64native wineps5${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
+modules="ntdll wineserver win32u wowprospero wow64native wineps5 ws2_32${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -233,7 +233,7 @@ dmem="$obj/pw_wine_dmem.o $obj/pw_wine_dmem_ps5.o"
 : > "$work/make.log"
 status=0
 for step in "dlls/ntdll/ntdll.so|$heap $dmem" "dlls/win32u/win32u.so|" "server/wineserver|$heap" \
-        "dlls/winevulkan/winevulkan.so|"; do
+        "dlls/winevulkan/winevulkan.so|" "dlls/ws2_32/ws2_32.so|"; do
     target=${step%%|*}; objects=${step#*|}
     case " $modules " in *" $(basename "${target%.so}") "*) ;; *) continue ;; esac
     (cd "$build" && rm -f "$target")
@@ -375,7 +375,8 @@ case " $modules " in *" ntdll "*)
         pw_wine_set_audio_sink pw_wine_audio_available pw_wine_audio_output \
         __wine_virtual_stats __wine_virtual_fault_top __wine_ps5_set_output_sink __wine_ps5_memory_stats pw_cwd_set \
         __wine_ps5_set_segv_hook __wine_ps5_set_segv_unresolved_hook pw_wine_set_display_release pw_wine_release_display \
-        pw_wine_set_exit_hook pw_wine_setenv pw_wine_thread_stats pw_wine_thread_policy pw_wine_thread_caller_stacks
+        pw_wine_set_exit_hook pw_wine_setenv pw_wine_thread_stats pw_wine_thread_policy pw_wine_thread_caller_stacks \
+        pw_wine_thread_live
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
             pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
@@ -446,6 +447,19 @@ case " $modules " in *" winevulkan "*)
         ntdll,win32u
     ;;
 esac
+case " $modules " in *" ws2_32 "*)
+    # Winsock's Unix side (milestone g): ws2_32.dll's DllMain fails when its
+    # unix library does not load (return !__wine_init_unix_call()), and a
+    # game that imports ws2_32 or wsock32 then never starts (Bloodlines
+    # imports both). Its socket calls go to libkernel/libc as the server's
+    # do; the resolver calls (getaddrinfo, gethostbyname, gethostname) are
+    # whatever the SDK's libc gives, and the PRX report lists what is missing.
+    [ -f "$prx/ntdll.shared.elf" ] || fail "ws2_32 imports from ntdll: build ntdll in the same run"
+    desc ws2_32 __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    # shellcheck disable=SC2086
+    link_prx ws2_32 dlls/ws2_32/ws2_32.so "$prx/obj/ws2_32_desc.o $exit_wraps $import_wraps" ntdll
+    ;;
+esac
 case " $modules " in *" libvulkan "*)
     # RADV (milestone e), which win32u's dlopen("libvulkan.so") loads through
     # pw_wine_dl beside ntdll.prx: module_start runs its constructors (ACO's
@@ -455,7 +469,8 @@ case " $modules " in *" libvulkan "*)
     # The archive is whole: Mesa's entry points are reached through lookup
     # tables, not by name.
     [ -f "$prx/ntdll.shared.elf" ] || fail "libvulkan imports from ntdll: build ntdll in the same run"
-    desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_vulkan_thread_stats pw_wine_setenv
+    desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_vulkan_thread_stats pw_wine_setenv \
+        pw_vulkan_alias_stats pw_vulkan_present_hist
     # shellcheck disable=SC2086
     link_prx libvulkan - "$prx/obj/libvulkan_desc.o $obj/pw_vulkan_radv_orbis.o $obj/pw_emutls_orbis.o \
         $obj/pw_wine_env_orbis.o --whole-archive $PROSPERO_RADV_ARCHIVE --no-whole-archive $PROSPERO_RADV_ZLIB \

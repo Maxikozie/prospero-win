@@ -44,6 +44,8 @@ __attribute__((constructor)) static void name_process(void)
 #endif
 
 static struct pw_vulkan_stats stats;
+/* Present intervals (milestone g): 1 ms buckets and the longest since a reset. */
+static uint64_t present_hist[PW_VULKAN_HIST_BUCKETS], present_max_ns;
 static PFN_vkCreateSwapchainKHR real_create_swapchain;
 static PFN_vkQueuePresentKHR real_queue_present;
 static PFN_vkQueueSubmit real_queue_submit;
@@ -88,9 +90,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL count_queue_present(VkQueue queue, const V
     if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
     {
         uint64_t now = now_ns(), none = 0;
+        uint64_t last = __atomic_exchange_n(&stats.last_present_ns, now, __ATOMIC_RELAXED);
 
         __atomic_compare_exchange_n(&stats.first_present_ns, &none, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-        __atomic_store_n(&stats.last_present_ns, now, __ATOMIC_RELAXED);
+        if (last && now > last)
+        {
+            uint64_t interval = now - last, ms = interval / 1000000u, seen;
+
+            __atomic_add_fetch(&present_hist[ms < PW_VULKAN_HIST_BUCKETS ? ms : PW_VULKAN_HIST_BUCKETS - 1], 1,
+                               __ATOMIC_RELAXED);
+            seen = __atomic_load_n(&present_max_ns, __ATOMIC_RELAXED);
+            while (interval > seen &&
+                   !__atomic_compare_exchange_n(&present_max_ns, &seen, interval, 1, __ATOMIC_RELAXED,
+                                                __ATOMIC_RELAXED))
+                ;
+        }
         __atomic_add_fetch(&stats.presents, 1, __ATOMIC_RELEASE);
     }
     else
@@ -198,4 +212,33 @@ void pw_vulkan_thread_stats(unsigned long *created, unsigned long *raised, size_
 {
     pw_orbis_thread_counts(created, raised);
     if (floor_bytes) *floor_bytes = pw_orbis_thread_stack_floor();   /* read without resolving it */
+}
+
+/* ps4-wine patches/mesa-ps4/0003, in RADV's Orbis winsys (ac_orbis_drm.c). */
+extern void ac_orbis_drm_alias_stats(uint32_t *made, uint32_t *live, uint64_t *live_bytes, uint64_t *peak_bytes,
+                                     uint32_t *failed);
+
+void pw_vulkan_alias_stats(uint32_t *made, uint32_t *live, uint64_t *live_bytes, uint64_t *peak_bytes,
+                           uint32_t *failed)
+{
+    uint32_t m, l, f;
+    uint64_t lb, pb;
+
+    ac_orbis_drm_alias_stats(&m, &l, &lb, &pb, &f);
+    if (made) *made = m;
+    if (live) *live = l;
+    if (live_bytes) *live_bytes = lb;
+    if (peak_bytes) *peak_bytes = pb;
+    if (failed) *failed = f;
+}
+
+size_t pw_vulkan_present_hist(uint64_t *buckets, size_t count, uint64_t *max_ns, int reset_max)
+{
+    size_t n = count < PW_VULKAN_HIST_BUCKETS ? count : PW_VULKAN_HIST_BUCKETS;
+
+    for (size_t i = 0; buckets && i < n; i++) buckets[i] = __atomic_load_n(&present_hist[i], __ATOMIC_RELAXED);
+    if (max_ns) *max_ns = reset_max ? __atomic_exchange_n(&present_max_ns, 0, __ATOMIC_RELAXED)
+                                    : __atomic_load_n(&present_max_ns, __ATOMIC_RELAXED);
+    else if (reset_max) __atomic_store_n(&present_max_ns, 0, __ATOMIC_RELAXED);
+    return buckets ? n : 0;
 }

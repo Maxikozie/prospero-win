@@ -22,6 +22,23 @@ int thr_self(long *id)
     return 0;
 }
 
+/* Wine names a thread with thr_set_name when the program does (SetThreadDescription:
+ * DXVK's dxvk-cs, dxvk-submit, ...; ntdll/unix/thread.c's FreeBSD branch). libkernel
+ * renames only through a thread handle, so the calling thread's name is set and
+ * another thread's is refused; the kernel then reports the name as the thread's
+ * ki_tdname, which the PS4 title's CPU census reads (milestone g). */
+extern void *scePthreadSelf(void);
+extern int scePthreadRename(void *thread, const char *name);
+
+int thr_set_name(long id, const char *name)
+{
+    if (id != (long)pthread_getthreadid_np()) {
+        errno = ESRCH;
+        return -1;
+    }
+    return scePthreadRename(scePthreadSelf(), name) ? (errno = EINVAL, -1) : 0;
+}
+
 /* The SDK's libc.a has a ppoll that returns ENOSYS; libkernel exports
  * poll. The signal mask argument is applied around the wait as FreeBSD's
  * ppoll does, which is all Wine's server loop (poll with a timeout) needs. */

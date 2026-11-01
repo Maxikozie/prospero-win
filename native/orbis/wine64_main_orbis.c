@@ -35,6 +35,7 @@
 #include "prospero_win.h"
 #include "pw_wine_exit_orbis.h"
 #include "pw_milestone_orbis.h"
+#include "pw_game_profile.h"
 #include "ps5log/ps5log.h"
 #include "orbislog/orbislog.h"
 #include <errno.h>
@@ -178,6 +179,7 @@ static void *forward_fd(void *arg)
             buffer[line] = 0;
             if (line && buffer[line - 1] == '\r') buffer[line - 1] = 0;
             LOG("%s %s", forward->tag, buffer);
+            pw_ms_wine_line(buffer);
             if (forward->tag[0] == 'S' && buffer[0]) {
                 pw_ms_stdout(buffer);
                 pthread_mutex_lock(&stdout_lock);
@@ -234,6 +236,7 @@ static void wine_output_sink(const char *str, size_t len)
             line[used] = 0;
             LOG("WINE %s", line);
             if (strstr(line, "wine startup: server connected")) server_connected = 1;
+            pw_ms_wine_line(line);
             used = 0;
             if (str[i] != '\n') line[used++] = str[i];
         } else {
@@ -354,11 +357,18 @@ static int set_env(const char *name, const char *value)
 
 struct thread_start { void (*entry)(void *); void *arg; };
 
+/* libkernel's own (FreeBSD libthr's name, which the kernel reports as the thread's
+ * ki_tdname): milestone g's CPU census finds Wine's main thread, the game's main
+ * thread under WoW64, by this name. */
+extern void *scePthreadSelf(void);
+extern int scePthreadRename(void *thread, const char *name);
+
 static void *thread_trampoline(void *opaque)
 {
     struct thread_start s = *(struct thread_start *)opaque;
     free(opaque);
-    LOG("PW_WINE64 thread entered, calling __wine_main");
+    LOG("PW_WINE64 thread entered, calling __wine_main (rename wine-main %d)",
+        scePthreadRename(scePthreadSelf(), "wine-main"));
     s.entry(s.arg);
     LOG("PW_WINE64 __wine_main returned");
     return NULL;
@@ -388,9 +398,96 @@ static char env_text[4096];
 static PwWineStartEnv env_pairs[PW_WINE_START_MAX_ENV];
 static uint32_t env_count;
 
+/* A later value for a name replaces the earlier one: the title's defaults, then
+ * the plan's, the profile's, and env.txt's last. */
 static void add_env(const char *name, const char *value)
 {
+    for (uint32_t i = 0; i < env_count; i++)
+        if (!strcmp(env_pairs[i].name, name)) { env_pairs[i].value = value; return; }
     if (env_count < PW_WINE_START_MAX_ENV) env_pairs[env_count++] = (PwWineStartEnv){ name, value };
+    else LOG("PW_WINE64 env full: %s=%s dropped", name, value);
+}
+
+/* ---- a game's profile (milestone g) -------------------------------------------------- */
+
+/* <root>/profiles/<id>.ini in prospero-win's profile format (src/pw_game_profile.h): the
+ * program, its arguments and working directory, Wine's DLL overrides, the desktop, the
+ * 32-bit CPU and the variables those imply. The id comes from env.txt's PS4WINE_PROFILE,
+ * else from the plan (g: vtmb). There is one prefix on the PS4, so the profile's prefix
+ * and runtime names are logged and otherwise unused. */
+static PwGameProfile profile;
+static int profile_loaded;
+static char profile_id[PW_APP_ID_CAPACITY], profile_status[48];
+static char profile_overrides[PW_APP_DLL_OVERRIDES_CAPACITY], profile_desktop[24];
+static char profile_words[PW_APP_ARGUMENTS_CAPACITY];
+static const char *profile_argv[PW_WINE_LAUNCH_WORDS];
+static int profile_argc;
+
+static void load_profile(const char *id)
+{
+    static uint8_t text[16384];
+    char path[256];
+    size_t got;
+    FILE *file;
+    int status;
+
+    snprintf(profile_id, sizeof(profile_id), "%s", id);
+    snprintf(path, sizeof(path), PW_ROOT "/profiles/%s.ini", id);
+    if (!(file = fopen(path, "rb"))) { snprintf(profile_status, sizeof(profile_status), "nofile"); return; }
+    got = fread(text, 1, sizeof(text), file);
+    fclose(file);
+    if (got == sizeof(text)) { snprintf(profile_status, sizeof(profile_status), "toolarge"); return; }
+    if ((status = pw_game_profile_parse(text, got, &profile)) != PW_OK) {
+        snprintf(profile_status, sizeof(profile_status), "parse:%s", pw_result_name(status));
+        return;
+    }
+    profile_argc = pw_wine_launch_split(profile.app.arguments, profile_words, sizeof(profile_words), profile_argv,
+                                        PW_WINE_LAUNCH_WORDS);
+    if (profile_argc < 0) { snprintf(profile_status, sizeof(profile_status), "arguments"); return; }
+    if (pw_app_profile_effective_dll_overrides(&profile.app, profile_overrides, sizeof(profile_overrides)) != PW_OK)
+        profile_overrides[0] = 0;
+    if (profile.display.width && profile.display.height)
+        snprintf(profile_desktop, sizeof(profile_desktop), "%ux%u", (unsigned)profile.display.width,
+                 (unsigned)profile.display.height);
+    profile_loaded = 1;
+    snprintf(profile_status, sizeof(profile_status), "ok");
+}
+
+/* The profile's variables, after the plan's and before env.txt's. */
+static void profile_environment(void)
+{
+    static PwGameEnv runtime_env[PW_GAME_RUNTIME_ENV_MAX], cpu_env[PW_GAME_CPU_ENV_MAX],
+        graphics_env[PW_GAME_GRAPHICS_ENV_MAX], debug_env[PW_GAME_DEBUG_ENV_MAX];
+    size_t n;
+
+    if (!profile_loaded) return;
+    if (profile_overrides[0]) add_env("WINEDLLOVERRIDES", profile_overrides);
+    if (profile_desktop[0]) add_env("WINE_PS5_DESKTOP", profile_desktop);
+    if (profile.winedebug[0]) add_env("WINEDEBUG", profile.winedebug);
+    n = pw_game_runtime_env(&profile.runtime, runtime_env);
+    for (size_t i = 0; i < n; i++) add_env(runtime_env[i].name, runtime_env[i].value);
+    n = pw_game_cpu_env(&profile, cpu_env);
+    for (size_t i = 0; i < n; i++) add_env(cpu_env[i].name, cpu_env[i].value);
+    n = pw_game_graphics_env(&profile, graphics_env);
+    for (size_t i = 0; i < n; i++) add_env(graphics_env[i].name, graphics_env[i].value);
+    n = pw_game_debug_env(&profile, debug_env);
+    for (size_t i = 0; i < n; i++) add_env(debug_env[i].name, debug_env[i].value);
+}
+
+/* The working directory the profile names, as ntdll's logical one (a title cannot chdir;
+ * wine/ps5/pw_wine_cwd.h), which Wine reads as the process's current directory. */
+static void profile_cwd(const PwWineStart *start)
+{
+    int (*set_cwd)(const char *);
+    char host_dir[PW_APP_PATH_CAPACITY + 64];
+    int mapped, status;
+
+    if (!profile_loaded || !profile.app.working_directory[0]) return;
+    set_cwd = (int (*)(const char *))(uintptr_t)pw_prx_lookup(start->descriptor, "pw_cwd_set");
+    mapped = pw_wine_launch_host_dir(PW_ROOT "/prefix", profile.app.working_directory, host_dir, sizeof(host_dir));
+    status = set_cwd && mapped == 0 ? set_cwd(host_dir) : -1;
+    LOG("PW_WINE64 cwd=%s host=%s set=%d status=%d", profile.app.working_directory, mapped == 0 ? host_dir : "-",
+        set_cwd != NULL, status);
 }
 
 static void load_env_file(const char *path)
@@ -425,7 +522,7 @@ static const char *const runtime_roots[] = { PW_ROOT "/runtime", "/app0" };
 int main(int argc, char **argv)
 {
     static char ntdll_dir[512], ntdll_path[512], exe[PW_WINE_LAUNCH_PATH_MAX];
-    static const char *wine_argv[3];
+    static const char *wine_argv[3 + PW_WINE_LAUNCH_WORDS];
     PwWineStartConfig config;
     PwWineStartOps ops = { load_start, module_info, set_env, start_thread };
     ps5log_config logcfg;
@@ -453,6 +550,24 @@ int main(int argc, char **argv)
     /* path=... from argv[0] on (a LoadExec restart) or argv[1] on; else env.txt's
      * PS4WINE_EXE (a Windows path without spaces); else the plan's program. */
     snprintf(exe, sizeof(exe), "%s", pw_ms_exe());
+    {
+        /* A game's profile (milestone g): env.txt's PS4WINE_PROFILE, else the plan's. */
+        char id[PW_APP_ID_CAPACITY];
+        const char *chosen_id = early_setting("PS4WINE_PROFILE", id, sizeof(id));
+        if (!chosen_id || !chosen_id[0]) chosen_id = pw_ms_profile_id();
+        if (chosen_id && chosen_id[0]) {
+            load_profile(chosen_id);
+            if (profile_loaded) snprintf(exe, sizeof(exe), "%s", profile.app.executable);
+            LOG("PW_WINE64 profile id=%s status=%s exe=%s words=%d cwd=%s overrides=%s desktop=%s cpu=%s preset=%s "
+                "prefix=%s runtime=%s", profile_id, profile_status, profile_loaded ? profile.app.executable : "-",
+                profile_loaded ? profile_argc : 0, profile_loaded ? profile.app.working_directory : "-",
+                profile_overrides[0] ? profile_overrides : "-", profile_desktop[0] ? profile_desktop : "-",
+                profile_loaded ? (pw_game_cpu_native(&profile) ? "native" : "translator") : "-",
+                profile_loaded && profile.input.preset[0] ? profile.input.preset : "-",
+                profile_loaded ? profile.app.prefix : "-", profile_loaded ? profile.app.runtime : "-");
+        }
+        pw_ms_set_profile(profile_loaded ? &profile : NULL, profile_id[0] ? profile_id : NULL, profile_status);
+    }
     {
         char chosen[256];
         if (early_setting("PS4WINE_EXE", chosen, sizeof(chosen)) && chosen[0]) snprintf(exe, sizeof(exe), "%s", chosen);
@@ -505,8 +620,11 @@ int main(int argc, char **argv)
     config.prefix = PW_ROOT "/prefix";
     wine_argv[0] = "wine";
     wine_argv[1] = exe;
-    wine_argv[2] = NULL;
     config.argc = 2;
+    /* The profile's arguments follow the program (Wine quotes them back into the command line). */
+    for (int i = 0; profile_loaded && i < profile_argc; i++) wine_argv[config.argc++] = profile_argv[i];
+    wine_argv[config.argc] = NULL;
+    if (config.argc > 2) LOG("PW_WINE64 arguments words=%d line=%s", (int)config.argc - 2, profile.app.arguments);
     config.argv = wine_argv;
     config.stack_bytes = 16u << 20;
 
@@ -585,9 +703,11 @@ int main(int argc, char **argv)
         add_env("WINE_PS5_MUTEX_SHARED", "0");
         add_env("WINE_PS5_SYNC_SHARED", "0");
         pw_ms_environment(add_env);
+        profile_environment();
         load_env_file(PW_ROOT "/env.txt");
         config.extra_env = env_pairs;
         config.extra_env_count = env_count;
+        profile_cwd(&start);
         status = pw_wine_start_environment(&start, &config, &ops);
         LOG("PW_WINE64 environment status=%d", status);
         if (status == PW_OK) {

@@ -27,6 +27,11 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
+/* The same program as vk32.exe (i686, milestone g's g1m): the bitness, and where
+ * vkMapMemory put the green square (below 4 GiB through WoW64's placed maps). */
+#define BITS ((unsigned)(sizeof(void *) * 8))
+static char map_text[48] = "-";
+
 enum { WIDTH = 1920, HEIGHT = 1080, FRAMES = 330, MARK = 64, MARK_X = 240, MARK_Y = 135, MAX_IMAGES = 8 };
 static const UINT64 TIMEOUT_NS = 2000000000ull;
 
@@ -83,13 +88,13 @@ static int phase1(void)
     HMODULE vulkan = LoadLibraryA("vulkan-1.dll");
 
     if (!vulkan || !(gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(vulkan, "vkGetInstanceProcAddr"))) {
-        printf("VK64 inst=fail:vulkan-1.dll:%lu\n", GetLastError());
+        printf("VK64 bits=%u inst=fail:vulkan-1.dll:%lu\n", BITS, GetLastError());
         return -1;
     }
     {
         PFN_vkCreateInstance vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
         if ((r = vkCreateInstance(&info, NULL, &instance))) {
-            printf("VK64 inst=fail:vkCreateInstance:%d\n", (int)r);
+            printf("VK64 bits=%u inst=fail:vkCreateInstance:%d\n", BITS, (int)r);
             return -1;
         }
     }
@@ -100,7 +105,7 @@ static int phase1(void)
         INSTANCE_FN(vkGetPhysicalDeviceQueueFamilyProperties);
         r = vkEnumeratePhysicalDevices(instance, &count, &physical);
         if ((r && r != VK_INCOMPLETE) || !count) {
-            printf("VK64 inst=ok device=none:%d:%u\n", (int)r, count);
+            printf("VK64 bits=%u inst=ok device=none:%d:%u\n", BITS, (int)r, count);
             return -1;
         }
         vkGetPhysicalDeviceProperties(physical, &props);
@@ -114,7 +119,7 @@ static int phase1(void)
     }
     for (family = 0; family < family_count && !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT); family++) {}
     field_text(props.deviceName, name, sizeof(name));
-    printf("VK64 inst=ok api=%u.%u device=%s exts=%u exts_dxvk=%s ", VK_API_VERSION_MAJOR(props.apiVersion),
+    printf("VK64 bits=%u inst=ok api=%u.%u device=%s exts=%u exts_dxvk=%s ", BITS, VK_API_VERSION_MAJOR(props.apiVersion),
            VK_API_VERSION_MINOR(props.apiVersion), name, ext_count, missing ? missing : "ok");
     {
         static const char *const device_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
@@ -213,7 +218,11 @@ static int make_mark(Frames *f)
         if ((r = vkAllocateMemory(device, &allocate, NULL, &backing))) return fail("vkAllocateMemory", r);
     }
     if ((r = vkBindBufferMemory(device, f->mark, backing, 0))) return fail("vkBindBufferMemory", r);
-    if ((r = vkMapMemory(device, backing, 0, VK_WHOLE_SIZE, 0, (void **)&bytes))) return fail("vkMapMemory", r);
+    if ((r = vkMapMemory(device, backing, 0, VK_WHOLE_SIZE, 0, (void **)&bytes))) {
+        snprintf(map_text, sizeof(map_text), "fail:%d", (int)r);
+        return fail("vkMapMemory", r);
+    }
+    snprintf(map_text, sizeof(map_text), "ok map_at=%p", (void *)bytes);
     for (unsigned i = 0; i < MARK * MARK; i++) {
         bytes[i * 4] = 0;
         bytes[i * 4 + 1] = 255;
@@ -369,8 +378,8 @@ static int phase2(void)
         if (r == VK_TIMEOUT) { hang = 1; fail("vkWaitForFences", r); frames++; break; }
         if (r || (r = vkResetFences(device, 1, &f.fence))) { fail("vkWaitForFences", r); frames++; break; }
     }
-    printf("VK64S surface=ok swapchain=%ux%u fmt=%d images=%u frames=%u hang=%d present=%s\n", extent.width,
-           extent.height, (int)format.format, f.count, frames, hang, failed[0] ? failed : "ok");
+    printf("VK64S surface=ok swapchain=%ux%u fmt=%d images=%u frames=%u hang=%d present=%s map=%s\n", extent.width,
+           extent.height, (int)format.format, f.count, frames, hang, failed[0] ? failed : "ok", map_text);
     fflush(stdout);
     vkDeviceWaitIdle(device);
     if (f.swapchain) vkDestroySwapchainKHR(device, f.swapchain, NULL);

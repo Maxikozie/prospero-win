@@ -99,8 +99,11 @@ speed_t cfgetispeed(const struct termios *t){return (speed_t)pw_compat_cfgetispe
 int cfsetospeed(struct termios *t,speed_t speed){return pw_compat_cfsetospeed(t,speed);}
 int cfsetispeed(struct termios *t,speed_t speed){return pw_compat_cfsetispeed(t,speed);}
 
-/* Thread names are diagnostic only; the title's threads keep theirs. */
+/* Thread names are diagnostic only; the title's threads keep theirs. The PS4's
+ * is in wine/orbis/pw_wine_compat_orbis.c (milestone g's CPU census reads them). */
+#ifndef __ORBIS__
 int thr_set_name(long id,const char *name){(void)id;(void)name;return 0;}
+#endif
 
 void __assert(const char *function,const char *file,int line,const char *expression)
 {

@@ -1,0 +1,48 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: orbis: export the live and peak thread counts
+
+The PS4 title's milestone g lines record how many threads Wine has alive at
+once over a game's session (docs/ps4/HANDOFF-g.md in ps4-wine). Since a
+thread whose stack the caller set (spawn_thread's kernel stack) goes to
+libkernel untouched (ps4-wine's orbis-compat patch 0001, keep), the pthread
+layer no longer sees threads end, so the count has to come from Wine's own
+nb_threads. pw_wine_thread_live reads it and the most seen at once, which
+spawn_thread now keeps. Orbis only (__ORBIS__): nothing changes elsewhere.
+---
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -82,6 +82,19 @@
+ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+ 
+ static LONG nb_threads = 1;
++#ifdef __ORBIS__
++/* The most threads alive at once (the PS4 title's milestone g lines). */
++static LONG pw_peak_threads = 1;
++
++/* Wine's live threads now and at the most, for the PS4 title: a thread whose
++ * stack the caller set (spawn_thread's kernel stack) no longer passes through
++ * the pthread layer's trampoline, so only Wine itself knows how many live. */
++void pw_wine_thread_live( LONG *live, LONG *peak )
++{
++    if (live) *live = nb_threads;
++    if (peak) *peak = pw_peak_threads;
++}
++#endif
+ 
+ static inline int get_unix_exit_code( NTSTATUS status )
+ {
+@@ -1342,7 +1355,14 @@
+     pthread_attr_setstack( &attr, get_kernel_stack( data ), kernel_stack_size );
+     pthread_attr_setguardsize( &attr, 0 );
+     pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
++#ifdef __ORBIS__
++    {
++        LONG now = InterlockedIncrement( &nb_threads ), peak;
++        while (now > (peak = pw_peak_threads) && InterlockedCompareExchange( &pw_peak_threads, now, peak ) != peak);
++    }
++#else
+     InterlockedIncrement( &nb_threads );
++#endif
+     data->ps5_spawn_us = ps5_slow_log() ? ps5_now_us() : 0;
+     if (pthread_create( &pthread_id, &attr, (void * (*)(void *))server_init_thread, data ))
+     {

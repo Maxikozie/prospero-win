@@ -58,6 +58,21 @@
  *       default), small (512 KiB of the layer's own) or floor (the main thread's
  *       size, as before). The e line carries the same thread fields and
  *       libvulkan.prx's own layer: vk_threads_created vk_stack_floor_kib.
+ *   g1n f1's stages and wow32.exe on the native CPU (WINE_PS5_WOW64_CPU=wow64native.dll):
+ *       guest SEH, x87/SSE2, a second thread (milestone g, docs/ps4/HANDOFF-g.md in ps4-wine)
+ *       -> PS4WINE g1n hello32 cpu=native native_caps=N seh=ok fp=ok thread=ok faults_unresolved=N ...
+ *   g1m winevulkan's slots, the display, vk32.exe (vk64.exe built for i686): 32-bit placed
+ *       maps (mesa-ps4 patch 0003) and the green square copied from mapped memory
+ *       -> PS4WINE g1m vk32 bits=32 map=ok map32=ok frames=N fb=ok ...
+ *   g1  the display, d3d9tri32.exe under DXVK 2.6.2's 32-bit d3d9 with the settings of
+ *       its vampire.exe profile (C:\g1\dxvk.conf), Vulkan batching on
+ *       -> PS4WINE g1 d3d9 bits=32 map32=ok batch=1 crossings_per_frame=N frames=N ...
+ *   g   Bloodlines from <root>/profiles/vtmb.ini (C:\VTMB\Vampire.exe -game Unofficial_Patch);
+ *       the user marks with the DS4's touchpad: the first mark at the main menu
+ *       -> PS4WINE g2 vtmb menu=1 ..., the second with the player in control in the first
+ *       map starts a 300 s window -> PS4WINE g vtmb batch=1 gameplay=1 crossings_per_frame=N
+ *       fps_avg=N ... (session_s from the mark); square/triangle measure a 60 s interior/hub
+ *       segment -> PS4WINE gseg vtmb seg=int|hub ...
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
@@ -129,6 +144,17 @@ void pw_ms_stdout(const char *line);
 /* The plan's defaults for Wine's environment (RADV's variables in the e
  * plans), added before <root>/env.txt is read. */
 void pw_ms_environment(void (*add)(const char *name, const char *value));
+/* Milestone g: the plan's game profile (g: "vtmb"), NULL for none; env.txt's
+ * PS4WINE_PROFILE wins (wine64_main_orbis.c). */
+const char *pw_ms_profile_id(void);
+/* The profile the title loaded from <root>/profiles/<id>.ini, NULL when none
+ * or refused; its id and the load's status ("ok", "nofile", "parse:...", ...). */
+struct PwGameProfile;
+void pw_ms_set_profile(const struct PwGameProfile *profile, const char *id, const char *status);
+/* Each line of Wine's debug output and of its stderr: 32-bit winevulkan's
+ * PW_VK_BATCH records, Wine's unhandled-exception reports, +loaddll's lines
+ * for the game's own modules. */
+void pw_ms_wine_line(const char *line);
 /* "module+0xoffset" for an address, "?" outside every loaded module. */
 const char *pw_orbis_module_of(uint64_t address, char *out, size_t size);
 

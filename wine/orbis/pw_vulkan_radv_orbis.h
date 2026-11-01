@@ -35,4 +35,20 @@ int pw_vulkan_stats(struct pw_vulkan_stats *stats);
  * may be NULL. */
 void pw_vulkan_thread_stats(unsigned long *created, unsigned long *raised, size_t *floor_bytes);
 
+/* Placed CPU aliases (VK_EXT_map_memory_placed, 32-bit Wine's host-visible
+ * memory below 4 GiB; ps4-wine patches/mesa-ps4/0003): made so far, live now
+ * and their bytes, the peak of those bytes, and refusals. Milestone g's g1m and
+ * g1 lines read them (map32). Any pointer may be NULL. */
+void pw_vulkan_alias_stats(uint32_t *made, uint32_t *live, uint64_t *live_bytes, uint64_t *peak_bytes,
+                           uint32_t *failed);
+
+/* The interval between consecutive counted presents, in 1 ms buckets
+ * (bucket i: i ms <= interval < i+1 ms; the last bucket holds everything
+ * from PW_VULKAN_HIST_BUCKETS-1 ms up), cumulative, and the longest interval
+ * since the last reset. Copies min(count, PW_VULKAN_HIST_BUCKETS) buckets;
+ * with reset_max the longest interval starts again from 0 (milestone g's
+ * window starts at a mark). Returns the number of buckets copied. */
+enum { PW_VULKAN_HIST_BUCKETS = 251 };
+size_t pw_vulkan_present_hist(uint64_t *buckets, size_t count, uint64_t *max_ns, int reset_max);
+
 #endif

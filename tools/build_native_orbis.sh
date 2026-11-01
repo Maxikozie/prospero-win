@@ -77,7 +77,7 @@ sources="native/orbis/wine64_main_orbis.c native/orbis/orbislog/orbislog.c nativ
 src/pw_result.c src/pw_wine_start.c wine/ps5/pw_wine_prx.c native/orbis/pw_stage_orbis.c \
 native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/pw_pad_orbis.c \
 native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c \
-native/orbis/pw_vk_stage_orbis.c native/orbis/pw_hist.c"
+native/orbis/pw_vk_stage_orbis.c native/orbis/pw_hist.c src/pw_wine_launch.c native/pw_hid_ps5.c src/pw_hid.c"
 objects=""
 for source in $sources; do
     object=$out/obj/$(basename "${source%.c}").o
@@ -92,7 +92,7 @@ if llvm-objdump -d "$out"/obj/*.o | grep -qw syscall; then fail "a raw syscall i
 ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
     $objects -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
     -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ -lSceNet -lSceSystemService -lSceUserService \
-    -lSceVideoOut -lScePad -lSceAudioOut \
+    -lSceVideoOut -lScePad -lSceAudioOut -lSceSysmodule \
     "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" ||
     fail "the title does not link"
 # libc.a has setjmp/longjmp/siglongjmp but no sigsetjmp: a sigsetjmp would bind to libkernel's
