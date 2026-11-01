@@ -955,6 +955,132 @@ static void *d_script(void *arg)
     return NULL;
 }
 
+/* ---- f: Space Cadet Pinball with the DualShock 4 ------------------------------------- */
+
+/* prospero-win's pinball bindings (docs/CASE_STUDY_PINBALL.md) in its .input
+ * format (docs/CONTROLS.md); <root>/input/pinball.input replaces them. L1/R1
+ * are the flippers, cross the plunger, the d-pad's left/right/up nudge,
+ * options pauses (F3), square starts a new game (F2), circle answers a
+ * dialog (Enter); the left stick moves the pointer, R2/L2 click. Holding
+ * the touchpad for F_END_HOLD_S ends the session and sends the line, as do
+ * F_PLAY_S seconds; Pinball goes on running after it. */
+static const char f_preset[] =
+    "[input]\n"
+    "mode = keyboard\n"
+    "mouse = left_stick\n"
+    "l1 = z\nr1 = slash\ncross = space\n"
+    "left = x\nright = period\nup = up\n"
+    "options = f3\nsquare = f2\ncircle = enter\n"
+    "r2 = mouse_left\nl2 = mouse_right\n";
+enum { F_PLAY_S = 1800, F_END_HOLD_S = 2, F_TOUCHPAD = 0x100000u };
+static volatile int f_keys;
+static const char *f_preset_from = "-";
+static uint64_t f_play_ns, f_frames_play;
+
+static int f_bindings(PwGameInput *input)
+{
+    static uint8_t text[4096];
+    char path[512];
+    FILE *file;
+
+    pw_game_input_init(input);
+    snprintf(path, sizeof(path), "%s/input/pinball.input", cfg.root);
+    if ((file = fopen(path, "rb"))) {
+        size_t got = fread(text, 1, sizeof(text), file);
+        fclose(file);
+        if (pw_game_input_parse(text, got, input) == PW_OK) {
+            f_preset_from = "file";
+            return 0;
+        }
+        step("f %s does not parse: the built-in bindings", path);
+        pw_game_input_init(input);
+    }
+    f_preset_from = "builtin";
+    return pw_game_input_parse((const uint8_t *)f_preset, sizeof(f_preset) - 1, input) == PW_OK ? 0 : -1;
+}
+
+/* d's loop with key bindings: each binding's button edge becomes a key or
+ * a mouse button of the user driver's input queue; a record a second. */
+static void *f_script(void *arg)
+{
+    PwGameInput input;
+    PwPadOrbis pad;
+    PwPadOrbisState state;
+    PwWinePointer pointer = { 0, 0 };
+    uint32_t held = 0;
+    uint64_t last, started = cfg.now_ns(), until, next_report, touch_since = 0, frames0;
+    (void)arg;
+
+    if (f_bindings(&input)) step("f: the built-in bindings do not parse");
+    pthread_mutex_lock(&present_lock);
+    frames0 = frames;
+    pthread_mutex_unlock(&present_lock);
+    if ((d_pad = pw_pad_orbis_open(&pad) == 0)) {
+        step("f pad open user=0x%x handle=%d preset=%s: L1/R1 flippers, cross plunger, d-pad nudges, square new "
+             "game, options pause, circle enter; hold the touchpad %d s to end", (unsigned)pad.user, pad.handle,
+             f_preset_from, F_END_HOLD_S);
+        last = started = next_report = cfg.now_ns();
+        for (until = started + (uint64_t)F_PLAY_S * 1000000000ull; cfg.now_ns() < until; pause_ms(8)) {
+            uint64_t now = cfg.now_ns();
+            PwWineInput move;
+            memset(&state, 0, sizeof(state));
+            if (pw_pad_orbis_read(&pad, &state)) continue;
+            d_pad_reads++;
+            if (now >= next_report) {
+                step("f play t=%llus reads=%d keys=%d inputs=%d refused=%d frames=%llu buttons=0x%x present_ms=%.1f",
+                     (unsigned long long)((now - started) / 1000000000ull), d_pad_reads, f_keys, d_inputs, d4_refused,
+                     (unsigned long long)frames, (unsigned)state.buttons,
+                     present_n ? present_sum_ns / (double)present_n / 1e6 : 0.0);
+                next_report = now + 1000000000ull;
+            }
+            if (state.buttons & F_TOUCHPAD) {
+                if (!touch_since) touch_since = now;
+                else if (now - touch_since >= (uint64_t)F_END_HOLD_S * 1000000000ull) { d_end = "touchpad"; break; }
+            } else {
+                touch_since = 0;
+            }
+            if (input.mouse == PW_GAME_STICK_LEFT &&
+                pw_wine_pointer_step(&pointer, state.left_x, state.left_y, D_POINTER_SPEED,
+                                     (uint32_t)((now - last) / 1000), &move)) {
+                if (!input_pending_ns) input_pending_ns = now;
+                post(move.type, move.code, move.x, move.y, 0);
+                d_inputs++;
+            }
+            last = now;
+            for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
+                const PwGameBinding *bind = &input.bindings[i];
+                uint32_t mask = pw_game_button_mask(i), down = state.buttons & mask;
+                if (!mask || down == (held & mask)) continue;
+                if (bind->kind == PW_GAME_BIND_KEY) {
+                    post(1, bind->code, 0, 0, down != 0);   /* PW_WINE_INPUT_KEY: a Windows virtual key */
+                    f_keys++;
+                } else if (bind->kind == PW_GAME_BIND_MOUSE) {
+                    post(3, bind->code, 0, 0, down != 0);   /* PW_WINE_INPUT_MOUSE_BUTTON */
+                } else {
+                    continue;
+                }
+                if (!input_pending_ns) input_pending_ns = now;
+                d_inputs++;
+            }
+            held = state.buttons;
+        }
+        if (!strcmp(d_end, "-")) d_end = "time";
+        /* No key stays down after the session. */
+        for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
+            if ((held & pw_game_button_mask(i)) && input.bindings[i].kind == PW_GAME_BIND_KEY)
+                post(1, input.bindings[i].code, 0, 0, 0);
+    } else {
+        step("f pad open failed: %s 0x%x", pad.failed, (unsigned)pad.status);
+        d_end = "nopad";
+    }
+    f_play_ns = cfg.now_ns() - started;
+    pthread_mutex_lock(&present_lock);
+    f_frames_play = frames - frames0;
+    pthread_mutex_unlock(&present_lock);
+    pw_ms_wine_end("running", "", -1);
+    return NULL;
+}
+
 /* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
 
 static void *(*ntdll_dlopen)(const char *, int);
@@ -1168,6 +1294,7 @@ static void stage_vk_present(char *fields, size_t size)
 
 static int vulkan_plan(void);
 static int dxvk_plan(void);
+static int pinball_plan(void);
 
 /* winevulkan.prx's slots against both its exporters (ntdll, then win32u for
  * __wine_get_vulkan_driver). */
@@ -1281,6 +1408,9 @@ void pw_ms_stdout(const char *line)
 void pw_ms_environment(void (*add)(const char *name, const char *value))
 {
     static char cache[512], shot[512];
+    /* Milestone f: Pinball's window (about 600x470) fits 960x540, which fills
+     * 1920x1080 at twice its size. */
+    if (pinball_plan()) add("WINE_PS5_DESKTOP", "960x540");
     if (!vulkan_plan()) return;
     snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
     mkdir(cache, 0777);
@@ -1386,6 +1516,7 @@ static void e1_lines(void);
 static void e2_lines(void);
 static void e_lines(void);
 static void f1_lines(void);
+static void f_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1446,6 +1577,13 @@ static const PwMsStage f1_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "wow32", 0, NULL, "exit=fault" },
 };
+/* f: milestone f's own line, Space Cadet Pinball (C:\\Pinball, the user's
+ * files) on the translator, played with the DualShock 4 (f_script). */
+static const PwMsStage f_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "pinball", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -1455,10 +1593,18 @@ static const PwMsPlan plans[] = {
     { "e2", e2_stages, sizeof(e2_stages) / sizeof(e2_stages[0]), "C:\\vk64.exe", 0, e2_lines },
     { "e", e_stages, sizeof(e_stages) / sizeof(e_stages[0]), "C:\\d3d11tri64.exe", 0, e_lines },
     { "f1", f1_stages, sizeof(f1_stages) / sizeof(f1_stages[0]), "C:\\wow32.exe", 0, f1_lines },
+    { "f", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, f_lines },
 };
 
 static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
+static int pinball_plan(void) { return plan && plan->lines == f_lines; }
+
+/* The Wine stage's watchdog (wine64_main_orbis.c), 0 for its default of
+ * 180 s: f plays up to F_PLAY_S, and its play loop sends the line itself
+ * (the first f launch's line came from the default watchdog at 180 s, in
+ * the middle of the play, with play_s=0). */
+unsigned pw_ms_wine_watchdog_s(void) { return pinball_plan() ? F_PLAY_S + 60 : 0; }
 
 const char *pw_ms_select(const char *name)
 {
@@ -1585,9 +1731,10 @@ void pw_ms_wine_begin(void)
 {
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
-    if (plan->lines == d4_lines || plan->lines == d_lines) {
+    if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines) {
         pthread_t thread;
-        if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : d_script, NULL))
+        if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : plan->lines == d_lines ? d_script
+                            : f_script, NULL))
             pthread_detach(thread);
     }
 }
@@ -1654,6 +1801,27 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, line, (unsigned long long)vk.presents, vk.width,
                  vk.height, removed || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none", release_state,
                  (unsigned long long)gdi_dropped, counted);
+    } else if (plan->lines == f_lines) {
+        /* Pinball: the translator's counters, the frames (all, and the play's
+         * rate), the pad. native_caps comes with f4. */
+        uint64_t wow[PW_WOW_STAT_COUNT];
+        const char *counted = wow_stats(wow);
+        double play_s = f_play_ns / 1e9;
+        save_last_drawn();
+        pthread_mutex_lock(&present_lock);
+        snprintf(fields, sizeof(fields), "exit=%s cpu=%s wow_stats=%s faults_unresolved=%llu faults_guest=%llu "
+                 "faults_marked=%llu faults_host=%llu faults_smc=%llu dbt_errors=%llu frames=%llu fps=%.1f "
+                 "play_s=%.0f inputs=%d keys=%d refused=%d pad=%s pad_reads=%d end=%s preset=%s fb=%s frame=%ux%u "
+                 "present_ms=%.1f native_caps=-", exit_text,
+                 strcmp(counted, "ok") ? counted : wow[PW_WOW_STAT_THREADS] ? "translator" : "none", counted,
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_GUEST],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_MARKED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_HOST],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_SMC], (unsigned long long)wow[PW_WOW_STAT_DBT_ERRORS],
+                 (unsigned long long)frames, play_s > 0 ? f_frames_play / play_s : 0.0, play_s, d_inputs, f_keys,
+                 d4_refused, d_pad == 1 ? "ok" : d_pad == 0 ? "none" : "-", d_pad_reads, d_end, f_preset_from,
+                 fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", frame_width, frame_height,
+                 present_n ? present_sum_ns / (double)present_n / 1e6 : 0.0);
+        pthread_mutex_unlock(&present_lock);
     } else if (plan->lines == f1_lines) {
         /* wow32.exe: the translator's counters, HELLO32/HELLO32S's checks,
          * then GDI32's picture with the sink's counts. cpu=translator once a
@@ -1870,6 +2038,21 @@ static void f1_lines(void)
     snprintf(head, sizeof(head), "PS4WINE f2 gdi32 win32u=%s",
              strcmp(pixel, "-") && strcmp(pixel, "crash") && strcmp(pixel, "hang") ? "ok" : "fail");
     emit_line(head, f2_keys, sizeof(f2_keys) / sizeof(f2_keys[0]));
+}
+
+/* Milestone f's own line: Pinball on the translator. */
+static void f_lines(void)
+{
+    enum { WOW, DISPLAY, PINBALL };
+    static const LineKey keys[] = {
+        { "cpu", PINBALL }, { "frames", PINBALL }, { "fps", PINBALL }, { "faults_unresolved", PINBALL },
+        { "native_caps", PINBALL }, { "play_s", PINBALL }, { "inputs", PINBALL }, { "keys", PINBALL },
+        { "pad", PINBALL }, { "end", PINBALL }, { "preset", PINBALL }, { "faults_guest", PINBALL },
+        { "faults_marked", PINBALL }, { "faults_host", PINBALL }, { "faults_smc", PINBALL },
+        { "dbt_errors", PINBALL }, { "refused", PINBALL }, { "present_ms", PINBALL }, { "fb", PINBALL },
+        { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY }, { "exit", PINBALL },
+    };
+    emit_line("PS4WINE f pinball", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void pw_ms_emit_lines(void)

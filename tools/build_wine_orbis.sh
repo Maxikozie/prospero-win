@@ -396,14 +396,18 @@ esac
 case " $modules " in *" win32u "*)
     # Its ntdll imports are loader imports of ntdll.prx (see link_prx).
     [ -f "$prx/ntdll.shared.elf" ] || fail "win32u imports from ntdll: build ntdll in the same run"
-    desc win32u __wine_unix_lib_init
+    # pw_wine_setenv: ntdll's loader replays Wine's environment into a module
+    # that exports it, and win32u's user driver reads WINE_PS5_DESKTOP and
+    # WINE_PS5_VIEW there (measured in f: without it the plan's 960x540 was
+    # never seen and the desktop stayed 800x600).
+    desc win32u __wine_unix_lib_init pw_wine_setenv
     # win32u opens and maps font files itself (freetype.c unix_face_create,
     # map_font_file) by .../dosdevices/c:/... names, so it links its own copy
     # of the working-directory emulation too (measured in d2: with the
     # listing fixed, all 13 fonts reached unix_face_create and none loaded).
     # shellcheck disable=SC2086
     link_prx win32u dlls/win32u/win32u.so "-u opendir $prx/obj/win32u_desc.o $obj/pw_wine_cwd.o $obj/pw_wine_cwd_libc.o \
-        $exit_wraps $import_wraps $cwd_wraps" ntdll
+        $obj/pw_wine_env_orbis.o $exit_wraps $import_wraps $cwd_wraps" ntdll
     # FreeType, which win32u loads by name, with its own static libc; the
     # exit and stdio wraps are ntdll's (it may not exit, its stderr reaches
     # the title). It opens font files with its own fopen, by the names

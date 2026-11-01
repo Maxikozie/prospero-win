@@ -20,6 +20,9 @@
  *   f1  wowprospero.prx's slots, the address space below 4 GiB, the display,
  *       wow32.exe (32-bit, on the translator: checks, then gdi64's picture)
  *       -> PS4WINE f1 hello32 cpu=translator ... and PS4WINE f2 gdi32 ...
+ *   f   wowprospero.prx's slots, the display, Space Cadet Pinball (C:\Pinball)
+ *       on a 960x540 desktop, played with the DS4 until the touchpad is held
+ *       -> PS4WINE f pinball cpu=translator frames=N fps=N faults_unresolved=N ...
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
@@ -73,6 +76,8 @@ void pw_ms_set_input(int (*post)(const void *event));
 int pw_ms_release_display(void *context);
 /* The title's main loop: performs a release asked for from another thread. */
 void pw_ms_service(void);
+/* The Wine stage's watchdog in seconds, 0 for the title's default. */
+unsigned pw_ms_wine_watchdog_s(void);
 /* Each line the Wine program writes to stdout. */
 void pw_ms_stdout(const char *line);
 /* The plan's defaults for Wine's environment (RADV's variables in the e

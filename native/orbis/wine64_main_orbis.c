@@ -589,8 +589,10 @@ int main(int argc, char **argv)
         }
         pw_diagnostics_tick(now);
         pw_ms_service();
-        if (!reported && now - hello_ns > (uint64_t)PW_WATCHDOG_S * 1000000000ull) {
-            LOG("PW_WINE64 watchdog: no exit after %d s", PW_WATCHDOG_S);
+        /* A plan that plays (f: Pinball until the touchpad is held) sets its own limit. */
+        unsigned watchdog_s = pw_ms_wine_watchdog_s() ? pw_ms_wine_watchdog_s() : PW_WATCHDOG_S;
+        if (!reported && now - hello_ns > (uint64_t)watchdog_s * 1000000000ull) {
+            LOG("PW_WINE64 watchdog: no exit after %u s", watchdog_s);
             report("timeout", "watchdog");
         }
         usleep(20000);
