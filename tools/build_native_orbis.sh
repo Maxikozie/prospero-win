@@ -92,7 +92,7 @@ if llvm-objdump -d "$out"/obj/*.o | grep -qw syscall; then fail "a raw syscall i
 ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
     $objects -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
     -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ -lSceNet -lSceSystemService -lSceUserService \
-    -lSceVideoOut -lScePad \
+    -lSceVideoOut -lScePad -lSceAudioOut \
     "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" ||
     fail "the title does not link"
 # libc.a has setjmp/longjmp/siglongjmp but no sigsetjmp: a sigsetjmp would bind to libkernel's

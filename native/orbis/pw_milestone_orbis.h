@@ -88,6 +88,11 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
 /* ntdll's flush sink (pw_wine_set_flush_sink, patch 0490): what the user
  * driver's next present changed, for phase p's measurements. */
 void pw_ms_flush(void *context, uint32_t dirty_px, uint32_t screen_px, uint32_t composed);
+/* ntdll's audio sink (pw_wine_set_audio_sink): one 256-frame S16 stereo
+ * grain to the title's sceAudioOut port, blocking (phase p5). */
+int pw_ms_audio(void *context, const int16_t *frames);
+/* Whether the plan plays audio and its port is open: set the sink only then. */
+int pw_ms_audio_wanted(void);
 /* ntdll's pw_wine_post_input, for the scripted input of d4. */
 void pw_ms_set_input(int (*post)(const void *event));
 /* ntdll's display release (pw_wine_set_display_release): closes the

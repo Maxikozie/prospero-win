@@ -540,6 +540,14 @@ int main(int argc, char **argv)
                 post_input != NULL, set_release != NULL, set_flush != NULL);
             if (set_present) set_present(pw_ms_present, NULL);
             if (set_flush) set_flush(pw_ms_flush, NULL);
+            {
+                /* Phase p5: Wine's audio driver plays into the title's port. */
+                void (*set_audio)(int (*)(void *, const int16_t *), void *) =
+                    (void (*)(int (*)(void *, const int16_t *), void *))(uintptr_t)
+                        pw_prx_lookup(start.descriptor, "pw_wine_set_audio_sink");
+                LOG("PW_WINE64 audio_sink=%d wanted=%d", set_audio != NULL, pw_ms_audio_wanted());
+                if (set_audio && pw_ms_audio_wanted()) set_audio(pw_ms_audio, NULL);
+            }
             if (set_release) set_release(pw_ms_release_display, NULL);
             pw_ms_set_input(post_input);
         }

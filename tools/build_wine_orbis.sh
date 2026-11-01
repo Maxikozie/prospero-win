@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u wowprospero wow64native${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
+modules="ntdll wineserver win32u wowprospero wow64native wineps5${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -493,6 +493,31 @@ case " $modules " in *" wowprospero "*)
     # shellcheck disable=SC2086
     link_prx wowprospero - "$prx/obj/wowprospero_desc.o $wow_objects $obj/pw_emutls_orbis.o $obj/pw_wine_env_orbis.o \
         $exit_wraps $import_wraps" ntdll
+    ;;
+esac
+case " $modules " in *" wineps5 "*)
+    # The audio driver (wine/wineps5, phase p5): mmdevapi loads its unix
+    # library by the name patch 0120 gives the console's driver ("ps5":
+    # wineps5.so, a PRX here), and it mixes every stream into one 256-frame
+    # grain for the title's audio sink, which ntdll exports
+    # (pw_wine_audio_output). The PS5 recipe (tools/build_wine_ps5.sh): its
+    # unix.c and the platform-free mixer. mmdevapi's IDL headers first.
+    [ -f "$prx/ntdll.shared.elf" ] || fail "wineps5 imports from ntdll: build ntdll in the same run"
+    make -C "$build" include/audioclient.h include/mmdeviceapi.h include/devicetopology.h \
+        include/propsys.h include/propidl.h include/objidl.h include/objidlbase.h \
+        include/unknwn.h include/wtypes.h include/oaidl.h >> "$work/make.log" 2>&1 ||
+        fail "cannot generate mmdevapi's headers; see $work/make.log"
+    mkdir -p "$obj/wineps5"
+    audio_objects=
+    for unit in wine/wineps5/unix.c src/pw_audio_mix.c; do
+        "$cc" -std=gnu11 -O2 -Wall -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT -I"$build/include" -I"$tree/include" \
+            -I"$tree/dlls/mmdevapi" -I"$root/wine/ps5" -I"$root/src" -I"$root/include" -c "$root/$unit" \
+            -o "$obj/wineps5/$(basename "${unit%.c}").o" || fail "cannot compile $unit"
+        audio_objects="$audio_objects $obj/wineps5/$(basename "${unit%.c}").o"
+    done
+    desc wineps5 __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    # shellcheck disable=SC2086
+    link_prx wineps5 - "$prx/obj/wineps5_desc.o $audio_objects $exit_wraps $import_wraps" ntdll
     ;;
 esac
 case " $modules " in *" wow64native "*)

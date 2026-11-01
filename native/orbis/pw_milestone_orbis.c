@@ -79,6 +79,7 @@ enum { P_PATH_SCALE, P_PATH_VO720, P_PATH_VO1080 };
 static const char *const p_path_names[] = { "scale", "vo720", "vo1080" };
 static int bench_plan, p_path, p_async;
 static int native_plan(void);   /* p2: 32-bit code on the hardware WoW64 backend */
+static void p5_lines(void);
 static void pause_ms(unsigned ms);
 
 /* ---- the progress file, through stdio ----------------------------------- */
@@ -1518,6 +1519,123 @@ done:
     step("p2 native probe: %s", fields);
 }
 
+/* ---- phase p5: the title's audio port, the sink of Wine's audio driver ---------------- */
+
+/* One sceAudioOut port for the process, opened once and never closed (a
+ * process gets one output stream; close and reopen is disputed:
+ * orbis-porting-kit services/audio/orbis_audio.h), 48 kHz S16 stereo in
+ * 256-frame grains, the volume set after Open (the port can open silent).
+ * The SYSTEM user 0xFF: milestone a's probe opened with the initial user and
+ * got 0x809b0001 (klog: sceMbusAddHandleByUserId); every reference opens
+ * with 0xFF. The initial user is tried only if 0xFF fails, for the record.
+ * sceAudioOutOutput blocks until the port has room: the port is the clock,
+ * and the sink runs on the driver's mixer thread (wine/wineps5). */
+extern int32_t sceAudioOutInit(void);
+extern int32_t sceAudioOutOpen(int32_t user, int32_t type, int32_t index, uint32_t grain, uint32_t rate,
+                               uint32_t format);
+extern int32_t sceAudioOutSetVolume(int32_t handle, int32_t flags, const int32_t *volumes);
+extern int32_t sceAudioOutOutput(int32_t handle, const void *frames);
+extern int32_t sceUserServiceInitialize(const void *parameters);
+extern int32_t sceUserServiceGetInitialUser(int32_t *user);
+enum { AUDIO_USER_SYSTEM = 0xff, AUDIO_PORT_MAIN = 0, AUDIO_GRAIN = 256, AUDIO_RATE = 48000,
+       AUDIO_S16_STEREO = 1, AUDIO_VOLUME_FL_FR = 3, AUDIO_VOLUME_0DB = 0x8000,
+       AUDIO_GRAIN_NS = AUDIO_GRAIN * 1000000000ull / AUDIO_RATE };
+static int p_audio = -1;              /* PS4WINE_AUDIO: 1 on, 0 off (p5: on) */
+static int32_t audio_handle = -1;
+static volatile uint64_t audio_grains, audio_nonzero, audio_errors, audio_underruns, audio_gap_max_ns;
+static uint64_t audio_last_ns;
+
+/* A gap between two grains longer than two grains, but shorter than a
+ * second, is a grain the port did not get in time (an underrun); the mixer
+ * also stops when no stream plays, and those pauses are longer. */
+int pw_ms_audio(void *context, const int16_t *frames)
+{
+    uint64_t now = cfg.now_ns();
+    int nonzero = 0, rc;
+
+    (void)context;
+    if (audio_handle < 0) return -1;
+    if (audio_last_ns) {
+        uint64_t gap = now - audio_last_ns;
+        if (gap > 2 * AUDIO_GRAIN_NS && gap < 1000000000ull) audio_underruns++;
+        if (gap < 1000000000ull && gap > audio_gap_max_ns) audio_gap_max_ns = gap;
+    }
+    for (unsigned i = 0; i < 2 * AUDIO_GRAIN && !nonzero; i++) nonzero = frames[i] != 0;
+    rc = sceAudioOutOutput(audio_handle, frames);
+    audio_last_ns = cfg.now_ns();
+    if (rc < 0) {
+        audio_errors++;
+        return -1;
+    }
+    audio_grains++;
+    audio_nonzero += nonzero;
+    return 0;
+}
+
+int pw_ms_audio_wanted(void) { return p_audio == 1 && audio_handle >= 0; }
+
+static void stage_audio(char *fields, size_t size)
+{
+    int32_t volumes[8], user = -1, rc_init, rc_vol;
+    int32_t h;
+
+    if (p_audio != 1) {
+        snprintf(fields, size, "audio=off");
+        return;
+    }
+    rc_init = sceAudioOutInit();
+    h = sceAudioOutOpen(AUDIO_USER_SYSTEM, AUDIO_PORT_MAIN, 0, AUDIO_GRAIN, AUDIO_RATE, AUDIO_S16_STEREO);
+    if (h < 0) {
+        int32_t h2;
+        sceUserServiceInitialize(NULL);
+        sceUserServiceGetInitialUser(&user);
+        h2 = sceAudioOutOpen(user, AUDIO_PORT_MAIN, 0, AUDIO_GRAIN, AUDIO_RATE, AUDIO_S16_STEREO);
+        snprintf(fields, size, "audio=on audio_open=err:0x%x audio_user=system audio_init=0x%x "
+                 "audio_initial_user=%s0x%x", (unsigned)h, (unsigned)rc_init, h2 < 0 ? "err:" : "ok:",
+                 (unsigned)(h2 < 0 ? h2 : user));
+        if (h2 >= 0) audio_handle = h2;
+        return;
+    }
+    for (int i = 0; i < 8; i++) volumes[i] = AUDIO_VOLUME_0DB;
+    rc_vol = sceAudioOutSetVolume(h, AUDIO_VOLUME_FL_FR, volumes);
+    audio_handle = h;
+    step("p5 audio port open handle=0x%x (SYSTEM user 0xff) init=0x%x volume=0x%x", (unsigned)h,
+         (unsigned)rc_init, (unsigned)rc_vol);
+    snprintf(fields, size, "audio=on audio_open=ok audio_user=system audio_handle=0x%x audio_init=0x%x "
+             "audio_volume=0x%x", (unsigned)h, (unsigned)rc_init, (unsigned)rc_vol);
+}
+
+/* After the segment: keys that make Pinball play its WAV effects (F2 a new
+ * game, the plunger held 1 s, the flippers), posted by the title; the pad
+ * is still off. About 12 s. */
+static int p_tail_keys;
+static double p_tail_s;
+static uint64_t p_tail_nonzero0;
+
+static void tail_key(uint32_t vk, unsigned hold_ms, unsigned after_ms)
+{
+    post(1, vk, 0, 0, 1);
+    pause_ms(hold_ms);
+    post(1, vk, 0, 0, 0);
+    p_tail_keys++;
+    pause_ms(after_ms);
+}
+
+static void p5_tail(void)
+{
+    uint64_t t0 = cfg.now_ns();
+    p_tail_nonzero0 = audio_nonzero;
+    step("p5 tail: F2, the plunger, the flippers (title-injected keys, the pad unused)");
+    tail_key(0x71 /* F2 */, 100, 2000);
+    tail_key(0x20 /* space: the plunger */, 1000, 2500);
+    for (int i = 0; i < 3; i++) {
+        tail_key(0x5a /* Z: left flipper */, 200, 500);
+        tail_key(0xbf /* '/': right flipper */, 200, 500);
+    }
+    pause_ms(2500);
+    p_tail_s = (cfg.now_ns() - t0) / 1e9;
+}
+
 /* ---- phase p: the benchmark segment ------------------------------------------------ */
 
 /* Pinball as plan f has it, but no pad bindings until the segment is over:
@@ -1532,7 +1650,7 @@ enum { P_WARM_S = 20, P_SEG_S = 60, P_FIRST_WAIT_S = 600, P_STICK_DEAD = 40, P_T
 static int p_inputs, p_inputs_warm, p_pad_reads;
 static const char *p_end = "-";
 static double p_first_s = -1.0, p_seg_s;
-static char p_bench[1400];   /* p_bench_fields, for the p line */
+static char p_bench[1700];   /* p_bench_fields, for the p line */
 static PwHist p_snap[7];
 static int shown_rc0 = -1;
 static int64_t p_snap_shown = -1;           /* flips the display completed in the segment; -1 unknown */
@@ -1641,6 +1759,7 @@ static void *p_script(void *arg)
     }
     pthread_mutex_unlock(&present_lock);
     p_end = "segment";
+    if (plan->lines == p5_lines) p5_tail();
     /* The histograms for plots, in records of bounded size. */
     {
         static const char *const names[7] = { "guest", "copy", "keep", "flip", "frame", "present", "guest_cpu" };
@@ -1705,12 +1824,19 @@ static void p_bench_fields(char *out, size_t size)
             snprintf(shown, sizeof(shown), "-");
             snprintf(shown_hz, sizeof(shown_hz), "-");
         }
-        snprintf(out + n, size - n, " present_path=%s present_mode=%s buffers=%u shown=%s shown_hz=%s "
+        n += (size_t)snprintf(out + n, size - n, " present_path=%s present_mode=%s buffers=%u shown=%s shown_hz=%s "
                  "slot_waits=%llu flip_errors=%llu slot_timeouts=%llu status_errors=%llu", p_path_names[p_path],
                  p_async ? "async" : "sync", video.mode.buffers, shown, shown_hz,
                  (unsigned long long)p_snap_slot_waits, (unsigned long long)video.flip_errors,
                  (unsigned long long)video.slot_timeouts, (unsigned long long)video.status_errors);
     }
+    if (n < size && p_audio >= 0)
+        snprintf(out + n, size - n, " audio_driver=ps5 grains=%llu grains_nonzero=%llu grains_tail=%llu underruns=%llu "
+                 "gap_max_us=%llu audio_errors=%llu tail_keys=%d tail_s=%.1f midi=untested",
+                 (unsigned long long)audio_grains, (unsigned long long)audio_nonzero,
+                 (unsigned long long)(audio_nonzero - p_tail_nonzero0), (unsigned long long)audio_underruns,
+                 (unsigned long long)(audio_gap_max_ns / 1000), (unsigned long long)audio_errors, p_tail_keys,
+                 p_tail_s);
 }
 
 /* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
@@ -2238,6 +2364,14 @@ static const PwMsStage p2_stages[] = {
     { "native_probe", 15, stage_native_probe, "probe_caps=fault" },
     { "pinball", 0, NULL, "exit=fault" },
 };
+/* p5: Wine's audio driver into the title's sceAudioOut port (stage audio),
+ * the benchmark on p4's path, then the scripted tail that plays sounds. */
+static const PwMsStage p5_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "audio", 15, stage_audio, "audio_open=fault" },
+    { "pinball", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -2254,6 +2388,7 @@ static const PwMsPlan plans[] = {
     /* p3, p4: the benchmark on another present path, after the HDMI test pattern. */
     { "p3", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p3_lines },
     { "p4", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p4_lines },
+    { "p5", p5_stages, sizeof(p5_stages) / sizeof(p5_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p5_lines },
 };
 
 static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
@@ -2261,7 +2396,7 @@ static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
 {
     return plan && (plan->lines == p1_lines || plan->lines == p2_lines || plan->lines == p3_lines ||
-                    plan->lines == p4_lines);
+                    plan->lines == p4_lines || plan->lines == p5_lines);
 }
 static int pinball_plan(void) { return plan && (plan->lines == f_lines || p_plan()); }
 static int native_plan(void) { return plan && plan->lines == p2_lines; }
@@ -2357,8 +2492,15 @@ void pw_ms_start(const PwMsConfig *config)
     if (bench_plan) {
         /* The plan's defaults (p3: vo720; p4: vo720 and async), then env.txt's. */
         char v[32];
-        p_path = plan->lines == p3_lines || plan->lines == p4_lines ? P_PATH_VO720 : P_PATH_SCALE;
-        p_async = plan->lines == p4_lines;
+        /* p5 runs on p4's path (p4 passed: vo720, async), as its rate gate assumes. */
+        p_path = plan->lines == p3_lines || plan->lines == p4_lines || plan->lines == p5_lines ? P_PATH_VO720
+                                                                                                : P_PATH_SCALE;
+        p_async = plan->lines == p4_lines || plan->lines == p5_lines;
+        if (plan->lines == p5_lines) {
+            p_audio = 1;
+            if (cfg.setting && cfg.setting("PS4WINE_AUDIO", v, sizeof(v)))
+                p_audio = !strcmp(v, "off") ? 0 : 1;
+        }
         if (cfg.setting && cfg.setting("PS4WINE_PRESENT_PATH", v, sizeof(v)))
             for (int i = 0; i < 3; i++)
                 if (!strcmp(v, p_path_names[i])) p_path = i;
@@ -2798,6 +2940,20 @@ static void p34_line(const char *head)
 }
 
 static void p3_lines(void) { p34_line("PS4WINE p3 bench pinball"); }
+
+/* p5: the audio stage's fields, then p1's (with the audio counters). */
+static void p5_lines(void)
+{
+    enum { WOW, DISPLAY, AUDIO, PINBALL };
+    static const LineKey keys[] = {
+        { "audio", AUDIO }, { "audio_open", AUDIO }, { "audio_user", AUDIO }, { "audio_handle", AUDIO },
+        { "audio_init", AUDIO }, { "audio_volume", AUDIO }, { "audio_initial_user", AUDIO },
+        { "cpu", PINBALL }, { "faults_unresolved", PINBALL }, { "frames", PINBALL }, { "pad", PINBALL },
+        { "fb", PINBALL }, { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY },
+        { "vo_size", DISPLAY }, { "vo_buffers", DISPLAY }, { "exit", PINBALL },
+    };
+    emit_line_with("PS4WINE p5 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
+}
 
 /* p2: the probe's fields, Wine's native caps (0883's export; "-" while the
  * Orbis ntdll has none), then p1's fields. */
