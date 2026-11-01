@@ -43,6 +43,14 @@ enum { PW_WINE_AUDIO_RATE=48000,PW_WINE_AUDIO_GRAIN=256 };
  * console's output clocks the caller. Returns the sink's result. */
 typedef int (*PwWineAudioSink)(void *context,const int16_t *frames);
 
+/* What the user driver's next present changed, told just before it on the
+ * same thread (patch 0490), for measurements (phase p): dirty_px is the
+ * area a surface flush changed, 0 for a present that is not a flush (the
+ * pointer moved, a window hidden); screen_px the desktop's area; composed 1
+ * when the driver copied the screen into a second frame to draw the pointer
+ * (or a view) over it. One flush is one present, not one game frame. */
+typedef void (*PwWineFlushSink)(void *context,uint32_t dirty_px,uint32_t screen_px,uint32_t composed);
+
 /* Hands the video output over to a Vulkan display-plane surface; 0 once
  * the title no longer uses it. */
 typedef int (*PwWineDisplayRelease)(void *context);
@@ -72,6 +80,8 @@ typedef struct PwWinePad {
 void pw_wine_set_present_sink(PwWinePresentSink sink,void *context);
 void pw_wine_set_audio_sink(PwWineAudioSink sink,void *context);
 void pw_wine_set_display_release(PwWineDisplayRelease release,void *context);
+/* Optional; NULL stops it. */
+void pw_wine_set_flush_sink(PwWineFlushSink sink,void *context);
 /* 0, or -1 when the queue is full or the event is invalid. */
 int pw_wine_post_input(const PwWineInput *event);
 void pw_wine_sink_stats(PwWineSinkStats *stats);
@@ -94,6 +104,9 @@ void pw_wine_set_menu(const struct pw_title_menu *menu);
 
 /* Driver side. -1 when no sink is set or the arguments are invalid. */
 int pw_wine_present(const void *bgra,uint32_t width,uint32_t height,uint32_t stride);
+/* Before each pw_wine_present (PwWineFlushSink); ignored without a flush
+ * sink. */
+void pw_wine_note_flush(uint32_t dirty_px,uint32_t screen_px,uint32_t composed);
 /* Asks the title to release the video output, once: 0 when it did (or has
  * nothing to release), else the title's refusal, and it may be asked again. */
 int pw_wine_release_display(void);

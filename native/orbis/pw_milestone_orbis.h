@@ -23,6 +23,10 @@
  *   f   wowprospero.prx's slots, the display, Space Cadet Pinball (C:\Pinball)
  *       on a 960x540 desktop, played with the DS4 until the touchpad is held
  *       -> PS4WINE f pinball cpu=translator frames=N fps=N faults_unresolved=N ...
+ *   p1  plan f's stages; Pinball's attract mode with the pad unused: 20 s
+ *       from the first present, then a 60 s segment measured per present
+ *       (phase p, docs/ps4/HANDOFF-p.md in ps4-wine); hand play after it
+ *       -> PS4WINE p1 bench pinball cpu=translator ... seg_s=60 inputs=0 presents=N guest_us_* ...
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
@@ -69,6 +73,9 @@ void pw_ms_emit_lines(void);
 /* The present sink for ntdll's pw_wine_set_present_sink: BGRA frames from
  * the user driver, shown on the title's VideoOut (d2). */
 int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t height, uint32_t stride);
+/* ntdll's flush sink (pw_wine_set_flush_sink, patch 0490): what the user
+ * driver's next present changed, for phase p's measurements. */
+void pw_ms_flush(void *context, uint32_t dirty_px, uint32_t screen_px, uint32_t composed);
 /* ntdll's pw_wine_post_input, for the scripted input of d4. */
 void pw_ms_set_input(int (*post)(const void *event));
 /* ntdll's display release (pw_wine_set_display_release): closes the

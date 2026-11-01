@@ -35,7 +35,11 @@
 #ifndef PW_ORBIS_NETLOG_PORT
 #define PW_ORBIS_NETLOG_PORT 18194
 #endif
-#define ORBISLOG_DATAGRAM 512
+/* klog keeps 512 bytes of a line; a datagram (the raw PS4WINE lines, the
+ * records) up to 2048: phase p's lines are about 1100 bytes, and the first
+ * p1 launch lost everything past 512. */
+#define ORBISLOG_KLOG_MAX 512
+#define ORBISLOG_DATAGRAM 2048
 
 /* libSceNet and libkernel, by prototype: the SDK's headers declare them
  * with types this file does not need. */
@@ -223,9 +227,9 @@ void ps5log_stats_get(ps5log_stats *out) { *out = g.stats; }
 
 void orbislog_klog(const char *line)
 {
-    char text[ORBISLOG_DATAGRAM + 2];
+    char text[ORBISLOG_KLOG_MAX + 2];
     size_t n = strlen(line);
-    if (n > ORBISLOG_DATAGRAM) n = ORBISLOG_DATAGRAM;
+    if (n > ORBISLOG_KLOG_MAX) n = ORBISLOG_KLOG_MAX;
     memcpy(text, line, n);
     if (!n || text[n - 1] != '\n') text[n++] = '\n';
     text[n] = 0;

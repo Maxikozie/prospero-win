@@ -1,0 +1,123 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: win32u: ps5 driver: tell ntdll what each present changed
+
+For the title's measurements (ps4-wine phase p): before each present the
+driver calls ntdll's pw_wine_note_flush, when it exists, with the area a
+surface flush changed (0 for a present that is not a flush: the pointer
+moved, a window hidden or a mode set), the desktop's area, and whether
+the frame was composed, i.e. the screen copied into a second buffer to
+draw the pointer or a view over it. One flush is one present, not one
+game frame: a game whose window flushes in several pieces presents
+several times a frame, and these numbers show it. Nothing changes when
+ntdll has no such export.
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -81,6 +81,9 @@
+ };
+ 
+ static int (*present_frame)( const void *bgra, UINT width, UINT height, UINT stride );
++/* Optional (ntdll's pw_wine_note_flush): what each present changed, told just
++ * before it, for the title's measurements. */
++static void (*note_flush)( UINT dirty_px, UINT screen_px, UINT composed );
+ static int (*next_input)( struct ps5_input *input );
+ static int (*input_fd)(void);
+ 
+@@ -170,8 +173,9 @@
+     return box;
+ }
+ 
+-/* screen_lock held */
+-static void present_screen(void)
++/* screen_lock held; dirty_px: the pixels a surface flush changed, 0 for a
++ * present that is not a flush (the pointer, a window hidden, a mode set) */
++static void present_screen( UINT dirty_px )
+ {
+     INT width, height, y;
+ 
+@@ -182,10 +186,13 @@
+     if ((!cursor_image || !frame) && width == (INT)screen_width && height == (INT)screen_height &&
+         !view.left && !view.top)
+     {
++        if (note_flush) note_flush( dirty_px, screen_width * screen_height, 0 );
+         present_frame( screen, screen_width, screen_height, screen_width * 4 );
+         return;
+     }
+     if (!frame) return;
++    /* composed: the view copied out of the screen and the pointer drawn over it */
++    if (note_flush) note_flush( dirty_px, screen_width * screen_height, 1 );
+     for (y = 0; y < height; y++)
+         memcpy( frame + y * width, screen + (view.top + y) * screen_width + view.left, width * 4 );
+     if (cursor_image) draw_cursor( frame, (POINT){view.left, view.top}, width, height );
+@@ -251,7 +258,7 @@
+             content_height = (UINT)((UINT64)height * screen_width / width);
+         }
+         TRACE( "mode %ux%u shown as %ux%u\n", width, height, content_width, content_height );
+-        present_screen();
++        present_screen( 0 );
+         pthread_mutex_unlock( &screen_lock );
+     }
+     return DISP_CHANGE_SUCCESSFUL;
+@@ -287,7 +294,7 @@
+                                   (target.left - window->visible.left) * 4;
+                 memcpy( screen + y * screen_width + target.left, src, (target.right - target.left) * 4 );
+             }
+-            present_screen();
++            present_screen( (target.right - target.left) * (target.bottom - target.top) );
+         }
+     }
+     pthread_mutex_unlock( &screen_lock );
+@@ -388,7 +395,7 @@
+         if (window->shown && (!shown || !EqualRect( &window->visible, &new_rects->visible )))
+         {
+             clear_screen_rect( &window->visible );
+-            present_screen();
++            present_screen( 0 );
+         }
+         /* a window just shown may have painted before it had this surface */
+         repaint = shown && !window->shown;
+@@ -409,7 +416,7 @@
+         if (window->shown)
+         {
+             clear_screen_rect( &window->visible );
+-            present_screen();
++            present_screen( 0 );
+         }
+         *window = windows[--window_count];
+     }
+@@ -535,7 +542,7 @@
+     if (cursor.x != pos.x || cursor.y != pos.y)
+     {
+         cursor = pos;
+-        if (cursor_image) present_screen();     /* the pointer moved on screen */
++        if (cursor_image) present_screen( 0 );     /* the pointer moved on screen */
+     }
+     pthread_mutex_unlock( &screen_lock );
+ }
+@@ -754,7 +761,7 @@
+     cursor_height = height;
+     cursor_box = box;
+     if (image) cursor_hotspot = (POINT){info.xHotspot, info.yHotspot};
+-    if (old || image) present_screen();
++    if (old || image) present_screen( 0 );
+     pthread_mutex_unlock( &screen_lock );
+     free( old );
+     TRACE( "cursor %p: %ux%u\n", handle, width, height );
+@@ -795,7 +802,7 @@
+     pthread_mutex_lock( &screen_lock );
+     cursor.x = x;
+     cursor.y = y;
+-    if (cursor_image) present_screen();
++    if (cursor_image) present_screen( 0 );
+     pthread_mutex_unlock( &screen_lock );
+     return TRUE;
+ }
+@@ -985,6 +992,7 @@
+         return;
+     }
+     present_frame = dlsym( RTLD_DEFAULT, "pw_wine_present" );
++    note_flush = dlsym( RTLD_DEFAULT, "pw_wine_note_flush" );
+     next_input = dlsym( RTLD_DEFAULT, "pw_wine_next_input" );
+     input_fd = dlsym( RTLD_DEFAULT, "pw_wine_input_fd" );
+ #ifdef SONAME_LIBVULKAN

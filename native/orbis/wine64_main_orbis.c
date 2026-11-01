@@ -96,7 +96,7 @@ static uint64_t now_ns_hook(void) { return now_ns(); }
 /* A record that must arrive: the kernel log, the UDP log and the diagnostics log. */
 static void emit_line(const char *line)
 {
-    char datagram[1500];
+    char datagram[2100];   /* the p lines run past 1000 bytes (klog keeps 512 of them) */
     orbislog_klog(line);
     snprintf(datagram, sizeof(datagram), "%s\n", line);
     ps5log_raw(datagram, strlen(datagram));
@@ -532,9 +532,14 @@ int main(int argc, char **argv)
             /* win32u's Vulkan driver asks for the display before its first surface (patch 0461). */
             void (*set_release)(int (*)(void *), void *) =
                 (void (*)(int (*)(void *), void *))(uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_display_release");
-            LOG("PW_WINE64 present_sink=%d post_input=%d display_release=%d", set_present != NULL, post_input != NULL,
-                set_release != NULL);
+            /* What each present changed (patch 0490), for phase p's measurements. */
+            void (*set_flush)(void (*)(void *, uint32_t, uint32_t, uint32_t), void *) =
+                (void (*)(void (*)(void *, uint32_t, uint32_t, uint32_t), void *))(uintptr_t)
+                    pw_prx_lookup(start.descriptor, "pw_wine_set_flush_sink");
+            LOG("PW_WINE64 present_sink=%d post_input=%d display_release=%d flush_sink=%d", set_present != NULL,
+                post_input != NULL, set_release != NULL, set_flush != NULL);
             if (set_present) set_present(pw_ms_present, NULL);
+            if (set_flush) set_flush(pw_ms_flush, NULL);
             if (set_release) set_release(pw_ms_release_display, NULL);
             pw_ms_set_input(post_input);
         }

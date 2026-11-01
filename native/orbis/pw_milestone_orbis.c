@@ -9,6 +9,7 @@
 #include "pw_wine_display.h"
 #include "pw_wine_exit_orbis.h"
 #include "../../wine/wowprospero/wow_stats.h"
+#include "pw_hist.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -672,6 +674,68 @@ static uint32_t present_scale, present_x0, present_y0;   /* desktop -> 1920x1080
 static int fb_saved = -1;      /* -1 not yet, 0 saved, else failed */
 static uint64_t gdi_dropped;   /* frames the driver sent after the display was handed over */
 
+/* Phase p's measurements (docs/ps4/HANDOFF-p.md in ps4-wine), per present
+ * while bench_on, under present_lock. guest: the previous present's exit to
+ * this one's entry (translated code, Wine, the guest's own waits); copy: the
+ * swizzle and scale; keep: the last_drawn copy; flip: the flip call; frame:
+ * entry to entry; present: entry to exit (with the lock wait). guest_cpu:
+ * the presenting thread's CPU time over the guest window (getrusage
+ * RUSAGE_THREAD from libkernel; orbis-compat answers every CPU-time
+ * clock_gettime id with the monotonic clock, so that would be wall time). */
+static int bench_plan;                 /* the timestamps and CPU reads run in the p plans only */
+static int bench_on;
+static PwHist hist_guest, hist_copy, hist_keep, hist_flip, hist_frame, hist_present, hist_guest_cpu;
+static uint64_t bench_presents, bench_noted, bench_flushes, bench_full, bench_composed;
+static uint64_t bench_dirty_sum, bench_dirty_max;
+static uint64_t prev_enter_ns, prev_exit_ns, prev_exit_cpu_us;
+static pthread_t prev_thread;
+static int prev_valid, thread_cpu_errno = -1;   /* -1: not read yet, 0 ok, else getrusage's errno */
+static uint64_t thread_cpu_other;      /* samples skipped: a different thread presented */
+/* The driver's note for the next present (pw_ms_flush), consumed by it. */
+static int note_pending;
+static uint32_t note_dirty, note_screen, note_composed;
+
+/* The calling thread's user + system time in us; 0 and the errno kept on failure. */
+static uint64_t thread_cpu_us(void)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_THREAD, &ru)) {
+        thread_cpu_errno = errno ? errno : -2;
+        return 0;
+    }
+    if (thread_cpu_errno == -1) thread_cpu_errno = 0;
+    return (uint64_t)ru.ru_utime.tv_sec * 1000000ull + (uint64_t)ru.ru_utime.tv_usec +
+           (uint64_t)ru.ru_stime.tv_sec * 1000000ull + (uint64_t)ru.ru_stime.tv_usec;
+}
+
+/* present_lock held */
+static void bench_reset(void)
+{
+    pw_hist_reset(&hist_guest);
+    pw_hist_reset(&hist_copy);
+    pw_hist_reset(&hist_keep);
+    pw_hist_reset(&hist_flip);
+    pw_hist_reset(&hist_frame);
+    pw_hist_reset(&hist_present);
+    pw_hist_reset(&hist_guest_cpu);
+    bench_presents = bench_noted = bench_flushes = bench_full = bench_composed = 0;
+    bench_dirty_sum = bench_dirty_max = 0;
+    thread_cpu_other = 0;
+}
+
+/* ntdll's flush sink (pw_wine_set_flush_sink, patch 0490): what the next
+ * present changed, told by the driver just before it on the same thread. */
+void pw_ms_flush(void *context, uint32_t dirty_px, uint32_t screen_px, uint32_t composed)
+{
+    (void)context;
+    pthread_mutex_lock(&present_lock);
+    note_pending = 1;
+    note_dirty = dirty_px;
+    note_screen = screen_px;
+    note_composed = composed;
+    pthread_mutex_unlock(&present_lock);
+}
+
 /* BGRA from the driver, integer-scaled and centred on the 1920x1080
  * buffer as R,G,B,A. The last frame with any pixel drawn is copied aside
  * and saved as the framebuffer readback when the program ends: the driver
@@ -681,7 +745,7 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
 {
     const uint32_t W = PW_VIDEOOUT_ORBIS_WIDTH, H = PW_VIDEOOUT_ORBIS_HEIGHT;
     uint32_t scale, x0, y0, *dst;
-    uint64_t t0 = cfg.now_ns(), pending = input_pending_ns;
+    uint64_t t0 = cfg.now_ns(), pending = input_pending_ns, cpu0 = 0, t_copy0, t_copy1, t_flip1, t_keep0, t_keep1;
     int any = 0;
 
     (void)context;
@@ -689,9 +753,11 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     pthread_mutex_lock(&present_lock);
     if (!video_open) {
         gdi_dropped++;
+        note_pending = 0;
         pthread_mutex_unlock(&present_lock);
         return -1;
     }
+    if (bench_plan) cpu0 = thread_cpu_us();
     if (pending) {
         uint64_t lat = t0 - pending;
         input_pending_ns = 0;
@@ -706,6 +772,7 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     present_scale = scale;
     present_x0 = x0;
     present_y0 = y0;
+    t_copy0 = cfg.now_ns();
     dst = pw_videoout_orbis_back(&video);
     /* The border around the desktop: once per buffer and frame size, not every frame (8 MB). */
     if (cleared[video.back][0] != width || cleared[video.back][1] != height) {
@@ -732,10 +799,13 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
                     dst[(size_t)(y0 + y * scale + dy) * W + x0 + x * scale + dx] = rgba;
         }
     }
+    t_copy1 = cfg.now_ns();
     pw_videoout_orbis_flip(&video);
+    t_flip1 = cfg.now_ns();
     frames++;
     frame_width = width;
     frame_height = height;
+    t_keep0 = t_keep1 = t_flip1;
     if (any) {
         drawn++;
         /* The source frame, not the 8 MB scan-out buffer: the readback is built from it when saved. */
@@ -743,9 +813,44 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
         if (last_drawn)
             for (uint32_t y = 0; y < height; y++)
                 memcpy(last_drawn + (size_t)y * width, (const uint8_t *)bgra + (size_t)y * stride, (size_t)width * 4);
+        t_keep1 = cfg.now_ns();
     }
+    if (bench_on) {
+        pthread_t self = pthread_self();
+        bench_presents++;
+        if (prev_valid) {
+            pw_hist_add(&hist_guest, (t0 - prev_exit_ns) / 1000);
+            pw_hist_add(&hist_frame, (t0 - prev_enter_ns) / 1000);
+            if (!pthread_equal(self, prev_thread)) thread_cpu_other++;
+            else if (cpu0 && prev_exit_cpu_us && cpu0 >= prev_exit_cpu_us) pw_hist_add(&hist_guest_cpu, cpu0 - prev_exit_cpu_us);
+        }
+        pw_hist_add(&hist_copy, (t_copy1 - t_copy0) / 1000);
+        pw_hist_add(&hist_flip, (t_flip1 - t_copy1) / 1000);
+        if (any) pw_hist_add(&hist_keep, (t_keep1 - t_keep0) / 1000);
+        if (note_pending) {
+            bench_noted++;
+            if (note_dirty) {
+                bench_flushes++;
+                bench_dirty_sum += note_dirty;
+                if (note_dirty > bench_dirty_max) bench_dirty_max = note_dirty;
+                if (note_dirty >= note_screen) bench_full++;
+            }
+            if (note_composed) bench_composed++;
+        }
+    }
+    note_pending = 0;
     present_n++;
-    present_sum_ns += cfg.now_ns() - t0;
+    if (bench_plan) {
+        prev_exit_cpu_us = thread_cpu_us();
+        prev_thread = pthread_self();
+        prev_enter_ns = t0;
+        prev_exit_ns = cfg.now_ns();
+        prev_valid = 1;
+        if (bench_on) pw_hist_add(&hist_present, (prev_exit_ns - t0) / 1000);
+        present_sum_ns += prev_exit_ns - t0;
+    } else {
+        present_sum_ns += cfg.now_ns() - t0;
+    }
     pthread_mutex_unlock(&present_lock);
     return 0;
 }
@@ -999,23 +1104,24 @@ static int f_bindings(PwGameInput *input)
     return pw_game_input_parse((const uint8_t *)f_preset, sizeof(f_preset) - 1, input) == PW_OK ? 0 : -1;
 }
 
-/* d's loop with key bindings: each binding's button edge becomes a key or
- * a mouse button of the user driver's input queue; a record a second. */
-static void *f_script(void *arg)
+/* d's loop with key bindings on an open pad: each binding's button edge
+ * becomes a key or a mouse button of the user driver's input queue; a
+ * record a second; until the touchpad is held or F_PLAY_S pass. Sets
+ * d_end, f_play_ns and f_frames_play. */
+static void f_play(const PwPadOrbis *pad_in)
 {
     PwGameInput input;
-    PwPadOrbis pad;
+    PwPadOrbis pad = *pad_in;
     PwPadOrbisState state;
     PwWinePointer pointer = { 0, 0 };
     uint32_t held = 0;
     uint64_t last, started = cfg.now_ns(), until, next_report, touch_since = 0, frames0;
-    (void)arg;
 
     if (f_bindings(&input)) step("f: the built-in bindings do not parse");
     pthread_mutex_lock(&present_lock);
     frames0 = frames;
     pthread_mutex_unlock(&present_lock);
-    if ((d_pad = pw_pad_orbis_open(&pad) == 0)) {
+    {
         step("f pad open user=0x%x handle=%d preset=%s: L1/R1 flippers, cross plunger, d-pad nudges, square new "
              "game, options pause, circle enter; hold the touchpad %d s to end", (unsigned)pad.user, pad.handle,
              f_preset_from, F_END_HOLD_S);
@@ -1069,16 +1175,191 @@ static void *f_script(void *arg)
         for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
             if ((held & pw_game_button_mask(i)) && input.bindings[i].kind == PW_GAME_BIND_KEY)
                 post(1, input.bindings[i].code, 0, 0, 0);
-    } else {
-        step("f pad open failed: %s 0x%x", pad.failed, (unsigned)pad.status);
-        d_end = "nopad";
     }
     f_play_ns = cfg.now_ns() - started;
     pthread_mutex_lock(&present_lock);
     f_frames_play = frames - frames0;
     pthread_mutex_unlock(&present_lock);
+}
+
+static void *f_script(void *arg)
+{
+    PwPadOrbis pad;
+    (void)arg;
+
+    if ((d_pad = pw_pad_orbis_open(&pad) == 0)) {
+        f_play(&pad);
+    } else {
+        step("f pad open failed: %s 0x%x", pad.failed, (unsigned)pad.status);
+        d_end = "nopad";
+    }
     pw_ms_wine_end("running", "", -1);
     return NULL;
+}
+
+/* ---- phase p: the benchmark segment ------------------------------------------------ */
+
+/* Pinball as plan f has it, but no pad bindings until the segment is over:
+ * P_WARM_S from the first present (the first frame the driver sends after
+ * Wine starts), then P_SEG_S of attract mode with the measurements on
+ * (bench_on). The pad is read throughout and every event counted, not
+ * delivered: a touched pad shows as inputs>0 and fails the run instead of
+ * skewing it. The line goes out at the end of the segment; then the
+ * bindings come on and the user may play (f_play), recorded as a PW_MS play
+ * record, never compared. The same W and N every run. */
+enum { P_WARM_S = 20, P_SEG_S = 60, P_FIRST_WAIT_S = 600, P_STICK_DEAD = 40, P_TRIGGER_DEAD = 64 };
+static int p_inputs, p_inputs_warm, p_pad_reads;
+static const char *p_end = "-";
+static double p_first_s = -1.0, p_seg_s;
+static char p_bench[1024];   /* p_bench_fields, for the p line */
+static PwHist p_snap[7];
+static uint64_t p_snap_presents, p_snap_noted, p_snap_flushes, p_snap_full, p_snap_composed, p_snap_dirty_sum,
+    p_snap_dirty_max, p_snap_cpu_other;
+
+/* Pad events since the previous state: button edges, and a stick or a
+ * trigger leaving its dead zone. */
+static int pad_events(const PwPadOrbisState *now, const PwPadOrbisState *before)
+{
+    int n = __builtin_popcount(now->buttons ^ before->buttons);
+    const uint8_t a[4] = { now->left_x, now->left_y, now->right_x, now->right_y };
+    const uint8_t b[4] = { before->left_x, before->left_y, before->right_x, before->right_y };
+    for (int i = 0; i < 4; i++) {
+        int out_now = abs((int)a[i] - 128) > P_STICK_DEAD, out_before = abs((int)b[i] - 128) > P_STICK_DEAD;
+        n += out_now && !out_before;
+    }
+    n += (now->l2 > P_TRIGGER_DEAD) && !(before->l2 > P_TRIGGER_DEAD);
+    n += (now->r2 > P_TRIGGER_DEAD) && !(before->r2 > P_TRIGGER_DEAD);
+    return n;
+}
+
+/* Reads the pad until the time given, counting events into *count. */
+static void pad_watch(const PwPadOrbis *pad, int have_pad, PwPadOrbisState *last, uint64_t until, int *count,
+                      const char *what, uint64_t since)
+{
+    uint64_t next_report = cfg.now_ns();
+    for (; cfg.now_ns() < until; pause_ms(8)) {
+        PwPadOrbisState state;
+        uint64_t now = cfg.now_ns();
+        if (have_pad) {
+            memset(&state, 0, sizeof(state));
+            if (!pw_pad_orbis_read(pad, &state)) {
+                p_pad_reads++;
+                *count += pad_events(&state, last);
+                *last = state;
+            }
+        }
+        if (now >= next_report) {
+            pthread_mutex_lock(&present_lock);
+            step("p %s t=%llus presents=%llu inputs=%d", what, (unsigned long long)((now - since) / 1000000000ull),
+                 (unsigned long long)bench_presents, *count);
+            pthread_mutex_unlock(&present_lock);
+            next_report = now + 10000000000ull;
+        }
+    }
+}
+
+static void *p_script(void *arg)
+{
+    PwPadOrbis pad;
+    PwPadOrbisState last;
+    uint64_t begun = cfg.now_ns(), first, seg0;
+    int have_pad;
+    (void)arg;
+
+    memset(&last, 0, sizeof(last));
+    last.left_x = last.left_y = last.right_x = last.right_y = 128;
+    have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
+    if (!have_pad) step("p pad open failed: %s 0x%x (inputs cannot be counted)", pad.failed, (unsigned)pad.status);
+    else if (!pw_pad_orbis_read(&pad, &last)) p_pad_reads++;
+    for (;;) {
+        uint64_t n;
+        pthread_mutex_lock(&present_lock);
+        n = frames;
+        pthread_mutex_unlock(&present_lock);
+        if (n) break;
+        if (cfg.now_ns() - begun > (uint64_t)P_FIRST_WAIT_S * 1000000000ull) {
+            p_end = "nopresent";
+            pw_ms_wine_end("running", "", -1);
+            return NULL;
+        }
+        pause_ms(50);
+    }
+    first = cfg.now_ns();
+    p_first_s = (first - begun) / 1e9;
+    step("p first present %.1f s after the Wine stage began: %d s warm-up, then the %d s segment; the pad is not "
+         "used until the line", p_first_s, P_WARM_S, P_SEG_S);
+    pad_watch(&pad, have_pad, &last, first + (uint64_t)P_WARM_S * 1000000000ull, &p_inputs_warm, "warm", first);
+    pthread_mutex_lock(&present_lock);
+    bench_reset();
+    bench_on = 1;
+    seg0 = cfg.now_ns();
+    pthread_mutex_unlock(&present_lock);
+    pad_watch(&pad, have_pad, &last, seg0 + (uint64_t)P_SEG_S * 1000000000ull, &p_inputs, "segment", seg0);
+    pthread_mutex_lock(&present_lock);
+    bench_on = 0;
+    p_seg_s = (cfg.now_ns() - seg0) / 1e9;
+    p_snap[0] = hist_guest; p_snap[1] = hist_copy; p_snap[2] = hist_keep; p_snap[3] = hist_flip;
+    p_snap[4] = hist_frame; p_snap[5] = hist_present; p_snap[6] = hist_guest_cpu;
+    p_snap_presents = bench_presents; p_snap_noted = bench_noted; p_snap_flushes = bench_flushes;
+    p_snap_full = bench_full; p_snap_composed = bench_composed; p_snap_dirty_sum = bench_dirty_sum;
+    p_snap_dirty_max = bench_dirty_max; p_snap_cpu_other = thread_cpu_other;
+    pthread_mutex_unlock(&present_lock);
+    p_end = "segment";
+    /* The histograms for plots, in records of bounded size. */
+    {
+        static const char *const names[7] = { "guest", "copy", "keep", "flip", "frame", "present", "guest_cpu" };
+        char buf[300];
+        for (int i = 0; i < 7; i++)
+            for (unsigned next = 0, part = 0; next <= PW_HIST_BUCKETS; part++) {
+                if (!pw_hist_sparse(&p_snap[i], &next, buf, sizeof(buf))) break;
+                step("PW_MS hist %s part=%u bucket_us=%d %s", names[i], part, PW_HIST_BUCKET_US, buf);
+            }
+    }
+    pw_ms_wine_end("running", "", -1);
+    if (have_pad) {
+        f_play(&pad);
+        step("PW_MS play end=%s play_s=%.0f frames=%llu fps=%.1f keys=%d inputs=%d (hand play, not compared)", d_end,
+             f_play_ns / 1e9, (unsigned long long)f_frames_play, f_play_ns ? f_frames_play / (f_play_ns / 1e9) : 0.0,
+             f_keys, d_inputs);
+    }
+    return NULL;
+}
+
+/* The segment's fields for the p lines, after the stage fields. */
+static void p_bench_fields(char *out, size_t size)
+{
+    static const char *const names[6] = { "guest_us", "copy_us", "keep_us", "flip_us", "frame_us", "present_us" };
+    PwHistSummary frame, present, cpu;
+    size_t n;
+    char cpu_state[24], cpu_avg[24];
+
+    pw_hist_summary(&p_snap[4], &frame);
+    pw_hist_summary(&p_snap[5], &present);
+    pw_hist_summary(&p_snap[6], &cpu);
+    if (thread_cpu_errno == 0) snprintf(cpu_state, sizeof(cpu_state), "ok");
+    else if (thread_cpu_errno == -1) snprintf(cpu_state, sizeof(cpu_state), "-");
+    else snprintf(cpu_state, sizeof(cpu_state), "err:%d", thread_cpu_errno);
+    n = (size_t)snprintf(out, size, " seg_s=%.0f warm_s=%d first_present_s=%.1f inputs=%d inputs_warm=%d pad_reads=%d "
+                         "end=%s presents=%llu flush_hz=%.1f flushes=%llu noted=%llu full_flushes=%llu composed=%llu "
+                         "dirty_px_avg=%llu dirty_px_max=%llu",
+                         (double)(uint64_t)p_seg_s, P_WARM_S, p_first_s, p_inputs,
+                         p_inputs_warm, p_pad_reads, p_end, (unsigned long long)p_snap_presents,
+                         p_seg_s > 0 ? p_snap_presents / p_seg_s : 0.0, (unsigned long long)p_snap_flushes,
+                         (unsigned long long)p_snap_noted, (unsigned long long)p_snap_full,
+                         (unsigned long long)p_snap_composed,
+                         (unsigned long long)(p_snap_flushes ? p_snap_dirty_sum / p_snap_flushes : 0),
+                         (unsigned long long)p_snap_dirty_max);
+    for (int i = 0; i < 4 && n < size; i++) {
+        out[n++] = ' ';
+        if (n < size) n += (size_t)pw_hist_fields(&p_snap[i], names[i], out + n, size - n);
+    }
+    if (cpu.n) snprintf(cpu_avg, sizeof(cpu_avg), "%llu", (unsigned long long)cpu.avg_us);
+    else snprintf(cpu_avg, sizeof(cpu_avg), "-");
+    if (n < size)
+        snprintf(out + n, size - n, " frame_us_avg=%llu present_us_avg=%llu guest_cpu_us_avg=%s guest_cpu_n=%llu "
+                 "thread_cpu=%s thread_cpu_other=%llu",
+                 (unsigned long long)frame.avg_us, (unsigned long long)present.avg_us, cpu_avg,
+                 (unsigned long long)cpu.n, cpu_state, (unsigned long long)p_snap_cpu_other);
 }
 
 /* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
@@ -1517,6 +1798,7 @@ static void e2_lines(void);
 static void e_lines(void);
 static void f1_lines(void);
 static void f_lines(void);
+static void p1_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1594,11 +1876,13 @@ static const PwMsPlan plans[] = {
     { "e", e_stages, sizeof(e_stages) / sizeof(e_stages[0]), "C:\\d3d11tri64.exe", 0, e_lines },
     { "f1", f1_stages, sizeof(f1_stages) / sizeof(f1_stages[0]), "C:\\wow32.exe", 0, f1_lines },
     { "f", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, f_lines },
+    /* p1: plan f's Pinball as the benchmark (p_script): the segment's measurements. */
+    { "p1", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p1_lines },
 };
 
 static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
-static int pinball_plan(void) { return plan && plan->lines == f_lines; }
+static int pinball_plan(void) { return plan && (plan->lines == f_lines || plan->lines == p1_lines); }
 
 /* The Wine stage's watchdog (wine64_main_orbis.c), 0 for its default of
  * 180 s: f plays up to F_PLAY_S, and its play loop sends the line itself
@@ -1611,6 +1895,7 @@ const char *pw_ms_select(const char *name)
     plan = &plans[sizeof(plans) / sizeof(plans[0]) - 1];   /* the newest milestone */
     for (size_t i = 0; name && i < sizeof(plans) / sizeof(plans[0]); i++)
         if (!strcmp(plans[i].name, name)) plan = &plans[i];
+    bench_plan = plan->lines == p1_lines;
     return plan->name;
 }
 
@@ -1731,10 +2016,10 @@ void pw_ms_wine_begin(void)
 {
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
-    if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines) {
+    if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines || plan->lines == p1_lines) {
         pthread_t thread;
         if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : plan->lines == d_lines ? d_script
-                            : f_script, NULL))
+                            : plan->lines == p1_lines ? p_script : f_script, NULL))
             pthread_detach(thread);
     }
 }
@@ -1801,6 +2086,25 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, line, (unsigned long long)vk.presents, vk.width,
                  vk.height, removed || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none", release_state,
                  (unsigned long long)gdi_dropped, counted);
+    } else if (plan->lines == p1_lines) {
+        /* The benchmark: the translator's counters and the display here, the
+         * segment's measurements kept aside for the line (they do not fit
+         * the stage's fields). */
+        uint64_t wow[PW_WOW_STAT_COUNT];
+        const char *counted = wow_stats(wow);
+        save_last_drawn();
+        pthread_mutex_lock(&present_lock);
+        snprintf(fields, sizeof(fields), "exit=%s cpu=%s wow_stats=%s faults_unresolved=%llu faults_guest=%llu "
+                 "faults_marked=%llu faults_host=%llu faults_smc=%llu dbt_errors=%llu frames=%llu pad=%s fb=%s "
+                 "frame=%ux%u", exit_text,
+                 strcmp(counted, "ok") ? counted : wow[PW_WOW_STAT_THREADS] ? "translator" : "none", counted,
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_UNRESOLVED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_GUEST],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_MARKED], (unsigned long long)wow[PW_WOW_STAT_FAULTS_HOST],
+                 (unsigned long long)wow[PW_WOW_STAT_FAULTS_SMC], (unsigned long long)wow[PW_WOW_STAT_DBT_ERRORS],
+                 (unsigned long long)frames, d_pad == 1 ? "ok" : d_pad == 0 ? "none" : "-",
+                 fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", frame_width, frame_height);
+        p_bench_fields(p_bench, sizeof(p_bench));
+        pthread_mutex_unlock(&present_lock);
     } else if (plan->lines == f_lines) {
         /* Pinball: the translator's counters, the frames (all, and the play's
          * rate), the pad. native_caps comes with f4. */
@@ -1879,19 +2183,27 @@ static const char *value(unsigned stage, const char *key, char *out, size_t size
 typedef struct LineKey { const char *key; unsigned stage; } LineKey;
 
 /* "<head> k=v ... build=... <summary> session_s=..." through cfg.emit. */
-static void emit_line(const char *head, const LineKey *keys, size_t count)
+/* The line: head, the keys' values, extra (fields of its own, or NULL),
+ * then build, the stage summary and session_s. */
+static void emit_line_with(const char *head, const LineKey *keys, size_t count, const char *extra)
 {
-    char line[1400], summary[512], v[96];
+    char line[2048], summary[512], v[96];
     size_t n = (size_t)snprintf(line, sizeof(line), "%s", head);
 
     for (size_t i = 0; i < count && n < sizeof(line); i++)
         n += (size_t)snprintf(line + n, sizeof(line) - n, " %s=%s", keys[i].key,
                               value(keys[i].stage, keys[i].key, v, sizeof(v)));
+    if (extra && n < sizeof(line)) n += (size_t)snprintf(line + n, sizeof(line) - n, "%s", extra);
     pw_stage_summary(&run, summary, sizeof(summary));
     if (n < sizeof(line))
         snprintf(line + n, sizeof(line) - n, " build=%s %s session_s=%llu", cfg.build_id, summary,
                  (unsigned long long)((cfg.now_ns() - start_ns) / 1000000000ull));
     cfg.emit(line);
+}
+
+static void emit_line(const char *head, const LineKey *keys, size_t count)
+{
+    emit_line_with(head, keys, count, NULL);
 }
 
 static void d1_lines(void)
@@ -2053,6 +2365,20 @@ static void f_lines(void)
         { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY }, { "exit", PINBALL },
     };
     emit_line("PS4WINE f pinball", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* Phase p's p1: Pinball's attract mode measured over the segment (p_script);
+ * the segment's fields come from p_bench, not from the stage file. */
+static void p1_lines(void)
+{
+    enum { WOW, DISPLAY, PINBALL };
+    static const LineKey keys[] = {
+        { "cpu", PINBALL }, { "faults_unresolved", PINBALL }, { "faults_guest", PINBALL },
+        { "faults_marked", PINBALL }, { "faults_host", PINBALL }, { "faults_smc", PINBALL },
+        { "dbt_errors", PINBALL }, { "frames", PINBALL }, { "pad", PINBALL }, { "fb", PINBALL },
+        { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY }, { "exit", PINBALL },
+    };
+    emit_line_with("PS4WINE p1 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
 }
 
 void pw_ms_emit_lines(void)

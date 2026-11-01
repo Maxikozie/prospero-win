@@ -11,6 +11,8 @@ static PwWinePresentSink sink;
 static void *sink_context;
 static PwWineDisplayRelease display_release;
 static void *display_context;
+static PwWineFlushSink flush_sink;
+static void *flush_context;
 static pthread_mutex_t release_lock=PTHREAD_MUTEX_INITIALIZER;
 static PwWineInput queue[PW_WINE_INPUT_QUEUE];
 static uint32_t head,count;
@@ -79,6 +81,20 @@ int pw_wine_release_display(void)
     }
     pthread_mutex_unlock(&release_lock);
     return status;
+}
+void pw_wine_set_flush_sink(PwWineFlushSink new_sink,void *context)
+{
+    pthread_mutex_lock(&lock);
+    flush_sink=new_sink;flush_context=context;
+    pthread_mutex_unlock(&lock);
+}
+void pw_wine_note_flush(uint32_t dirty_px,uint32_t screen_px,uint32_t composed)
+{
+    /* Under the frame lock, as pw_wine_present calls its sink: the title
+     * takes its own lock inside both, in the same order. */
+    pthread_mutex_lock(&lock);
+    if(flush_sink)flush_sink(flush_context,dirty_px,screen_px,composed);
+    pthread_mutex_unlock(&lock);
 }
 int pw_wine_present(const void *bgra,uint32_t width,uint32_t height,uint32_t stride)
 {

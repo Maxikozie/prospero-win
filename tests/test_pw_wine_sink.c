@@ -20,6 +20,14 @@ static int sink(void *context,const void *bgra,uint32_t w,uint32_t h,uint32_t st
     return 0;
 }
 
+static int flush_calls;
+static uint32_t flush_dirty,flush_screen,flush_composed;
+static void *flush_context_seen;
+static void flush(void *context,uint32_t dirty_px,uint32_t screen_px,uint32_t composed)
+{
+    flush_calls++;flush_context_seen=context;flush_dirty=dirty_px;flush_screen=screen_px;flush_composed=composed;
+}
+
 static int release_calls,release_status;
 static void *release_seen;
 static int release(void *context)
@@ -239,6 +247,15 @@ int main(void)
     /* The sink's failure is returned and counted. */
     fail_next=1;assert(pw_wine_present(frame,4,3,16)==-7 && calls==2);
     pw_wine_sink_stats(&s);assert(s.frames==1 && s.frames_dropped==5);
+    /* The flush sink: ignored until set, then handed each flush's areas,
+     * and stopped by NULL. */
+    pw_wine_note_flush(10,20,0);assert(flush_calls==0);
+    int flush_tag;
+    pw_wine_set_flush_sink(flush,&flush_tag);
+    pw_wine_note_flush(4,12,1);
+    assert(flush_calls==1 && flush_context_seen==&flush_tag && flush_dirty==4 && flush_screen==12 && flush_composed==1);
+    pw_wine_set_flush_sink(NULL,NULL);
+    pw_wine_note_flush(1,12,0);assert(flush_calls==1);
     test_audio();
 
     /* Input is first in, first out, validated, and bounded. */
