@@ -466,7 +466,7 @@ int main(int argc, char **argv)
     LOG("PW_WINE64 ntdll=%s prefix=%s exe=%s found=%d", ntdll_path, PW_ROOT "/prefix", exe, !first);
 
     {
-        PwMsConfig ms = { ntdll_dir, PW_ROOT, PW_BUILD_ID, log_line, emit_line, now_ns_hook };
+        PwMsConfig ms = { ntdll_dir, PW_ROOT, PW_BUILD_ID, log_line, emit_line, now_ns_hook, early_setting };
         pw_ms_start(&ms);
         pw_ms_title_stages();
     }

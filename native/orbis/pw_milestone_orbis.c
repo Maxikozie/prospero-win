@@ -73,6 +73,12 @@ static volatile int lines_emitted;
 static uint64_t start_ns;
 static PwVideoOutOrbis video;
 static int video_open;
+/* Phase p: the timestamps and CPU reads run in the p plans only (bench_plan);
+ * their present path and flip (p_path, p_async: see pw_ms_present). */
+enum { P_PATH_SCALE, P_PATH_VO720, P_PATH_VO1080 };
+static const char *const p_path_names[] = { "scale", "vo720", "vo1080" };
+static int bench_plan, p_path, p_async;
+static void pause_ms(unsigned ms);
 
 /* ---- the progress file, through stdio ----------------------------------- */
 
@@ -645,19 +651,85 @@ static void stage_display(char *fields, size_t size)
     char shot[512];
     int rc;
 
+    PwVideoOutOrbisMode mode = { PW_VIDEOOUT_ORBIS_WIDTH, PW_VIDEOOUT_ORBIS_HEIGHT, PW_VIDEOOUT_ORBIS_WIDTH, 0,
+                                 PW_VIDEOOUT_ORBIS_BUFFERS, 0 };
+    const char *tried = "";
+
     snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
     unlink(shot);
-    if ((rc = pw_videoout_orbis_open(&video))) {
-        snprintf(fields, size, "display=fail vo_failed=%s:0x%x", video.failed, (unsigned)rc);
+    if (bench_plan) {
+        mode.buffers = p_async ? 3 : 2;
+        mode.async = p_async;
+        /* 960x540 was refused (0x80290005 at pitch 960 and 1024, LOG.md
+         * 2026-11-01 18:21); 1280x720 registered in milestone a. */
+        if (p_path == P_PATH_VO720) {
+            mode.width = mode.pitch = 1280;
+            mode.height = 720;
+            mode.bgra = 1;
+        } else if (p_path == P_PATH_VO1080) {
+            mode.bgra = 1;
+        }
+    }
+    rc = pw_videoout_orbis_open_mode(&video, &mode);
+    if (rc) {
+        snprintf(fields, size, "display=fail vo_failed=%s:0x%x vo_register=%s%s", video.failed, (unsigned)rc,
+                 video.failed && !strcmp(video.failed, "sceVideoOutRegisterBuffers") ? "err" : "-", tried);
         return;
     }
     video_open = 1;
     if ((rc = pw_videoout_orbis_flip(&video))) {
-        snprintf(fields, size, "display=fail vo_failed=%s:0x%x", video.failed, (unsigned)rc);
+        snprintf(fields, size, "display=fail vo_failed=%s:0x%x vo_register=ok%s", video.failed, (unsigned)rc, tried);
         return;
     }
-    step("display open handle=%d", video.handle);
-    snprintf(fields, size, "display=ok");
+    step("display open handle=%d %ux%u pitch=%u %s buffers=%u %s", video.handle, video.mode.width,
+         video.mode.height, video.mode.pitch, video.mode.bgra ? "A8R8G8B8_SRGB" : "A8B8G8R8_SRGB",
+         video.mode.buffers, video.mode.async ? "async" : "sync");
+    snprintf(fields, size, "display=ok vo_register=ok vo_size=%ux%u vo_pitch=%u vo_format=%s vo_buffers=%u%s",
+             video.mode.width, video.mode.height, video.mode.pitch, video.mode.bgra ? "a8r8g8b8" : "a8b8g8r8",
+             video.mode.buffers, tried);
+}
+
+/* p3/p4: a desktop-sized frame through the plan's own present path for 5 s,
+ * before Wine, for the HDMI check: black, a green square on the centre and
+ * an orange one on (w/8, h/8), alpha 0 as the user driver leaves it. On the
+ * 960x540 desktop (scale, vo1080): green 100x100 on 480,270, orange 32x32 on
+ * 120,67; on vo720's 1280x720: 132x132 on 640,360 and 42x42 on 160,90. Shown
+ * full-screen (2x, or VideoOut's 1.5x) they land on HDMI 960,540 and 240,135
+ * (d1's pixels); a buffer shown unscaled, in the corner or centred, fails the
+ * orange one. */
+enum { PATTERN_MS = 5000, PATTERN_EVERY_MS = 100 };
+
+static void pattern_square(uint32_t *pixels, uint32_t width, int cx, int cy, int half, uint32_t bgrx)
+{
+    for (int y = cy - half; y < cy + half; y++)
+        for (int x = cx - half; x < cx + half; x++) pixels[(size_t)y * width + (size_t)x] = bgrx;
+}
+
+static void stage_pattern(char *fields, size_t size)
+{
+    const uint32_t w = p_path == P_PATH_VO720 ? 1280 : 960, h = p_path == P_PATH_VO720 ? 720 : 540;
+    uint32_t *img = calloc((size_t)w * h, 4);
+    int shown = 0, failed = 0;
+    uint64_t t0;
+
+    if (!img || !video_open) {
+        snprintf(fields, size, "vo_flip=%s", img ? "nodisplay" : "nomemory");
+        free(img);
+        return;
+    }
+    pattern_square(img, w, (int)w / 2, (int)h / 2, (int)(w * 50 / 960), 0x0000ff00u);   /* green: B=0 G=255 R=0 */
+    pattern_square(img, w, (int)w / 8, (int)h / 8, (int)(w * 16 / 960), 0x00ff8000u);   /* orange: B=0 G=128 R=255 */
+    step("p pattern on screen for %d ms: %ux%u, green on %u,%u, orange on %u,%u (HDMI 960,540 and 240,135 when "
+         "shown full-screen)", PATTERN_MS, w, h, w / 2, h / 2, w / 8, h / 8);
+    t0 = cfg.now_ns();
+    while (cfg.now_ns() - t0 < (uint64_t)PATTERN_MS * 1000000ull) {
+        if (pw_ms_present(NULL, img, w, h, w * 4)) failed++;
+        else shown++;
+        pause_ms(PATTERN_EVERY_MS);
+    }
+    step("p pattern off after %d presents (%d refused)", shown, failed);
+    snprintf(fields, size, "vo_flip=%s pattern_presents=%d", failed || video.flip_errors ? "fail" : "ok", shown);
+    free(img);
 }
 
 /* ---- the present sink ------------------------------------------------------------ */
@@ -666,7 +738,7 @@ static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t frames, drawn;
 static uint32_t frame_width, frame_height;
 static uint32_t *last_drawn;   /* the last frame with any pixel drawn, as the driver's BGRA (frame_width x frame_height) */
-static uint32_t cleared[PW_VIDEOOUT_ORBIS_BUFFERS][2];   /* the frame size each buffer's border was cleared for */
+static uint32_t cleared[PW_VIDEOOUT_ORBIS_MAX_BUFFERS][2];   /* the frame size each buffer's border was cleared for */
 /* Latency: from the first pad event not yet shown to the next present, and each present's own time. */
 static volatile uint64_t input_pending_ns;
 static uint64_t lat_n, lat_sum_ns, lat_max_ns, present_n, present_sum_ns;
@@ -682,7 +754,6 @@ static uint64_t gdi_dropped;   /* frames the driver sent after the display was h
  * the presenting thread's CPU time over the guest window (getrusage
  * RUSAGE_THREAD from libkernel; orbis-compat answers every CPU-time
  * clock_gettime id with the monotonic clock, so that would be wall time). */
-static int bench_plan;                 /* the timestamps and CPU reads run in the p plans only */
 static int bench_on;
 static PwHist hist_guest, hist_copy, hist_keep, hist_flip, hist_frame, hist_present, hist_guest_cpu;
 static uint64_t bench_presents, bench_noted, bench_flushes, bench_full, bench_composed;
@@ -691,6 +762,20 @@ static uint64_t prev_enter_ns, prev_exit_ns, prev_exit_cpu_us;
 static pthread_t prev_thread;
 static int prev_valid, thread_cpu_errno = -1;   /* -1: not read yet, 0 ok, else getrusage's errno */
 static uint64_t thread_cpu_other;      /* samples skipped: a different thread presented */
+/* The p plans' present path and flip (pw_ms_start, env.txt). p_path:
+ * scale, today's 1080p A8B8G8R8 with the CPU's swizzle and integer scale;
+ * vo720, 1280x720 A8R8G8B8_SRGB buffers on a 1280x720 desktop, one row copy,
+ * VideoOut asked to scale to the 1080p output (what p3 measures); vo1080,
+ * 1920x1080 A8R8G8B8_SRGB, no swizzle, the 2x scale as a widened row and its
+ * copy. In both vo paths the driver's B,G,R,X is the buffer's memory order,
+ * and the keep copy moves to save time (the readback comes from the scan-out
+ * buffer shown last). p_async: three buffers and a flip that returns once
+ * submitted, the wait moved to the next present's start and only for a free
+ * buffer (p4). */
+static uint32_t buf_scale, buf_x0, buf_y0;   /* where a vo path put the frame in its buffer */
+static uint32_t widened[PW_VIDEOOUT_ORBIS_WIDTH];   /* one scaled row (vo1080), under present_lock */
+static int64_t shown_arg0;     /* the last completed flip's argument at the segment's start */
+static uint64_t slot_waits0;
 /* The driver's note for the next present (pw_ms_flush), consumed by it. */
 static int note_pending;
 static uint32_t note_dirty, note_screen, note_composed;
@@ -748,8 +833,20 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     uint64_t t0 = cfg.now_ns(), pending = input_pending_ns, cpu0 = 0, t_copy0, t_copy1, t_flip1, t_keep0, t_keep1;
     int any = 0;
 
+    uint64_t slot_ns = 0;
+
     (void)context;
     if (!bgra || !width || !height || width > W || height > H) return -1;
+    /* The guest window's CPU end, before any wait of this present (the first
+     * p4 launch read it after the slot wait and counted that as guest CPU). */
+    if (bench_plan) cpu0 = thread_cpu_us();
+    /* Async: the next back buffer must be neither queued nor on screen.
+     * Outside present_lock (presents are one at a time: ntdll's sink lock). */
+    if (p_async && video_open) {
+        uint64_t w0 = cfg.now_ns();
+        pw_videoout_orbis_wait_slot(&video);
+        slot_ns = cfg.now_ns() - w0;
+    }
     pthread_mutex_lock(&present_lock);
     if (!video_open) {
         gdi_dropped++;
@@ -757,7 +854,6 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
         pthread_mutex_unlock(&present_lock);
         return -1;
     }
-    if (bench_plan) cpu0 = thread_cpu_us();
     if (pending) {
         uint64_t lat = t0 - pending;
         input_pending_ns = 0;
@@ -774,6 +870,46 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     present_y0 = y0;
     t_copy0 = cfg.now_ns();
     dst = pw_videoout_orbis_back(&video);
+    if (p_path != P_PATH_SCALE) {
+        /* The driver's B,G,R,X is A8R8G8B8's memory order (alpha as the driver
+         * left it): rows copied, a scaled row widened once and copied again. */
+        const uint32_t bw = video.mode.width, bh = video.mode.height, pitch = video.mode.pitch;
+        uint32_t bs = bw / width < bh / height ? bw / width : bh / height;
+        if (!bs) bs = 1;
+        buf_scale = bs;
+        buf_x0 = (bw - (width < bw ? width : bw) * bs) / 2;
+        buf_y0 = (bh - (height < bh ? height : bh) * bs) / 2;
+        if (cleared[video.back][0] != width || cleared[video.back][1] != height) {
+            for (uint32_t y = 0; y < bh; y++)
+                for (uint32_t x = 0; x < bw; x++) dst[(size_t)y * pitch + x] = 0xff000000u;
+            cleared[video.back][0] = width;
+            cleared[video.back][1] = height;
+        }
+        for (uint32_t y = 0; y < height && y * bs < bh; y++) {
+            const uint32_t *src = (const uint32_t *)((const uint8_t *)bgra + (size_t)y * stride);
+            uint32_t *row = dst + (size_t)(buf_y0 + y * bs) * pitch + buf_x0;
+            uint32_t w = width * bs <= bw ? width : bw / bs;
+            if (bs == 1) {
+                memcpy(row, src, (size_t)w * 4);
+                continue;
+            }
+            /* Widened in cached memory, then written bs times: never read
+             * back out of the scan-out buffer (write-combined Garlic memory;
+             * reading it made the first vo1080 launch's copy 112 ms, LOG.md
+             * 2026-11-01 18:36). */
+            for (uint32_t x = 0; x < w; x++)
+                for (uint32_t dx = 0; dx < bs; dx++) widened[x * bs + dx] = src[x];
+            for (uint32_t dy = 0; dy < bs; dy++) memcpy(row + (size_t)dy * pitch, widened, (size_t)w * bs * 4);
+        }
+        /* The readback's layout: as the buffer for vo1080; for vo720 the
+         * buffer unscaled and centred (the readback cannot know VideoOut's
+         * scaling, which only HDMI shows). */
+        present_scale = bw == W ? bs : 1;
+        present_x0 = (W - width * present_scale) / 2;
+        present_y0 = (H - height * present_scale) / 2;
+        any = 1;   /* not looked at: that would read every pixel again */
+        goto copied;
+    }
     /* The border around the desktop: once per buffer and frame size, not every frame (8 MB). */
     if (cleared[video.back][0] != width || cleared[video.back][1] != height) {
         for (size_t i = 0; i < (size_t)W * H; i++) dst[i] = 0xff000000u;
@@ -799,6 +935,7 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
                     dst[(size_t)(y0 + y * scale + dy) * W + x0 + x * scale + dx] = rgba;
         }
     }
+copied:
     t_copy1 = cfg.now_ns();
     pw_videoout_orbis_flip(&video);
     t_flip1 = cfg.now_ns();
@@ -808,6 +945,9 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
     t_keep0 = t_keep1 = t_flip1;
     if (any) {
         drawn++;
+    }
+    /* The vo paths move this copy to save time: the readback comes from the scan-out buffer shown last. */
+    if (any && p_path == P_PATH_SCALE) {
         /* The source frame, not the 8 MB scan-out buffer: the readback is built from it when saved. */
         if (!last_drawn) last_drawn = malloc((size_t)W * H * 4);
         if (last_drawn)
@@ -825,8 +965,8 @@ int pw_ms_present(void *context, const void *bgra, uint32_t width, uint32_t heig
             else if (cpu0 && prev_exit_cpu_us && cpu0 >= prev_exit_cpu_us) pw_hist_add(&hist_guest_cpu, cpu0 - prev_exit_cpu_us);
         }
         pw_hist_add(&hist_copy, (t_copy1 - t_copy0) / 1000);
-        pw_hist_add(&hist_flip, (t_flip1 - t_copy1) / 1000);
-        if (any) pw_hist_add(&hist_keep, (t_keep1 - t_keep0) / 1000);
+        pw_hist_add(&hist_flip, (t_flip1 - t_copy1 + slot_ns) / 1000);
+        if (any && p_path == P_PATH_SCALE) pw_hist_add(&hist_keep, (t_keep1 - t_keep0) / 1000);
         if (note_pending) {
             bench_noted++;
             if (note_dirty) {
@@ -866,6 +1006,18 @@ static int save_drawn_as(const char *name)
     int rc = -1;
 
     pthread_mutex_lock(&present_lock);
+    if (p_path != P_PATH_SCALE && video_open && frame_width && frame_height && buf_scale &&
+        video.buffers[video.shown]) {
+        /* The keep copy, moved here: the frame shown last, sampled out of the
+         * scan-out buffer (write-combined memory, slow to read, once). */
+        const uint32_t *shown = video.buffers[video.shown];
+        if (!last_drawn) last_drawn = malloc((size_t)W * H * 4);
+        if (last_drawn)
+            for (uint32_t y = 0; y < frame_height && buf_y0 + y * buf_scale < video.mode.height; y++)
+                for (uint32_t x = 0; x < frame_width && buf_x0 + x * buf_scale < video.mode.width; x++)
+                    last_drawn[(size_t)y * frame_width + x] =
+                        shown[(size_t)(buf_y0 + y * buf_scale) * video.mode.pitch + buf_x0 + x * buf_scale];
+    }
     if (last_drawn && present_scale && (frame = malloc((size_t)W * H * 4))) {
         for (size_t i = 0; i < (size_t)W * H; i++) frame[i] = 0xff000000u;
         for (uint32_t y = 0; y < frame_height * present_scale; y++)
@@ -876,6 +1028,8 @@ static int save_drawn_as(const char *name)
             }
         copy = video;
         copy.buffers[copy.shown] = frame;
+        copy.mode.width = copy.mode.pitch = W;   /* fbshot.sh reads a 1920x1080 frame */
+        copy.mode.height = H;
         snprintf(shot, sizeof(shot), "%s/%s", cfg.root, name);
         rc = pw_videoout_orbis_save(&copy, shot);
         free(frame);
@@ -889,7 +1043,9 @@ static int save_drawn_as(const char *name)
 /* The last drawn frame to <root>/shot.raw (fbshot.sh's readback); once. */
 static void save_last_drawn(void)
 {
-    if (fb_saved == -1 && last_drawn) fb_saved = save_drawn_as("shot.raw") ? 1 : 0;
+    /* The vo paths fill last_drawn only here, from the scan-out buffer. */
+    if (fb_saved == -1 && (last_drawn || (p_path != P_PATH_SCALE && frame_width)))
+        fb_saved = save_drawn_as("shot.raw") ? 1 : 0;
 }
 
 /* ---- d4: winemine and a scripted click ------------------------------------------- */
@@ -1211,8 +1367,11 @@ enum { P_WARM_S = 20, P_SEG_S = 60, P_FIRST_WAIT_S = 600, P_STICK_DEAD = 40, P_T
 static int p_inputs, p_inputs_warm, p_pad_reads;
 static const char *p_end = "-";
 static double p_first_s = -1.0, p_seg_s;
-static char p_bench[1024];   /* p_bench_fields, for the p line */
+static char p_bench[1400];   /* p_bench_fields, for the p line */
 static PwHist p_snap[7];
+static int shown_rc0 = -1;
+static int64_t p_snap_shown = -1;           /* flips the display completed in the segment; -1 unknown */
+static uint64_t p_snap_slot_waits;
 static uint64_t p_snap_presents, p_snap_noted, p_snap_flushes, p_snap_full, p_snap_composed, p_snap_dirty_sum,
     p_snap_dirty_max, p_snap_cpu_other;
 
@@ -1262,10 +1421,14 @@ static void *p_script(void *arg)
 {
     PwPadOrbis pad;
     PwPadOrbisState last;
-    uint64_t begun = cfg.now_ns(), first, seg0;
+    uint64_t begun = cfg.now_ns(), first, seg0, frames_before;
     int have_pad;
     (void)arg;
 
+    /* The pattern stage presented already: the first present is the first after it. */
+    pthread_mutex_lock(&present_lock);
+    frames_before = frames;
+    pthread_mutex_unlock(&present_lock);
     memset(&last, 0, sizeof(last));
     last.left_x = last.left_y = last.right_x = last.right_y = 128;
     have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
@@ -1276,7 +1439,7 @@ static void *p_script(void *arg)
         pthread_mutex_lock(&present_lock);
         n = frames;
         pthread_mutex_unlock(&present_lock);
-        if (n) break;
+        if (n > frames_before) break;
         if (cfg.now_ns() - begun > (uint64_t)P_FIRST_WAIT_S * 1000000000ull) {
             p_end = "nopresent";
             pw_ms_wine_end("running", "", -1);
@@ -1293,6 +1456,8 @@ static void *p_script(void *arg)
     bench_reset();
     bench_on = 1;
     seg0 = cfg.now_ns();
+    shown_rc0 = pw_videoout_orbis_shown(&video, &shown_arg0);
+    slot_waits0 = video.slot_waits;
     pthread_mutex_unlock(&present_lock);
     pad_watch(&pad, have_pad, &last, seg0 + (uint64_t)P_SEG_S * 1000000000ull, &p_inputs, "segment", seg0);
     pthread_mutex_lock(&present_lock);
@@ -1303,6 +1468,12 @@ static void *p_script(void *arg)
     p_snap_presents = bench_presents; p_snap_noted = bench_noted; p_snap_flushes = bench_flushes;
     p_snap_full = bench_full; p_snap_composed = bench_composed; p_snap_dirty_sum = bench_dirty_sum;
     p_snap_dirty_max = bench_dirty_max; p_snap_cpu_other = thread_cpu_other;
+    {
+        int64_t arg1 = 0;
+        int rc1 = pw_videoout_orbis_shown(&video, &arg1);
+        p_snap_shown = !shown_rc0 && !rc1 && arg1 >= shown_arg0 ? (int64_t)(arg1 - shown_arg0) : -1;
+        p_snap_slot_waits = video.slot_waits - slot_waits0;
+    }
     pthread_mutex_unlock(&present_lock);
     p_end = "segment";
     /* The histograms for plots, in records of bounded size. */
@@ -1356,10 +1527,25 @@ static void p_bench_fields(char *out, size_t size)
     if (cpu.n) snprintf(cpu_avg, sizeof(cpu_avg), "%llu", (unsigned long long)cpu.avg_us);
     else snprintf(cpu_avg, sizeof(cpu_avg), "-");
     if (n < size)
-        snprintf(out + n, size - n, " frame_us_avg=%llu present_us_avg=%llu guest_cpu_us_avg=%s guest_cpu_n=%llu "
-                 "thread_cpu=%s thread_cpu_other=%llu",
-                 (unsigned long long)frame.avg_us, (unsigned long long)present.avg_us, cpu_avg,
-                 (unsigned long long)cpu.n, cpu_state, (unsigned long long)p_snap_cpu_other);
+        n += (size_t)snprintf(out + n, size - n, " frame_us_avg=%llu present_us_avg=%llu guest_cpu_us_avg=%s "
+                              "guest_cpu_n=%llu thread_cpu=%s thread_cpu_other=%llu",
+                              (unsigned long long)frame.avg_us, (unsigned long long)present.avg_us, cpu_avg,
+                              (unsigned long long)cpu.n, cpu_state, (unsigned long long)p_snap_cpu_other);
+    if (n < size) {
+        char shown[24], shown_hz[24];
+        if (p_snap_shown >= 0) {
+            snprintf(shown, sizeof(shown), "%lld", (long long)p_snap_shown);
+            snprintf(shown_hz, sizeof(shown_hz), "%.1f", p_seg_s > 0 ? p_snap_shown / p_seg_s : 0.0);
+        } else {
+            snprintf(shown, sizeof(shown), "-");
+            snprintf(shown_hz, sizeof(shown_hz), "-");
+        }
+        snprintf(out + n, size - n, " present_path=%s present_mode=%s buffers=%u shown=%s shown_hz=%s "
+                 "slot_waits=%llu flip_errors=%llu slot_timeouts=%llu status_errors=%llu", p_path_names[p_path],
+                 p_async ? "async" : "sync", video.mode.buffers, shown, shown_hz,
+                 (unsigned long long)p_snap_slot_waits, (unsigned long long)video.flip_errors,
+                 (unsigned long long)video.slot_timeouts, (unsigned long long)video.status_errors);
+    }
 }
 
 /* ---- e1: RADV in libvulkan.prx, the display handed over ------------------------------ */
@@ -1691,7 +1877,7 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     static char cache[512], shot[512];
     /* Milestone f: Pinball's window (about 600x470) fits 960x540, which fills
      * 1920x1080 at twice its size. */
-    if (pinball_plan()) add("WINE_PS5_DESKTOP", "960x540");
+    if (pinball_plan()) add("WINE_PS5_DESKTOP", bench_plan && p_path == P_PATH_VO720 ? "1280x720" : "960x540");
     if (!vulkan_plan()) return;
     snprintf(cache, sizeof(cache), "%s/cache", cfg.root);
     mkdir(cache, 0777);
@@ -1799,6 +1985,8 @@ static void e_lines(void);
 static void f1_lines(void);
 static void f_lines(void);
 static void p1_lines(void);
+static void p3_lines(void);
+static void p4_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -1866,6 +2054,12 @@ static const PwMsStage f_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "pinball", 0, NULL, "exit=fault" },
 };
+static const PwMsStage p_stages[] = {
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "pattern", 15, stage_pattern, "vo_flip=fault" },
+    { "pinball", 0, NULL, "exit=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -1878,11 +2072,18 @@ static const PwMsPlan plans[] = {
     { "f", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, f_lines },
     /* p1: plan f's Pinball as the benchmark (p_script): the segment's measurements. */
     { "p1", f_stages, sizeof(f_stages) / sizeof(f_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p1_lines },
+    /* p3, p4: the benchmark on another present path, after the HDMI test pattern. */
+    { "p3", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p3_lines },
+    { "p4", p_stages, sizeof(p_stages) / sizeof(p_stages[0]), "C:\\Pinball\\PINBALL.EXE", 0, p4_lines },
 };
 
 static int vulkan_plan(void) { return plan && (plan->lines == e2_lines || plan->lines == e_lines); }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
-static int pinball_plan(void) { return plan && (plan->lines == f_lines || plan->lines == p1_lines); }
+static int p_plan(void)
+{
+    return plan && (plan->lines == p1_lines || plan->lines == p3_lines || plan->lines == p4_lines);
+}
+static int pinball_plan(void) { return plan && (plan->lines == f_lines || p_plan()); }
 
 /* The Wine stage's watchdog (wine64_main_orbis.c), 0 for its default of
  * 180 s: f plays up to F_PLAY_S, and its play loop sends the line itself
@@ -1895,7 +2096,7 @@ const char *pw_ms_select(const char *name)
     plan = &plans[sizeof(plans) / sizeof(plans[0]) - 1];   /* the newest milestone */
     for (size_t i = 0; name && i < sizeof(plans) / sizeof(plans[0]); i++)
         if (!strcmp(plans[i].name, name)) plan = &plans[i];
-    bench_plan = plan->lines == p1_lines;
+    bench_plan = p_plan();
     return plan->name;
 }
 
@@ -1972,6 +2173,17 @@ void pw_ms_start(const PwMsConfig *config)
 
     if (!plan) pw_ms_select(NULL);
     cfg = *config;
+    if (bench_plan) {
+        /* The plan's defaults (p3: vo720; p4: vo720 and async), then env.txt's. */
+        char v[32];
+        p_path = plan->lines == p3_lines || plan->lines == p4_lines ? P_PATH_VO720 : P_PATH_SCALE;
+        p_async = plan->lines == p4_lines;
+        if (cfg.setting && cfg.setting("PS4WINE_PRESENT_PATH", v, sizeof(v)))
+            for (int i = 0; i < 3; i++)
+                if (!strcmp(v, p_path_names[i])) p_path = i;
+        if (cfg.setting && cfg.setting("PS4WINE_PRESENT_MODE", v, sizeof(v)))
+            p_async = !strcmp(v, "async") ? 1 : !strcmp(v, "sync") ? 0 : p_async;
+    }
     main_thread = pthread_self();
     start_ns = cfg.now_ns();
     snprintf(dir, sizeof(dir), "%s/%s", cfg.root, plan->name);
@@ -2016,10 +2228,10 @@ void pw_ms_wine_begin(void)
 {
     set_handlers(NULL);
     pw_stage_begin(&run, wine_stage());
-    if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines || plan->lines == p1_lines) {
+    if (plan->lines == d4_lines || plan->lines == d_lines || plan->lines == f_lines || p_plan()) {
         pthread_t thread;
         if (!pthread_create(&thread, NULL, plan->lines == d4_lines ? d4_script : plan->lines == d_lines ? d_script
-                            : plan->lines == p1_lines ? p_script : f_script, NULL))
+                            : p_plan() ? p_script : f_script, NULL))
             pthread_detach(thread);
     }
 }
@@ -2086,7 +2298,7 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  "release=%s gdi_dropped=%llu vk_stats=%s", exit_text, line, (unsigned long long)vk.presents, vk.width,
                  vk.height, removed || vk.device_lost != 0, vk.device_lost, fb ? "ok" : "none", release_state,
                  (unsigned long long)gdi_dropped, counted);
-    } else if (plan->lines == p1_lines) {
+    } else if (p_plan()) {
         /* The benchmark: the translator's counters and the display here, the
          * segment's measurements kept aside for the line (they do not fit
          * the stage's fields). */
@@ -2380,6 +2592,24 @@ static void p1_lines(void)
     };
     emit_line_with("PS4WINE p1 bench pinball", keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
 }
+
+/* p3 and p4: p1's fields, the display's mode and the test pattern's flips. */
+static void p34_line(const char *head)
+{
+    enum { WOW, DISPLAY, PATTERN, PINBALL };
+    static const LineKey keys[] = {
+        { "cpu", PINBALL }, { "faults_unresolved", PINBALL }, { "faults_guest", PINBALL },
+        { "faults_marked", PINBALL }, { "faults_host", PINBALL }, { "faults_smc", PINBALL },
+        { "dbt_errors", PINBALL }, { "frames", PINBALL }, { "pad", PINBALL }, { "fb", PINBALL },
+        { "frame", PINBALL }, { "wow_bound", WOW }, { "display", DISPLAY }, { "vo_register", DISPLAY },
+        { "vo_size", DISPLAY }, { "vo_pitch", DISPLAY }, { "vo_format", DISPLAY }, { "vo_buffers", DISPLAY },
+        { "vo_flip", PATTERN }, { "pattern_presents", PATTERN }, { "exit", PINBALL },
+    };
+    emit_line_with(head, keys, sizeof(keys) / sizeof(keys[0]), p_bench[0] ? p_bench : NULL);
+}
+
+static void p3_lines(void) { p34_line("PS4WINE p3 bench pinball"); }
+static void p4_lines(void) { p34_line("PS4WINE p4 bench pinball"); }
 
 void pw_ms_emit_lines(void)
 {

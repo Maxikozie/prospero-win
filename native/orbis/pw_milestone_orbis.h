@@ -27,6 +27,15 @@
  *       from the first present, then a 60 s segment measured per present
  *       (phase p, docs/ps4/HANDOFF-p.md in ps4-wine); hand play after it
  *       -> PS4WINE p1 bench pinball cpu=translator ... seg_s=60 inputs=0 presents=N guest_us_* ...
+ *   p3  p1 on A8R8G8B8_SRGB scan-out buffers (vo720: 1280x720 on a 1280x720
+ *       desktop, a row copy, VideoOut asked to scale; vo1080: 1920x1080, no
+ *       swizzle, the 2x scale by rows), after a test pattern shown 5 s for
+ *       the HDMI check
+ *       -> PS4WINE p3 bench pinball ... present_path=vo720|vo1080 vo_register=ok vo_flip=ok copy_us_avg=N ...
+ *   p4  p3's path (or env.txt's) with three buffers and an asynchronous flip
+ *       -> PS4WINE p4 bench pinball present_mode=async buffers=3 shown_hz=N flip_errors=N ...
+ *       In p1, p3 and p4, env.txt's PS4WINE_PRESENT_PATH=scale|vo720|vo1080 and
+ *       PS4WINE_PRESENT_MODE=sync|async replace the plan's defaults.
  *
  * The plan comes from PS4WINE_MILESTONE in <root>/env.txt (default: the newest).
  * Title stages run under a fault handler that records the fault and goes
@@ -48,6 +57,9 @@ typedef struct PwMsConfig {
     void (*log)(const char *line);       /* diagnostics log (netlog) */
     void (*emit)(const char *line);      /* klog + netlog + log: records that must arrive */
     uint64_t (*now_ns)(void);
+    /* NAME=VALUE from <root>/env.txt into out (NULL when absent): the p plans'
+     * PS4WINE_PRESENT_PATH and PS4WINE_PRESENT_MODE. May be NULL. */
+    const char *(*setting)(const char *name, char *out, size_t size);
 } PwMsConfig;
 
 /* Picks the plan by name ("d1", "d2"); NULL or unknown keeps the default.
