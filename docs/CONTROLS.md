@@ -62,8 +62,50 @@ touchpad = space
     `backslash`, `rbracket`, `quote`;
   - any Windows key code as `vk:0xNN`;
   - `mouse_left`, `mouse_right` or `mouse_middle`;
-  - `none`.
+  - `none`;
+  - on the PS4 title: `toggle:<key>`, a latch that holds the key from one
+    press to the next, and `ctrl+<key>` (or `shift+`, `alt+`), a chord
+    of one modifier and one key.
 - **`mouse`:** `left_stick`, `right_stick` or `none`.
+- **`keyboard_stick`:** `left_stick`, `right_stick` or `none`. Some games
+  read the keyboard for movement and cannot be told to use a stick axis, so
+  a stick does nothing in them. This one presses the four direction keys
+  instead, which lets the other stick stay on the pointer (upstream #736):
+
+  ```ini
+  ; the left stick walks (W/A/S/D), the right stick aims
+  keyboard_stick = left_stick
+  mouse = right_stick
+  stick_deadzone = 25
+  ```
+
+- **`stick_up`, `stick_down`, `stick_left`, `stick_right`:** the keys
+  `keyboard_stick` sends, from the same list the buttons use. They default
+  to `w`, `s`, `a` and `d`; set them to the arrows for a game that walks
+  with those instead.
+- **`stick_deadzone`:** how far the stick must be pushed before a key is
+  sent, as a percentage of full deflection, `5` to `70` (default `25`). A
+  direction already held is kept slightly past the release point, so a stick
+  resting on the edge does not tap the key.
+
+On the PS4 title, more of the pad can be laid out:
+
+- **`stick_walk` and `stick_run`:** a key (say `shift`) held with the
+  direction keys while the stick is pushed less than `stick_run` percent
+  (`10` to `100`, past the dead zone), and let go past it: a light push
+  walks, a full push runs.
+- **`layer = l1`:** a button that sends nothing itself (its own binding must
+  be `none`) and, while held, gives other buttons a second binding written
+  `l1+<button> = <binding>`. A button without one keeps its own. The prefix
+  must be the layer button.
+- **`<button>.hold = <binding>` and `hold_ms`:** the button sends its own
+  binding as a tap when released within `hold_ms` (`100` to `2000`, default
+  `350`), and holds the `.hold` binding once held that long. A tap is held
+  for 20 ms so a game reading the keyboard once a frame sees it.
+
+A key two bindings share (a latched `ctrl` and a `ctrl+c` chord, the walk
+`shift` and a `shift+` chord) is counted: it goes up only when the last of
+them lets go.
 
 `mouse.input` is a starting point for games played with the mouse alone.
 

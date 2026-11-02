@@ -3,7 +3,13 @@
 #include <string.h>
 
 enum { SET_MODE = 1u << 0, SET_MOUSE = 1u << 1, SET_SPEED = 1u << 2, SET_PRESET = 1u << 3,
-       SET_PLAYER2 = 1u << 4 };
+       SET_PLAYER2 = 1u << 4, SET_KEYBOARD_STICK = 1u << 5, SET_STICK_DEADZONE = 1u << 6,
+       SET_STICK_WALK = 1u << 7, SET_STICK_RUN = 1u << 8, SET_LAYER = 1u << 9, SET_HOLD_MS = 1u << 10 };
+/* keyboard_stick names the stick that drives the four direction keys; the
+ * keys themselves are stick_up/down/left/right, defaulting to WASD (upstream
+ * prospero-win #736, 58b6e0c). */
+enum { STICK_UP = 1u << 0, STICK_DOWN = 1u << 1, STICK_LEFT = 1u << 2, STICK_RIGHT = 1u << 3 };
+enum { HOLD_MS_DEFAULT = 350, HOLD_MS_MIN = 100, HOLD_MS_MAX = 2000 };
 
 /* DualSense buttons in PW_GAME_BUTTON order, with their scePadRead bits. */
 static const struct { const char *name; uint32_t mask; } buttons[PW_GAME_BUTTON_COUNT] = {
@@ -98,6 +104,41 @@ static int binding(const uint8_t *v, size_t n, PwGameBinding *out)
     return PW_ERR_UNSUPPORTED;
 }
 
+/* A button binding's value: binding()'s, or toggle:<key> (a latch), or
+ * <modifier>+<key> (a chord: ctrl, shift or alt, then one key). */
+static int button_binding(const uint8_t *v, size_t n, PwGameBinding *out)
+{
+    const uint8_t *plus = memchr(v, '+', n);
+    PwGameBinding key = { out->mask, 0, 0, 0, 0 };
+    int status;
+
+    if (n > 7 && is(v, 7, "toggle:")) {
+        if ((status = binding(v + 7, n - 7, &key)) != PW_OK) return status;
+        if (key.kind != PW_GAME_BIND_KEY) return PW_ERR_UNSUPPORTED;
+        key.toggle = 1;
+        *out = key;
+        return PW_OK;
+    }
+    if (plus && plus > v && plus < v + n - 1) {
+        size_t m = (size_t)(plus - v);
+        uint16_t mod = is(v, m, "ctrl") ? 0x11 : is(v, m, "shift") ? 0x10 : is(v, m, "alt") ? 0x12 : 0;
+        if (!mod) return PW_ERR_UNSUPPORTED;
+        if ((status = binding(plus + 1, n - m - 1, &key)) != PW_OK) return status;
+        if (key.kind != PW_GAME_BIND_KEY || key.code == mod) return PW_ERR_UNSUPPORTED;
+        key.mod = mod;
+        *out = key;
+        return PW_OK;
+    }
+    return binding(v, n, out);
+}
+
+static int button_index(const uint8_t *name, size_t n)
+{
+    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
+        if (is(name, n, buttons[i].name)) return (int)i;
+    return -1;
+}
+
 /* A preset's name: the file name under input/ without .input. */
 static int preset_name(char *out, size_t capacity, const uint8_t *v, size_t n)
 {
@@ -111,6 +152,12 @@ static int preset_name(char *out, size_t capacity, const uint8_t *v, size_t n)
     out[n] = 0;
     return PW_OK;
 }
+
+/* The four stick directions as profile keys; defaults are WASD. */
+static const struct { const char *name; unsigned index, bit; } stick_key_names[] = {
+    { "stick_up", 0, STICK_UP }, { "stick_down", 1, STICK_DOWN },
+    { "stick_left", 2, STICK_LEFT }, { "stick_right", 3, STICK_RIGHT },
+};
 
 static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length,
                        const uint8_t *v, size_t n, int allow_preset)
@@ -153,15 +200,113 @@ static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length
         input->set |= SET_SPEED;
         return PW_OK;
     }
-    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
-        if (!is(key, key_length, buttons[i].name)) continue;
-        PwGameBinding parsed = { buttons[i].mask, 0, 0 };
-        if (input->bindings[i].kind != PW_GAME_BIND_UNSET) return PW_ERR_MALFORMED;
-        int status = binding(v, n, &parsed);
-        if (status == PW_OK) input->bindings[i] = parsed;
-        return status;
+    if (is(key, key_length, "keyboard_stick")) {
+        if (input->set & SET_KEYBOARD_STICK) return PW_ERR_MALFORMED;
+        if (is(v, n, "none")) input->keyboard_stick = PW_GAME_STICK_NONE;
+        else if (is(v, n, "left_stick")) input->keyboard_stick = PW_GAME_STICK_LEFT;
+        else if (is(v, n, "right_stick")) input->keyboard_stick = PW_GAME_STICK_RIGHT;
+        else return PW_ERR_UNSUPPORTED;
+        input->set |= SET_KEYBOARD_STICK;
+        return PW_OK;
     }
-    return PW_ERR_UNSUPPORTED;
+    if (is(key, key_length, "stick_deadzone")) {
+        uint32_t deadzone;
+        if ((input->set & SET_STICK_DEADZONE) || number(v, n, &deadzone) != PW_OK || deadzone < 5 || deadzone > 70)
+            return PW_ERR_MALFORMED;
+        input->stick_deadzone = (uint8_t)deadzone;
+        input->set |= SET_STICK_DEADZONE;
+        return PW_OK;
+    }
+    if (is(key, key_length, "stick_walk")) {
+        PwGameBinding parsed = { 0, 0, 0, 0, 0 };
+        int status;
+        if (input->set & SET_STICK_WALK) return PW_ERR_MALFORMED;
+        if ((status = binding(v, n, &parsed)) != PW_OK) return status;
+        if (parsed.kind != PW_GAME_BIND_KEY) return PW_ERR_UNSUPPORTED;
+        input->stick_walk = parsed.code;
+        input->set |= SET_STICK_WALK;
+        return PW_OK;
+    }
+    if (is(key, key_length, "stick_run")) {
+        uint32_t run;
+        if ((input->set & SET_STICK_RUN) || number(v, n, &run) != PW_OK || run < 10 || run > 100)
+            return PW_ERR_MALFORMED;
+        input->stick_run = (uint8_t)run;
+        input->set |= SET_STICK_RUN;
+        return PW_OK;
+    }
+    for (size_t i = 0; i < sizeof(stick_key_names) / sizeof(stick_key_names[0]); i++) {
+        PwGameBinding parsed = { 0, 0, 0, 0, 0 };
+        int status;
+        if (!is(key, key_length, stick_key_names[i].name)) continue;
+        if (input->stick_keys_set & stick_key_names[i].bit) return PW_ERR_MALFORMED;
+        if ((status = binding(v, n, &parsed)) != PW_OK) return status;
+        if (parsed.kind != PW_GAME_BIND_KEY) return PW_ERR_UNSUPPORTED;
+        input->stick_keys[stick_key_names[i].index] = parsed.code;
+        input->stick_keys_set |= stick_key_names[i].bit;
+        return PW_OK;
+    }
+    if (is(key, key_length, "layer")) {
+        int index = button_index(v, n);
+        if ((input->set & SET_LAYER) || index < 0) return PW_ERR_MALFORMED;
+        input->layer = (int8_t)index;
+        input->set |= SET_LAYER;
+        return PW_OK;
+    }
+    if (is(key, key_length, "hold_ms")) {
+        uint32_t ms;
+        if ((input->set & SET_HOLD_MS) || number(v, n, &ms) != PW_OK || ms < HOLD_MS_MIN || ms > HOLD_MS_MAX)
+            return PW_ERR_MALFORMED;
+        input->hold_ms = ms;
+        input->set |= SET_HOLD_MS;
+        return PW_OK;
+    }
+    {
+        /* <prefix>+<button> (a layer binding) and <button>.hold (a hold binding). */
+        const uint8_t *plus = memchr(key, '+', key_length), *dot = memchr(key, '.', key_length);
+        PwGameBinding *slot = NULL;
+        int index, prefix = -1, status;
+
+        if (plus) {
+            if (dot || (prefix = button_index(key, (size_t)(plus - key))) < 0) return PW_ERR_UNSUPPORTED;
+            index = button_index(plus + 1, key_length - (size_t)(plus - key) - 1);
+            if (index < 0 || index == prefix) return PW_ERR_UNSUPPORTED;
+            slot = &input->layer_bindings[index];
+        } else if (dot) {
+            if (!is(dot, key_length - (size_t)(dot - key), ".hold")) return PW_ERR_UNSUPPORTED;
+            if ((index = button_index(key, (size_t)(dot - key))) < 0) return PW_ERR_UNSUPPORTED;
+            slot = &input->hold_bindings[index];
+        } else {
+            if ((index = button_index(key, key_length)) < 0) return PW_ERR_UNSUPPORTED;
+            slot = &input->bindings[index];
+        }
+        PwGameBinding parsed = { buttons[index].mask, 0, 0, 0, 0 };
+        if (slot->kind != PW_GAME_BIND_UNSET) return PW_ERR_MALFORMED;
+        if ((status = button_binding(v, n, &parsed)) != PW_OK) return status;
+        /* A hold must be a plain key or mouse button. */
+        if (dot && (parsed.toggle || parsed.mod)) return PW_ERR_UNSUPPORTED;
+        if (plus) input->layer_prefixes |= 1u << prefix;
+        *slot = parsed;
+        return PW_OK;
+    }
+}
+
+/* The rules no single line can check: the layer button sends nothing and
+ * has no hold; every <prefix>+ names it; the run point is past the dead zone. */
+static int input_finish(const PwGameInput *input)
+{
+    if (input->layer_prefixes) {
+        if (!(input->set & SET_LAYER) || input->layer_prefixes != (1u << input->layer)) return PW_ERR_MALFORMED;
+    }
+    if (input->set & SET_LAYER) {
+        const PwGameBinding *own = &input->bindings[input->layer];
+        if ((own->kind != PW_GAME_BIND_UNSET && own->kind != PW_GAME_BIND_NONE) ||
+            input->hold_bindings[input->layer].kind != PW_GAME_BIND_UNSET)
+            return PW_ERR_MALFORMED;
+    }
+    if ((input->set & SET_STICK_RUN) && input->stick_run <= input->stick_deadzone) return PW_ERR_MALFORMED;
+    if ((input->set & SET_STICK_WALK) != 0 && !(input->set & SET_STICK_RUN)) return PW_ERR_MALFORMED;
+    return PW_OK;
 }
 
 static int display_field(PwGameDisplay *display, uint32_t *seen, const uint8_t *key,
@@ -508,7 +653,15 @@ void pw_game_input_init(PwGameInput *input)
     if (!input) return;
     memset(input, 0, sizeof(*input));
     input->mouse_speed = PW_GAME_MOUSE_SPEED_DEFAULT;
-    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) input->bindings[i].mask = buttons[i].mask;
+    input->stick_deadzone = 25;
+    input->stick_keys[0] = 'W';
+    input->stick_keys[1] = 'S';
+    input->stick_keys[2] = 'A';
+    input->stick_keys[3] = 'D';
+    input->layer = -1;
+    input->hold_ms = HOLD_MS_DEFAULT;
+    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
+        input->bindings[i].mask = input->layer_bindings[i].mask = input->hold_bindings[i].mask = buttons[i].mask;
 }
 
 int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *profile)
@@ -526,6 +679,7 @@ int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *pr
     parsed.display.refresh = 60;
     if ((status = parse_sections(bytes, length, &parsed, NULL, &application_end)) != PW_OK)
         return status;
+    if ((status = input_finish(&parsed.input)) != PW_OK) return status;
     if ((status = pw_app_profile_parse(bytes, application_end, &parsed.app)) != PW_OK)
         return status;
     /* show_fps and menu set the HUD variable themselves (pw_game_graphics_env). */
@@ -551,6 +705,7 @@ int pw_game_input_parse(const uint8_t *bytes, size_t length, PwGameInput *input)
     pw_game_input_init(&parsed);
     parsed.mouse_speed = 0;
     if ((status = parse_sections(bytes, length, &unused, &parsed, NULL)) != PW_OK) return status;
+    if ((status = input_finish(&parsed)) != PW_OK) return status;
     pw_game_input_overlay(input, &parsed);
     return PW_OK;
 }
@@ -561,9 +716,24 @@ void pw_game_input_overlay(PwGameInput *base, const PwGameInput *overrides)
     if (overrides->set & SET_MODE) base->mode = overrides->mode;
     if (overrides->set & SET_MOUSE) base->mouse = overrides->mouse;
     if (overrides->set & SET_SPEED) base->mouse_speed = overrides->mouse_speed;
-    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED);
-    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
+    if (overrides->set & SET_KEYBOARD_STICK) base->keyboard_stick = overrides->keyboard_stick;
+    if (overrides->set & SET_STICK_DEADZONE) base->stick_deadzone = overrides->stick_deadzone;
+    if (overrides->set & SET_STICK_WALK) base->stick_walk = overrides->stick_walk;
+    if (overrides->set & SET_STICK_RUN) base->stick_run = overrides->stick_run;
+    if (overrides->set & SET_LAYER) base->layer = overrides->layer;
+    if (overrides->set & SET_HOLD_MS) base->hold_ms = overrides->hold_ms;
+    for (size_t i = 0; i < 4; i++)
+        if (overrides->stick_keys_set & (1u << i)) base->stick_keys[i] = overrides->stick_keys[i];
+    base->stick_keys_set |= overrides->stick_keys_set;
+    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED | SET_KEYBOARD_STICK | SET_STICK_DEADZONE |
+                                   SET_STICK_WALK | SET_STICK_RUN | SET_LAYER | SET_HOLD_MS);
+    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
         if (overrides->bindings[i].kind != PW_GAME_BIND_UNSET) base->bindings[i] = overrides->bindings[i];
+        if (overrides->layer_bindings[i].kind != PW_GAME_BIND_UNSET)
+            base->layer_bindings[i] = overrides->layer_bindings[i];
+        if (overrides->hold_bindings[i].kind != PW_GAME_BIND_UNSET)
+            base->hold_bindings[i] = overrides->hold_bindings[i];
+    }
 }
 
 void pw_game_input_default_mode(PwGameInput *input)

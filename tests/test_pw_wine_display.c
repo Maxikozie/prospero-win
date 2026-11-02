@@ -326,6 +326,240 @@ static void test_script_pad(void)
     }
 }
 
+
+/* keyboard_stick: one stick drives the four direction keys (upstream
+ * prospero-win #736, 58b6e0c). Deadzone 25 of 127 counts gives a threshold
+ * of 31, with five counts of hysteresis once a direction is held, and a
+ * release is emitted before the opposite press. */
+static void test_keyboard_stick(void)
+{
+    PwWineKeyboardStick state = { 0 };
+    PwWineInput out[4];
+    PwGameInput in;
+
+    pw_game_input_init(&in);
+    in.keyboard_stick = PW_GAME_STICK_LEFT;
+    in.stick_deadzone = 25;                       /* threshold 31 */
+
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 0x80, 1, &state, out, 4) == 0);
+    assert(state.held == 0);
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 128 - 31, 1, &state, out, 4) == 0);
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 0x00, 1, &state, out, 4) == 1);
+    assert(out[0].type == PW_WINE_INPUT_KEY && out[0].code == 'W' && out[0].down == 1);
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 128 - 28, 1, &state, out, 4) == 0);
+    assert(state.held != 0);
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 0xff, 1, &state, out, 4) == 2);
+    assert(out[0].code == 'W' && out[0].down == 0);
+    assert(out[1].code == 'S' && out[1].down == 1);
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 0xff, 0, &state, out, 4) == 1);
+    assert(out[0].code == 'S' && out[0].down == 0 && state.held == 0);
+    in.keyboard_stick = PW_GAME_STICK_NONE;
+    assert(pw_wine_keyboard_stick_step(&in, 0x80, 0x00, 1, &state, out, 4) == 0);
+    in.keyboard_stick = PW_GAME_STICK_LEFT;
+    assert(pw_wine_keyboard_stick_step(&in, 0x00, 0x00, 1, &state, out, 4) == 2);
+    assert(!pw_wine_keyboard_stick_step(NULL, 0, 0, 1, &state, out, 4));
+    assert(!pw_wine_keyboard_stick_step(&in, 0, 0, 1, NULL, out, 4));
+    assert(!pw_wine_keyboard_stick_step(&in, 0, 0, 1, &state, NULL, 4));
+}
+
+/* ---- the pad mapper ---------------------------------------------------------- */
+
+static const char BLOODLINES[] =
+    "[input]\nmode = keyboard\nmouse = right_stick\nkeyboard_stick = left_stick\nstick_walk = shift\nstick_run = 80\n"
+    "layer = l1\nl1 = none\nr2 = mouse_left\nl2 = tab\nr1 = mouse_right\ncross = e\ntriangle = space\n"
+    "square = r\nsquare.hold = h\ncircle = i\ncircle.hold = c\nl3 = toggle:ctrl\nr3 = z\nup = f\ndown = t\n"
+    "left = rbracket\nright = lbracket\noptions = escape\n"
+    "l1+cross = 1\nl1+circle = 2\nl1+square = 3\nl1+triangle = 4\nl1+up = 5\nl1+right = 6\nl1+down = 7\n"
+    "l1+left = 8\nl1+r1 = 9\nl1+options = l\nl1+r3 = f9\nl1+l3 = f8\nl1+l2 = ctrl+c\n";
+
+enum { B_CROSS = 0x4000u, B_CIRCLE = 0x2000u, B_SQUARE = 0x8000u, B_TRIANGLE = 0x1000u, B_L1 = 0x400u,
+       B_R1 = 0x800u, B_L2 = 0x100u, B_R2 = 0x200u, B_L3 = 0x2u, B_R3 = 0x4u, B_UP = 0x10u };
+
+static PwGameInput map_input;
+static PwWinePadMap map;
+static PwWineInput ev[PW_WINE_PAD_MAP_EVENTS];
+static char trace[1024];
+
+/* One step at t ms, centred sticks unless given; the events as "+X -X" (keys
+ * by their character or hex, mouse buttons as M0..M2). */
+static const char *step_at(uint32_t buttons, uint64_t t_ms, uint8_t lx, uint8_t ly, int connected)
+{
+    size_t n = pw_wine_pad_map_step(&map_input, &map, buttons, lx, ly, 0x80, 0x80, connected, t_ms * 1000000ull,
+                                    ev, PW_WINE_PAD_MAP_EVENTS), used = 0;
+    trace[0] = 0;
+    for (size_t i = 0; i < n; i++) {
+        char name[8];
+        if (ev[i].type == PW_WINE_INPUT_MOUSE_BUTTON) snprintf(name, sizeof(name), "M%u", ev[i].code);
+        else if ((ev[i].code >= 'A' && ev[i].code <= 'Z') || (ev[i].code >= '0' && ev[i].code <= '9'))
+            snprintf(name, sizeof(name), "%c", (char)ev[i].code);
+        else snprintf(name, sizeof(name), "%02x", ev[i].code);
+        used += (size_t)snprintf(trace + used, sizeof(trace) - used, "%s%c%s", used ? " " : "", ev[i].down ? '+' : '-', name);
+    }
+    return trace;
+}
+static const char *step(uint32_t buttons, uint64_t t_ms) { return step_at(buttons, t_ms, 0x80, 0x80, 1); }
+#define STEP(b, t, want) do { const char *got_ = step((b), (t)); \
+    if (strcmp(got_, (want))) { printf("t=%llu: got '%s' want '%s'\n", (unsigned long long)(t), got_, (want)); assert(0); } } while (0)
+#define STICK(lx, ly, t, want) do { const char *got_ = step_at(0, (t), (lx), (ly), 1); \
+    if (strcmp(got_, (want))) { printf("t=%llu: got '%s' want '%s'\n", (unsigned long long)(t), got_, (want)); assert(0); } } while (0)
+
+static void map_reset(void)
+{
+    pw_game_input_init(&map_input);
+    assert(pw_game_input_parse((const uint8_t *)BLOODLINES, sizeof(BLOODLINES) - 1, &map_input) == PW_OK);
+    pw_wine_pad_map_init(&map);
+}
+
+static void test_pad_map(void)
+{
+    PwWineInput small[4];
+
+    map_reset();
+    /* The refusals. */
+    assert(!pw_wine_pad_map_step(&map_input, &map, 0, 0x80, 0x80, 0x80, 0x80, 1, 0, small, 4));
+    assert(!pw_wine_pad_map_step(NULL, &map, 0, 0x80, 0x80, 0x80, 0x80, 1, 0, ev, PW_WINE_PAD_MAP_EVENTS));
+
+    /* Plain keys and mouse buttons, held while held. */
+    STEP(B_CROSS, 0, "+E");
+    STEP(B_CROSS | B_R2, 8, "+M0");
+    STEP(0, 16, "-E -M0");
+
+    /* Tap and hold at hold_ms (350) +-1: released at 349 taps r (down now, up
+     * 20 ms later), held to 350 holds h until the release. */
+    map_reset();
+    STEP(B_SQUARE, 1000, "");
+    STEP(B_SQUARE, 1349, "");
+    STEP(0, 1349, "+R");
+    STEP(0, 1368, "");                       /* the tap is held at least 20 ms */
+    STEP(0, 1369, "-R");
+    STEP(B_SQUARE, 2000, "");
+    STEP(B_SQUARE, 2349, "");
+    STEP(B_SQUARE, 2350, "+H");
+    STEP(B_SQUARE, 2900, "");
+    STEP(0, 2908, "-H");
+    assert(map.stats.taps == 1 && map.stats.holds == 1);
+
+    /* The layer: L1 sends nothing; L1+cross answers 1; a layer entry that is
+     * unset falls through (R2 still attacks); L1 let go in the middle of a
+     * held face button releases exactly what the press took. */
+    map_reset();
+    STEP(B_L1, 0, "");
+    STEP(B_L1 | B_CROSS, 8, "+1");
+    STEP(B_L1 | B_CROSS | B_R2, 16, "+M0");
+    STEP(B_CROSS | B_R2, 24, "");            /* L1 up: 1 stays held by cross */
+    STEP(B_R2, 32, "-1");
+    STEP(0, 40, "-M0");
+    STEP(B_CROSS, 48, "+E");                 /* the layer is gone: e again */
+    STEP(B_CROSS | B_L1, 56, "");            /* L1 pressed while cross is held: nothing changes */
+    STEP(B_L1, 64, "-E");
+    STEP(0, 72, "");
+    assert(map.stats.layer_keys == 1);
+    /* An L1 tap/hold button: L1+square is the layer's 3, not a tap. */
+    STEP(B_L1, 80, "");
+    STEP(B_L1 | B_SQUARE, 88, "+3");
+    STEP(B_L1, 96, "-3");
+    STEP(0, 104, "");
+
+    /* The latch: L3 holds ctrl until the next L3. */
+    map_reset();
+    STEP(B_L3, 0, "+11");
+    STEP(0, 8, "");
+    STEP(B_L3, 16, "-11");
+    STEP(0, 24, "");
+    assert(map.stats.toggles == 2);
+
+    /* The chord's order, and a shared key: crouch latched, then L1+L2 sends
+     * ctrl+c; ctrl stays held (the player stays crouched) after the chord. */
+    map_reset();
+    STEP(B_L1, 0, "");
+    STEP(B_L1 | B_L2, 8, "+11 +C");
+    STEP(B_L1, 16, "-C -11");
+    STEP(0, 24, "");
+    STEP(B_L3, 32, "+11");
+    STEP(0, 40, "");
+    STEP(B_L1, 48, "");
+    STEP(B_L1 | B_L2, 56, "+C");             /* ctrl already held by the latch */
+    STEP(B_L1, 64, "-C");                    /* ... and still held after */
+    STEP(0, 72, "");
+    assert(map.key_refs[0x11] == 1);
+    STEP(B_L3, 80, "-11");
+    STEP(0, 88, "");
+    assert(map.stats.chords == 2);
+
+    /* Walk and run: past the dead zone (31 counts) with less than 80% (101
+     * counts) walks (shift with w, shift first); full push runs (shift let
+     * go); hysteresis 5 counts either side; centred lets go. */
+    map_reset();
+    STICK(0x80, 128 - 60, 0, "+10 +W");
+    STICK(0x80, 128 - 100, 8, "");           /* 100 <= 101 + 5: still walking */
+    STICK(0x80, 128 - 107, 16, "-10");       /* past run + 5: runs */
+    STICK(0x80, 128 - 100, 24, "");          /* 100 >= 101 - 5: still running */
+    STICK(0x80, 128 - 95, 32, "+10");        /* inside run - 5: walks again */
+    STICK(0x80, 0x80, 1032, "-W -10");
+    assert(map.stats.stick_keys == 1 && map.stats.walk_ns == 1008000000ull);
+    /* Walk shift held while a chord takes and lets go of shift: the walk keeps it. */
+    pw_game_input_init(&map_input);
+    {
+        static const char text[] = "[input]\nkeyboard_stick = left_stick\nstick_walk = shift\nstick_run = 80\n"
+                                   "cross = shift+e\n";
+        assert(pw_game_input_parse((const uint8_t *)text, sizeof(text) - 1, &map_input) == PW_OK);
+    }
+    pw_wine_pad_map_init(&map);
+    STICK(0x80, 128 - 60, 0, "+10 +W");
+    assert(!strcmp(step_at(B_CROSS, 8, 0x80, 128 - 60, 1), "+E"));
+    assert(!strcmp(step_at(0, 16, 0x80, 128 - 60, 1), "-E"));
+    assert(map.key_refs[0x10] == 1);
+
+    /* Disconnect lets go of everything and clears the latch. */
+    map_reset();
+    STEP(B_L3, 0, "+11");
+    STEP(B_CROSS | B_R2, 8, "+E +M0");
+    STEP(B_CROSS | B_R2 | B_SQUARE, 16, "");
+    assert(!strcmp(step_at(B_CROSS | B_R2 | B_SQUARE, 24, 0x80, 0, 1), "+W"));
+    assert(!strcmp(step_at(0, 32, 0x80, 0x80, 0), "-E -M0 -11 -W"));
+    assert(map.latched[8] == 0 && map.key_refs['E'] == 0 && map.mouse_refs[0] == 0);
+    STEP(0, 40, "");                         /* square's press was forgotten: no tap */
+    assert(map.stats.stuck == 0);
+}
+
+/* stuck stays 0 over a random walk of buttons, sticks and disconnects, and
+ * nothing is left held at the end. */
+static void test_pad_map_fuzz(void)
+{
+    uint32_t seed = 12345u, buttons = 0;
+    static const uint32_t pool[] = { B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE, B_L1, B_R1, B_L2, B_R2, B_L3, B_R3,
+                                     B_UP, 0x40u, 0x80u, 0x20u, 0x8u };
+    uint64_t t = 0;
+    uint8_t shadow[256], shadow_mouse[3] = { 0, 0, 0 };
+
+    memset(shadow, 0, sizeof(shadow));
+    map_reset();
+    for (int i = 0; i < 10000; i++) {
+        uint8_t lx = 0x80, ly = 0x80;
+        seed = seed * 1103515245u + 12345u;
+        buttons ^= pool[(seed >> 16) % (sizeof(pool) / sizeof(pool[0]))];
+        seed = seed * 1103515245u + 12345u;
+        if ((seed >> 16) % 3 == 0) { lx = (uint8_t)(seed >> 8); ly = (uint8_t)(seed >> 20); }
+        t += 4 + (seed >> 24) % 400;
+        size_t n = pw_wine_pad_map_step(&map_input, &map, buttons, lx, ly, 0x80, 0x80, (seed >> 12) % 200 != 0,
+                                        t * 1000000ull, ev, PW_WINE_PAD_MAP_EVENTS);
+        /* What the game sees: never a second down without an up, never an up
+         * without a down, and down exactly while the mapper counts a holder. */
+        for (size_t e = 0; e < n; e++) {
+            uint8_t *seen = ev[e].type == PW_WINE_INPUT_MOUSE_BUTTON ? &shadow_mouse[ev[e].code] : &shadow[ev[e].code];
+            assert(*seen != ev[e].down);
+            *seen = (uint8_t)ev[e].down;
+        }
+        for (size_t k = 0; k < 256; k++) assert(map.key_refs[k] < 64 && (shadow[k] != 0) == (map.key_refs[k] != 0));
+        for (size_t m = 0; m < 3; m++) assert((shadow_mouse[m] != 0) == (map.mouse_refs[m] != 0));
+    }
+    assert(map.stats.stuck == 0);
+    step_at(0, t + 1000, 0x80, 0x80, 0);
+    for (size_t k = 0; k < 256; k++) assert(map.key_refs[k] == 0);
+    for (size_t m = 0; m < 3; m++) assert(map.mouse_refs[m] == 0);
+    assert(map.stats.stuck == 0);
+}
+
 int main(void)
 {
     test_frames();
@@ -333,10 +567,14 @@ int main(void)
     test_inputs();
     test_pointer();
     test_pointer_fraction();
+    test_keyboard_stick();
+    test_pad_map();
+    test_pad_map_fuzz();
     test_pad();
     test_script_pad();
     printf("wine display passed: frame box copy, newest frame, refusals, concurrent put/take, "
-           "profile bindings to keys and mouse buttons, stick pointer, resized frames, "
+           "profile bindings to keys and mouse buttons, stick pointer, a stick driving the direction keys, "
+           "the pad mapper (layer, tap/hold, latch, chord, walk/run, shared keys, disconnect, 10k-step fuzz), resized frames, "
            "DualSense as XInput, scripted controller added to it\n");
     return 0;
 }

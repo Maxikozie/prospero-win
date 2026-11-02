@@ -4127,9 +4127,27 @@ static void g_bindings(PwGameInput *input)
         step("g: the built-in bindings do not parse");
     if (g_profile) pw_game_input_overlay(input, &g_profile->input);
     pw_game_input_default_mode(input);
-    /* The marks are the title's. */
-    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
-        if (i == 2 || i == 3 || i == 16) input->bindings[i].kind = PW_GAME_BIND_NONE;
+    /* The touchpad is the title's (the marks, and with square or triangle the
+     * segments); square and triangle alone are the game's. */
+    input->bindings[16].kind = input->layer_bindings[16].kind = input->hold_bindings[16].kind = PW_GAME_BIND_NONE;
+}
+
+/* The pad mapper's counters for g's pad line (PS4WINE gpad), every 60 s. */
+static PwWinePadMap g_map;
+static uint64_t g_map_lost;   /* reads that failed for longer than the grace and let everything go */
+
+static void gpad_emit(void)
+{
+    char extra[400];
+    const PwWinePadMapStats *m = &g_map.stats;
+
+    snprintf(extra, sizeof(extra), " stick_keys=%llu walk_s=%llu layer_keys=%llu taps=%llu holds=%llu toggles=%llu "
+             "chords=%llu stuck=%llu lost=%llu kbm=%u pad=%u marks=%d faults_unresolved=%llu",
+             (unsigned long long)m->stick_keys, (unsigned long long)(m->walk_ns / 1000000000ull),
+             (unsigned long long)m->layer_keys, (unsigned long long)m->taps, (unsigned long long)m->holds,
+             (unsigned long long)m->toggles, (unsigned long long)m->chords, (unsigned long long)m->stuck,
+             (unsigned long long)g_map_lost, g_kbm_events, g_pad_events, g_marks, faults_unresolved_g());
+    emit_line_with("PS4WINE gpad vtmb", NULL, 0, extra);
 }
 
 /* A segment: SEG_WARM_S after its button, a snapshot, SEG_S later another; the
@@ -4180,13 +4198,16 @@ static void *g_script(void *arg)
     PwGameInput input;
     PwWinePointer pointer = { 0, 0 };
     GSeg seg = { -1, 0, 0, { 0 }, 0 };
-    uint32_t held = 0;
-    uint64_t started = cfg.now_ns(), last = started, next_s = started, next_hid = started;
+    static PwWineInput events[PW_WINE_PAD_MAP_EVENTS];
+    uint32_t held = 0, swallowed = 0;
+    int touch_chord = 0, lost = 0;
+    uint64_t started = cfg.now_ns(), last = started, next_s = started, next_hid = started, last_read = started;
     int32_t user = -1;
     int have_pad;
     (void)arg;
 
     g_bindings(&input);
+    pw_wine_pad_map_init(&g_map);
     have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
     if (have_pad) user = pad.user;
     else if (sceUserServiceInitialize(NULL), sceUserServiceGetInitialUser(&user)) user = -1;
@@ -4218,6 +4239,7 @@ static void *g_script(void *arg)
                     have_prev = 1;
                 }
             }
+            if ((now - started) / 1000000000ull % 60 == 59) gpad_emit();
             if ((now - started) / 1000000000ull % 10 == 0) {
                 vulkan_stats(&vk);
                 step("g t=%llus marks=%d presents=%llu flex_mib=%lld batch_lines=%llu unhandled=%u inputs=%u "
@@ -4260,18 +4282,33 @@ static void *g_script(void *arg)
         if (have_pad) {
             memset(&state, 0, sizeof(state));
             if (!pw_pad_orbis_read(&pad, &state)) {
-                uint32_t pressed = state.buttons & ~held;
+                uint32_t pressed = state.buttons & ~held, released = held & ~state.buttons, chord;
                 PwWineInput move;
+                size_t n;
 
                 d_pad_reads++;
-                if (pressed & touchpad) g_mark(now, started);
-                if ((pressed & (square | triangle)) && seg.kind < 0) {
-                    seg.kind = (pressed & triangle) ? 1 : 0;
-                    seg.start_ns = now;
-                    seg.have_a = 0;
-                    step("g segment %s from t=%llus", seg.kind ? "hub" : "int",
-                         (unsigned long long)((now - started) / 1000000000ull));
+                last_read = now;
+                lost = 0;
+                /* The touchpad: a tap (pressed and released alone) is a mark;
+                 * square or triangle pressed while it is held start a segment
+                 * and never reach the game. A mark fires on the release, so a
+                 * segment's chord is not also a mark (the second mark opens
+                 * g's window). */
+                if (pressed & touchpad) touch_chord = 0;
+                chord = (state.buttons & touchpad) ? pressed & (square | triangle) : 0;
+                if (chord) {
+                    touch_chord = 1;
+                    swallowed |= chord;
+                    if (seg.kind < 0) {
+                        seg.kind = (chord & triangle) ? 1 : 0;
+                        seg.start_ns = now;
+                        seg.have_a = 0;
+                        step("g segment %s from t=%llus", seg.kind ? "hub" : "int",
+                             (unsigned long long)((now - started) / 1000000000ull));
+                    }
                 }
+                if ((released & touchpad) && !touch_chord) g_mark(now, started);
+                swallowed &= state.buttons;
                 if (input.mouse != PW_GAME_STICK_NONE &&
                     pw_wine_pointer_step(&pointer, input.mouse == PW_GAME_STICK_LEFT ? state.left_x : state.right_x,
                                          input.mouse == PW_GAME_STICK_LEFT ? state.left_y : state.right_y,
@@ -4281,17 +4318,24 @@ static void *g_script(void *arg)
                     g_pad_events++;
                     g_inputs++;
                 }
-                for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
-                    const PwGameBinding *bind = &input.bindings[i];
-                    uint32_t mask = pw_game_button_mask(i), down = state.buttons & mask;
-                    if (!mask || down == (held & mask)) continue;
-                    if (bind->kind == PW_GAME_BIND_KEY) post(1, bind->code, 0, 0, down != 0);
-                    else if (bind->kind == PW_GAME_BIND_MOUSE) post(3, bind->code, 0, 0, down != 0);
-                    else continue;
-                    g_pad_events++;
-                    g_inputs++;
-                }
+                /* Everything else through the mapper (layer, tap/hold, latches,
+                 * chords, the stick's keys), touchpad and its chords removed. */
+                n = pw_wine_pad_map_step(&input, &g_map, state.buttons & ~(touchpad | swallowed), state.left_x,
+                                         state.left_y, state.right_x, state.right_y, 1, now, events,
+                                         PW_WINE_PAD_MAP_EVENTS);
+                for (size_t i = 0; i < n; i++) post(events[i].type, events[i].code, 0, 0, events[i].down);
+                g_pad_events += (uint32_t)n;
+                g_inputs += (uint32_t)n;
                 held = state.buttons;
+            } else if (now - last_read > 250000000ull && !lost) {
+                /* The pad stopped reading: let go of every key it holds
+                 * (buttons, the stick's, a latch), once per loss. */
+                size_t n = pw_wine_pad_map_step(&input, &g_map, 0, 0x80, 0x80, 0x80, 0x80, 0, now, events,
+                                                PW_WINE_PAD_MAP_EVENTS);
+                for (size_t i = 0; i < n; i++) post(events[i].type, events[i].code, 0, 0, events[i].down);
+                if (n) g_map_lost++;
+                lost = 1;
+                held = swallowed = 0;
             }
         }
         last = now;
@@ -4303,7 +4347,11 @@ static void *g_script(void *arg)
         if (seg.kind >= 0 && seg.have_a &&
             now - seg.start_ns >= (uint64_t)(G_SEG_WARM_S + G_SEG_S) * 1000000000ull)
             g_seg_end(&seg);
-        if (g_marks >= 2 && !g_line_sent && now - g_window_ns >= (uint64_t)G_WINDOW_S * 1000000000ull) {
+        /* now was read before this pass's mark stamped g_window_ns: compare
+         * only once it is past it (L14: the unsigned difference wrapped and
+         * the 300 s window ended as it began). */
+        if (g_marks >= 2 && !g_line_sent && now >= g_window_ns &&
+            now - g_window_ns >= (uint64_t)G_WINDOW_S * 1000000000ull) {
             g_line_sent = 1;
             pw_ms_wine_end("running", "", -1);
         }

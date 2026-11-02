@@ -567,6 +567,124 @@ static void test_debug_env(void)
            PW_GAME_CPU_ENV_MAX + PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
 }
 
+
+/* keyboard_stick, its dead zone and the four direction keys (upstream
+ * prospero-win #736, 58b6e0c). */
+static void test_keyboard_stick(void)
+{
+    PwGameProfile p;
+    PwGameInput in;
+    static const char *refused[] = {
+        "keyboard_stick = middle_stick",            /* not a stick */
+        "keyboard_stick = left_stick\nkeyboard_stick = right_stick",  /* twice */
+        "stick_deadzone = 4",                       /* below the range */
+        "stick_deadzone = 71",                      /* above it */
+        "stick_deadzone = left_stick",              /* not a number */
+        "stick_deadzone = 25\nstick_deadzone = 30", /* twice */
+        "stick_up = mouse_left",                    /* a key, not a button */
+    };
+
+    /* Defaults: no stick drives the keys, dead zone 25, WASD. */
+    assert(parse(APP "[input]\nmode = keyboard\n", &p) == PW_OK);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_NONE);
+    assert(p.input.stick_deadzone == 25);
+    assert(p.input.stick_keys[0] == 'W' && p.input.stick_keys[1] == 'S' &&
+           p.input.stick_keys[2] == 'A' && p.input.stick_keys[3] == 'D');
+
+    /* Named stick, dead zone and remapped keys. */
+    assert(parse(APP "[input]\nmode = keyboard\nkeyboard_stick = left_stick\n"
+                     "stick_deadzone = 40\nstick_up = up\nstick_down = down\n"
+                     "stick_left = left\nstick_right = right\n", &p) == PW_OK);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_LEFT);
+    assert(p.input.stick_deadzone == 40);
+    assert(p.input.stick_keys_set == 0xf);
+    assert(p.input.stick_keys[0] != 'W' && p.input.stick_keys[3] != 'D');
+
+    assert(parse(APP "[input]\nkeyboard_stick = right_stick\n", &p) == PW_OK &&
+           p.input.keyboard_stick == PW_GAME_STICK_RIGHT);
+    assert(parse(APP "[input]\nkeyboard_stick = none\n", &p) == PW_OK &&
+           p.input.keyboard_stick == PW_GAME_STICK_NONE);
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char text[2048];
+        snprintf(text, sizeof(text), APP "[input]\n%s\n", refused[i]);
+        assert(parse(text, &p) != PW_OK);
+    }
+
+    /* A shared preset's stick settings, overridden by the profile. */
+    pw_game_input_init(&in);
+    assert(preset("[input]\nkeyboard_stick = right_stick\nstick_deadzone = 60\n", &in) == PW_OK);
+    assert(in.keyboard_stick == PW_GAME_STICK_RIGHT && in.stick_deadzone == 60);
+    assert(parse(APP "[input]\nkeyboard_stick = left_stick\n", &p) == PW_OK);
+    pw_game_input_overlay(&in, &p.input);
+    assert(in.keyboard_stick == PW_GAME_STICK_LEFT);
+    assert(in.stick_deadzone == 60);   /* the profile said nothing, so the preset holds */
+}
+
+/* The layer, tap/hold, latches, chords and walk/run. */
+static void test_layer_hold_toggle_chord(void)
+{
+    PwGameInput in;
+    PwGameProfile p;
+    static const char *refused[] = {
+        "layer = l1\nl1 = space",                    /* the layer button sends something */
+        "layer = l1\nl1.hold = space",               /* a hold on the layer button */
+        "layer = r1\nl1+cross = 1",                  /* the prefix is not the layer */
+        "l1+cross = 1",                              /* a prefix with no layer */
+        "layer = l1\nl1+l1 = 1",                     /* the layer on itself */
+        "layer = l1\nlayer = r1",                    /* twice */
+        "layer = middle",                            /* not a button */
+        "layer = l1\nl1+cross = 1\nl1+cross = 2",    /* a layer binding twice */
+        "layer = l1\nl1+cross.hold = 1",             /* a hold inside the layer */
+        "cross = ctrl+shift+c",                      /* three keys */
+        "cross = meta+c",                            /* not a modifier */
+        "cross = ctrl+ctrl",                         /* the modifier on itself */
+        "cross = toggle:mouse_left",                 /* a latch of a mouse button */
+        "square.hold = toggle:h",                    /* a hold must be plain */
+        "square.hold = ctrl+h",
+        "square.hold = h\nsquare.hold = r",          /* twice */
+        "cross.held = e",                            /* not .hold */
+        "hold_ms = 99", "hold_ms = 2001",
+        "stick_walk = shift",                        /* a walk key with no run point */
+        "stick_walk = shift\nstick_run = 20",        /* run inside the dead zone (25) */
+        "stick_run = 9", "stick_run = 101",
+        "stick_walk = mouse_left\nstick_run = 80",
+    };
+
+    pw_game_input_init(&in);
+    assert(in.layer == -1 && in.hold_ms == 350 && in.stick_walk == 0);
+    assert(preset("[input]\nlayer = l1\nl1 = none\ncross = e\nl1+cross = 1\nl1+up = 5\nl1+r1 = 9\n"
+                  "l1+l2 = ctrl+c\nl1+r3 = f9\nsquare = r\nsquare.hold = h\nhold_ms = 300\n"
+                  "l3 = toggle:ctrl\nkeyboard_stick = left_stick\nstick_walk = shift\nstick_run = 80\n",
+                  &in) == PW_OK);
+    assert(in.layer == 4);                                           /* l1 */
+    assert(in.bindings[0].kind == PW_GAME_BIND_KEY && in.bindings[0].code == 'E');
+    assert(in.layer_bindings[0].kind == PW_GAME_BIND_KEY && in.layer_bindings[0].code == '1');
+    assert(in.layer_bindings[10].code == '5' && in.layer_bindings[5].code == '9');
+    assert(in.layer_bindings[6].code == 'C' && in.layer_bindings[6].mod == 0x11);   /* l2: ctrl+c */
+    assert(in.layer_bindings[9].code == 0x78);                       /* r3: f9 */
+    assert(in.layer_bindings[1].kind == PW_GAME_BIND_UNSET);         /* circle: falls through */
+    assert(in.bindings[2].code == 'R' && in.hold_bindings[2].code == 'H' && in.hold_ms == 300);
+    assert(in.bindings[8].code == 0x11 && in.bindings[8].toggle == 1);   /* l3: toggle:ctrl */
+    assert(in.stick_walk == 0x10 && in.stick_run == 80);
+    assert(in.layer_bindings[0].mask == 0x4000u && in.hold_bindings[2].mask == 0x8000u);
+
+    /* A profile's own [input] overrides one layer entry and keeps the rest. */
+    assert(parse(APP "[input]\nlayer = l1\nl1+cross = 3\n", &p) == PW_OK);
+    pw_game_input_overlay(&in, &p.input);
+    assert(in.layer_bindings[0].code == '3' && in.layer_bindings[10].code == '5' && in.layer == 4);
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char text[2048];
+        PwGameInput scratch;
+        snprintf(text, sizeof(text), APP "[input]\n%s\n", refused[i]);
+        assert(parse(text, &p) != PW_OK);
+        pw_game_input_init(&scratch);
+        snprintf(text, sizeof(text), "[input]\n%s\n", refused[i]);
+        assert(preset(text, &scratch) != PW_OK);
+    }
+}
+
 int main(void)
 {
     test_graphics_env();
@@ -578,7 +696,10 @@ int main(void)
     test_refusals();
     test_presets();
     test_default_mode();
+    test_keyboard_stick();
+    test_layer_hold_toggle_chord();
     printf("game profile passed: application plus display and input, every binding kind, "
-           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile\n");
+           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile, "
+           "a stick driving the direction keys, the layer, tap/hold, latches, chords and walk/run\n");
     return 0;
 }

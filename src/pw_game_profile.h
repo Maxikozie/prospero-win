@@ -32,8 +32,30 @@
  *                          ; when nothing is bound, keyboard otherwise
  *   mouse = right_stick    ; a stick moves the pointer: left_stick, right_stick, none
  *   mouse_speed = 1200     ; pointer pixels per second at full tilt
+ *   keyboard_stick = left_stick ; one stick presses four direction keys
+ *                          ; (upstream prospero-win #736): left_stick,
+ *                          ; right_stick or none (default none)
+ *   stick_deadzone = 25    ; how far it must be pushed, percent 5..70
+ *   stick_up = w           ; the four direction keys, default WASD
+ *   stick_down = s
+ *   stick_left = a
+ *   stick_right = d
+ *   stick_walk = shift     ; a key held with the direction keys while the
+ *   stick_run = 80         ; stick is pushed less than stick_run percent
+ *                          ; (walk); past it the key is let go (run)
  *   cross = space          ; <button> = <key> | mouse_left | mouse_right |
- *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
+ *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none |
+ *                          ;            toggle:<key> (a latch) |
+ *                          ;            ctrl+<key> (a chord: one of ctrl,
+ *                          ;            shift, alt plus one key)
+ *   square.hold = h        ; a button with a .hold binding sends its own on a
+ *   hold_ms = 350          ; tap (released before hold_ms, 100..2000,
+ *                          ; default 350) and the hold binding once held
+ *   layer = l1             ; a modifier button: it sends nothing itself (its
+ *   l1+cross = 1           ; own binding must be none), and while it is held
+ *                          ; <layer>+<button> lines replace a button's
+ *                          ; binding; buttons without one keep theirs. The
+ *                          ; prefix must name the layer button of the file
  *   player2 = pinball-p2   ; a keyboard preset for a second DualSense, the pad
  *                          ; of another signed-in user (local multiplayer)
  *
@@ -99,13 +121,26 @@ typedef struct PwGameBinding {
     uint32_t mask;      /* the DualSense button (scePadRead bit) */
     uint8_t kind;       /* PwGameBindKind */
     uint16_t code;      /* KEY: Windows virtual key; MOUSE: 0 left, 1 right, 2 middle */
+    uint8_t toggle;     /* KEY: each press latches or lets go of the key */
+    uint16_t mod;       /* KEY: a modifier's virtual key held around it (a chord), 0 none */
 } PwGameBinding;
 
 typedef struct PwGameInput {
     PwGameInputMode mode;
     PwGameStick mouse;
     uint32_t mouse_speed;
+    PwGameStick keyboard_stick;      /* digital key presses from this stick */
+    uint8_t stick_deadzone;          /* percent, 5..70 */
+    uint8_t stick_keys_set;          /* directions explicitly set by this profile/preset */
+    uint16_t stick_keys[4];          /* up, down, left, right; defaults to W, S, A, D */
+    uint16_t stick_walk;             /* key held while the stick is pushed less than stick_run, 0 none */
+    uint8_t stick_run;               /* percent, past the dead zone; 0 with no walk key */
+    int8_t layer;                    /* the layer button's PW_GAME_BUTTON index, -1 none */
+    uint32_t layer_prefixes;         /* the buttons named as <prefix>+ in this file (checked at its end) */
+    uint32_t hold_ms;                /* tap or hold, 100..2000 */
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
+    PwGameBinding layer_bindings[PW_GAME_BUTTON_COUNT];   /* while the layer button is held */
+    PwGameBinding hold_bindings[PW_GAME_BUTTON_COUNT];    /* once held hold_ms */
     char preset[PW_APP_ID_CAPACITY];
     char player2[PW_APP_ID_CAPACITY];   /* the second pad's preset, profile only */
     uint32_t set;       /* which of mode/mouse/mouse_speed a file set (overlay) */

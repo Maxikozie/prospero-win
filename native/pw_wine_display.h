@@ -88,4 +88,74 @@ enum { PW_WINE_POINTER_DEADZONE = 20 };   /* of 128, stick noise at rest */
  * else 0. */
 int pw_wine_pointer_step(PwWinePointer *pointer, uint8_t stick_x, uint8_t stick_y,
                          uint32_t speed, uint32_t elapsed_us, PwWineInput *out);
+
+/* Digital key emulation for one analog stick (upstream prospero-win #736,
+ * 58b6e0c). Direction bits are retained across frames so key-down is sent
+ * only on a threshold crossing, and every held direction is released when
+ * the controller disconnects.
+ *
+ * For titles that read the keyboard for movement and cannot be configured
+ * to use a stick axis: one stick drives the four direction keys. */
+typedef struct PwWineKeyboardStick { uint8_t held; } PwWineKeyboardStick;
+size_t pw_wine_keyboard_stick_step(const PwGameInput *input, uint8_t stick_x, uint8_t stick_y,
+                                   int connected, PwWineKeyboardStick *state,
+                                   PwWineInput *out, size_t max);
+
+/* The pad mapper: a profile's whole keyboard-mode input for one pad, step
+ * by step (the PS4 title's play loop). Each step takes the held buttons, the
+ * sticks and the time and returns the KEY and MOUSE_BUTTON events to post:
+ *
+ * - A button's action is chosen when it is pressed, from the layer button's
+ *   state at that moment (its <layer>+ binding, else its own), and its
+ *   release lets go of exactly what that press took, so pressing or
+ *   releasing the layer button never leaves a key held.
+ * - A button with a .hold binding sends nothing on its press: released
+ *   before hold_ms it taps its own binding (down now, up after
+ *   PW_WINE_PAD_TAP_NS, so a game sampling once a frame sees it); held
+ *   hold_ms it holds the hold binding until released.
+ * - toggle:<key> latches the key on one press and lets it go on the next; a
+ *   chord holds its modifier around its key.
+ * - keyboard_stick's direction keys, and stick_walk held with them while the
+ *   stick is pushed less than stick_run percent (5 counts of hysteresis).
+ * - Keys are counted: a key goes down when its first holder takes it and up
+ *   when its last lets go, so a latch, the walk key and a chord can share
+ *   ctrl or shift without one releasing the other.
+ * - A step with connected 0 lets go of everything and clears the latches.
+ *
+ * Stuck counts keys found down that no holder accounts for (the invariant
+ * is 0). out must hold PW_WINE_PAD_MAP_EVENTS events; 0 is returned for a
+ * smaller one. */
+enum { PW_WINE_PAD_MAP_EVENTS = 192, PW_WINE_PAD_MAP_TAPS = 16 };
+#define PW_WINE_PAD_TAP_NS 20000000ull
+typedef struct PwWinePadMapStats {
+    uint64_t stick_keys;    /* direction keys pressed by the stick */
+    uint64_t walk_ns;       /* time the walk key was held by the stick */
+    uint64_t layer_keys;    /* presses that took their <layer>+ binding */
+    uint64_t taps, holds, toggles, chords;
+    uint64_t stuck;         /* keys found down with no holder (each step that finds one) */
+    uint64_t events;        /* events returned */
+} PwWinePadMapStats;
+typedef struct PwWinePadMap {
+    uint32_t buttons;                       /* held at the last step */
+    int layer_down;
+    struct {
+        uint8_t phase;                      /* PwWinePadPhase (pw_wine_display.c) */
+        PwGameBinding took;                 /* what the press holds */
+        uint64_t since_ns;
+    } press[PW_GAME_BUTTON_COUNT];
+    uint8_t latched[PW_GAME_BUTTON_COUNT];
+    PwGameBinding latch[PW_GAME_BUTTON_COUNT];
+    struct { PwGameBinding binding; uint64_t up_ns; } taps[PW_WINE_PAD_MAP_TAPS];
+    uint32_t tap_count;
+    PwWineKeyboardStick stick;
+    uint8_t walk;
+    uint64_t last_ns;
+    uint8_t key_refs[256];
+    uint8_t mouse_refs[3];
+    PwWinePadMapStats stats;
+} PwWinePadMap;
+void pw_wine_pad_map_init(PwWinePadMap *map);
+size_t pw_wine_pad_map_step(const PwGameInput *input, PwWinePadMap *map, uint32_t buttons, uint8_t left_x,
+                            uint8_t left_y, uint8_t right_x, uint8_t right_y, int connected, uint64_t now_ns,
+                            PwWineInput *out, size_t max);
 #endif
