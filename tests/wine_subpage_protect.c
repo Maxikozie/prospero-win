@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 #define PAGE 4096
-#define PAGES 16
+#define PAGES 20
 
 static unsigned char *base;
 static volatile LONG faults, fault_page, fault_write;
@@ -88,21 +88,45 @@ int main(void)
     ok = ok && expect("read of the inaccessible page", faults - got, 1) && fault_page == 9 && !fault_write;
     (void)sink;
 
-    /* Many writes beside a protected page: the first ones are stepped over unseen;
-     * when they keep coming, Wine reports one write to the protected page itself
-     * (the handler then makes it writable, as an emulator does), and none after. */
+    /* Many writes beside a read-only page: the first ones are stepped over unseen;
+     * when they keep coming, the host page is kept whole and the rest run unstepped.
+     * None of them is reported, since none touched the read-only page (a loader
+     * filling a page next to a section it made read-only takes a report for a real
+     * access violation). Protecting the page again splits the host page: a write to
+     * it faults again. */
     ok = ok && protect(13, PAGE_READONLY);
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
     got = faults;
     for (i = 0; i < 20000; i++) ((volatile unsigned char *)base)[12 * PAGE + (i & 4095)] = (unsigned char)i;
     QueryPerformanceCounter(&end);
-    got = faults - got;
-    printf("subpage 20000 writes beside a read-only page: %ld fault(s), expected at most 1 on that page\n", got);
-    ok = ok && (got == 0 || (got == 1 && fault_page == 13 && fault_write));
+    ok = ok && expect("20000 writes beside a read-only page", faults - got, 0);
     printf("subpage neighbour writes: %.2f us each\n",
            (double)(end.QuadPart - start.QuadPart) * 1e6 / freq.QuadPart / 20000);
     ok = ok && base[12 * PAGE + 19999 % 4096] == (unsigned char)19999;
+    ok = ok && protect(13, PAGE_READONLY);
+    got = write_pages(13, 1, 11);
+    ok = ok && expect("write to the read-only page protected again", got, 1) && fault_page == 13 && fault_write;
+
+    /* Pages decommitted beside a read-only page in the same host page: Wine clears
+     * them itself, since the host page stays, and that must neither fail nor fault.
+     * They come back as zeroes, and the read-only page still faults on a write.
+     * A loader that maps a module into memory it allocated does this (the Bloodlines
+     * Unofficial Patch's loader.dll). */
+    write_pages(16, 4, 8);
+    ok = ok && protect(17, PAGE_READONLY);
+    got = faults;
+    if (ok && !VirtualFree(base + 18 * PAGE, 2 * PAGE, MEM_DECOMMIT))
+    {
+        printf("subpage decommit beside a read-only page failed %lu\n", GetLastError());
+        ok = 0;
+    }
+    ok = ok && expect("decommit beside a read-only page", faults - got, 0);
+    ok = ok && VirtualAlloc(base + 18 * PAGE, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) == base + 18 * PAGE;
+    ok = ok && base[18 * PAGE + 123] == 0 && base[19 * PAGE + 123] == 0 && base[17 * PAGE + 123] == 8;
+    ok = ok && expect("writes beside the read-only page after the decommit", write_pages(16, 1, 9) + write_pages(18, 2, 9), 0);
+    got = write_pages(17, 1, 10);
+    ok = ok && expect("write to the read-only page after the decommit", got, 1) && fault_page == 17 && fault_write;
 
     printf("subpage verdict=%s\n", ok ? "pass" : "fail");
     fflush(stdout);

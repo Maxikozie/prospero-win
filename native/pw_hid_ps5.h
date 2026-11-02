@@ -26,6 +26,7 @@
 enum {
     PW_HID_PS5_MOUSE_RECORD = 40, PW_HID_PS5_MOUSE_RECORDS = 64,
     PW_HID_PS5_KEYBOARD_STATE = 96, PW_HID_PS5_DUMPS = 3,
+    PW_HID_PS5_MOUSE_SILENT_READS = 7500,   /* about a minute of the title's 8 ms polls */
     PW_HID_PS5_EVENTS = 2 * (PW_HID_KEYS + 8) + 3,
 };
 
@@ -46,6 +47,14 @@ typedef struct PwHidPs5 {
     uint32_t buttons;                                         /* the last mouse buttons */
     uint64_t mouse_time;                                      /* newest record seen */
     unsigned keyboard_dumps, mouse_dumps;
+    /* The mouse reads, not established on the PS4 (USB mouse opened, no record in milestone g's
+     * first sessions): how many, the records they gave, the last result (logged when it changes),
+     * the record count asked for (halved from PW_HID_PS5_MOUSE_RECORDS after a refusal), and
+     * whether the mouse was opened again per device after merged reads gave nothing. */
+    int (*mouse_close)(int32_t handle);
+    uint64_t mouse_reads, mouse_records;
+    int32_t mouse_last_rc, mouse_count;
+    unsigned mouse_refusals, mouse_unmerged;
 } PwHidPs5;
 
 /* One poll: key and button changes, and the mouse's motion. */

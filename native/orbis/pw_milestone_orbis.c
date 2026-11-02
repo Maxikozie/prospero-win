@@ -3086,6 +3086,7 @@ static const PwMsStage g_stages[] = {
     { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
     { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
     { "display", 15, stage_display, "display=fault" },
+    { "audio", 15, stage_audio, "audio_open=fault" },
     { "vtmb", 0, NULL, "exit=fault" },
 };
 static const PwMsPlan plans[] = {
@@ -3245,6 +3246,13 @@ void pw_ms_start(const PwMsConfig *config)
                 if (!strcmp(v, p_path_names[i])) p_path = i;
         if (cfg.setting && cfg.setting("PS4WINE_PRESENT_MODE", v, sizeof(v)))
             p_async = !strcmp(v, "async") ? 1 : !strcmp(v, "sync") ? 0 : p_async;
+    }
+    if (plan->lines == g_lines) {
+        /* g plays with sound through the port p5 measured (stage_audio, Wine's ps5 audio driver);
+         * PS4WINE_AUDIO=off in env.txt turns it off. */
+        char v[32];
+        p_audio = 1;
+        if (cfg.setting && cfg.setting("PS4WINE_AUDIO", v, sizeof(v))) p_audio = !strcmp(v, "off") ? 0 : 1;
     }
     main_thread = pthread_self();
     start_ns = cfg.now_ns();
@@ -3955,6 +3963,16 @@ static void g_lines(void)
                               alias, live, threads, vk_threads, (unsigned long long)batch_lines,
                               g_main_p95(p95, sizeof(p95)),
                               g_seg[0][0] ? g_seg[0] : " int_fps_avg=-", g_seg[1][0] ? g_seg[1] : " hub_fps_avg=-");
+    if (n < sizeof(extra))
+        /* Sound: the port's grains (pw_ms_audio), non-silent ones and refused writes, and the mouse reads. */
+        n += (size_t)snprintf(extra + n, sizeof(extra) - n,
+                              " audio=%s grains=%llu grains_nonzero=%llu audio_errors=%llu mouse_reads=%llu "
+                              "mouse_records=%llu mouse_rc=%d mouse_count=%d",
+                              p_audio != 1 ? "off" : audio_handle >= 0 ? "on" : "fail",
+                              (unsigned long long)audio_grains, (unsigned long long)audio_nonzero,
+                              (unsigned long long)audio_errors, (unsigned long long)g_hid.mouse_reads,
+                              (unsigned long long)g_hid.mouse_records, (int)g_hid.mouse_last_rc,
+                              (int)g_hid.mouse_count);
     session_base_ns = g_marks >= 2 ? g_window_ns : 0;
     emit_line_with("PS4WINE g vtmb", keys, sizeof(keys) / sizeof(keys[0]), extra);
     session_base_ns = 0;

@@ -4,8 +4,8 @@ Subject: ntdll: orbis: native WoW64 signal entry (0883, 0903) on the PS4
 Patches 0883 (raw signal entries through libkernel's syscall stub, the
 verified frame, the readiness export) and 0903 (keep the FS base of a
 64-bit thread resumed where it was) stay PS5-only in the series. On the PS4
-the title measured everything 0883 relies on (ps4-wine phase p2, LOG.md
-2026-11-01 18:56): libkernel's getppid stub has the same shape and its
+the title measured everything 0883 relies on (on the console,
+2026-11-01): libkernel's getppid stub has the same shape and its
 syscall instruction runs other calls; sigaltstack works (with FreeBSD's
 stack_t, which wine/orbis/include has); a signal registered with the
 kernel's own sigaction and SA_ONSTACK arrives on the alternate stack, where

@@ -1,7 +1,7 @@
 From: prospero-win orbis <noreply@localhost>
 Subject: win32u: ps5 driver: tell ntdll what each present changed
 
-For the title's measurements (ps4-wine phase p): before each present the
+For the PS4 title's performance measurements: before each present the
 driver calls ntdll's pw_wine_note_flush, when it exists, with the area a
 surface flush changed (0 for a present that is not a flush: the pointer
 moved, a window hidden or a mode set), the desktop's area, and whether

@@ -1,0 +1,47 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: clear decommitted pages beside a read-only page
+
+Where host pages are larger than Windows pages (16 KiB on the PS4 and the
+PS5), decommitting pages that share a host page with pages staying committed
+cannot replace the host page, so clear_committed_pages zeroes them. It opened
+each page with mprotect_range, but since patch 0974 a committed read-only or
+inaccessible neighbour takes writing away from the whole host page, so the
+memset faulted on the neighbour: 0974 stepped it 256 times and then reported
+it as a write to the read-only page, and NtFreeVirtualMemory(MEM_DECOMMIT)
+returned STATUS_ACCESS_VIOLATION.
+
+The Unofficial Patch of Vampire: The Masquerade - Bloodlines hit it at start:
+its loader.dll maps a module itself into memory it allocated, makes one page
+read-only and decommits the pages after it, and the launcher stopped with
+"Failed to load the loader DLL: No access to memory location". The PC's Wine
+does the same with WINE_HOST_PAGE_SIZE=16384 and loads the DLL with 4 KiB
+host pages.
+
+The clear is Wine's own write, so the host page is opened with what its pages
+allow plus writing for it; decommit_pages already gives the partial host pages
+their own protection again once the pages are no longer committed (and on
+failure). Nothing changes where host pages are Windows pages.
+---
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2919,7 +2919,19 @@ static NTSTATUS clear_committed_pages( char *start, char *end )
+     for (page = start; page < end; page += page_size)
+     {
+         if (!(get_page_vprot( page ) & VPROT_COMMITTED)) continue;
+-        if (mprotect_range( page, page_size, VPROT_READ | VPROT_WRITE, VPROT_GUARD | VPROT_WRITEWATCH ))
++        if (host_page_size != page_size)
++        {
++            /* The clear is Wine's own write, not the program's. A committed page that is
++             * read-only or inaccessible takes writing away from its whole host page
++             * (get_host_page_unix_prot), so writing through it here would fault on the
++             * neighbour. Open the host page with what its pages allow plus writing; the
++             * caller gives it its own protection again once these pages are decommitted. */
++            BYTE vprot = (get_host_page_vprot( page ) | VPROT_COMMITTED | VPROT_READ | VPROT_WRITE) &
++                         ~(VPROT_GUARD | VPROT_WRITEWATCH);
++            if (mprotect_exec( ROUND_ADDR( page, host_page_mask ), host_page_size, get_unix_prot( vprot ) ))
++                return STATUS_ACCESS_DENIED;
++        }
++        else if (mprotect_range( page, page_size, VPROT_READ | VPROT_WRITE, VPROT_GUARD | VPROT_WRITEWATCH ))
+             return STATUS_ACCESS_DENIED;
+         memset( page, 0, page_size );
+     }

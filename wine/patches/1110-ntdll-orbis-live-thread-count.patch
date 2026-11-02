@@ -2,10 +2,9 @@ From: prospero-win orbis <noreply@localhost>
 Subject: ntdll: orbis: export the live and peak thread counts
 
 The PS4 title's milestone g lines record how many threads Wine has alive at
-once over a game's session (docs/ps4/HANDOFF-g.md in ps4-wine). Since a
-thread whose stack the caller set (spawn_thread's kernel stack) goes to
-libkernel untouched (ps4-wine's orbis-compat patch 0001, keep), the pthread
-layer no longer sees threads end, so the count has to come from Wine's own
+once over a game's session. Since a thread whose stack the caller set
+(spawn_thread's kernel stack) goes to libkernel untouched (the title's
+pthread layer passes a caller-set stack through), the pthread layer no longer sees threads end, so the count has to come from Wine's own
 nb_threads. pw_wine_thread_live reads it and the most seen at once, which
 spawn_thread now keeps. Orbis only (__ORBIS__): nothing changes elsewhere.
 ---

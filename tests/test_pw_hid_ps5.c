@@ -14,7 +14,7 @@ static int32_t opened_user, merged_flags[2];
 static int merged_calls;
 static uint8_t keyboard_state[PW_HID_PS5_KEYBOARD_STATE];
 static uint8_t mouse_records[4 * PW_HID_PS5_MOUSE_RECORD];
-static int mouse_count;
+static int mouse_count, mouse_refuse_above, mouse_closes;
 
 static int32_t fake_load(const char *path)
 {
@@ -43,9 +43,16 @@ static int fake_keyboard_read(int32_t handle, void *state)
 }
 static int fake_mouse_read(int32_t handle, void *records, int32_t count)
 {
-    assert(handle == 4 && count == PW_HID_PS5_MOUSE_RECORDS);
+    assert(handle == 4 && count >= 1 && count <= PW_HID_PS5_MOUSE_RECORDS);
+    if (mouse_refuse_above && count > mouse_refuse_above) return (int)0x80df0003;   /* a refused count */
     memcpy(records, mouse_records, (size_t)mouse_count * PW_HID_PS5_MOUSE_RECORD);
     return mouse_count;
+}
+static int fake_mouse_close(int32_t handle)
+{
+    assert(handle == 4);
+    mouse_closes++;
+    return 0;
 }
 static int fake_resolve(int32_t module, const char *name, void **address)
 {
@@ -53,7 +60,7 @@ static int fake_resolve(int32_t module, const char *name, void **address)
         { "sceKeyboardInit", (void *)fake_init }, { "sceKeyboardOpen", (void *)fake_keyboard_open },
         { "sceKeyboardReadState", (void *)fake_keyboard_read },
         { "sceMouseInit", (void *)fake_init }, { "sceMouseOpen", (void *)fake_mouse_open },
-        { "sceMouseRead", (void *)fake_mouse_read },
+        { "sceMouseRead", (void *)fake_mouse_read }, { "sceMouseClose", (void *)fake_mouse_close },
     };
     (void)module;
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
@@ -149,14 +156,14 @@ static void test_open_and_poll(void)
     assert(poll.events[0].kind == PW_HID_EVENT_KEY && poll.events[0].code == 0x11 && poll.events[0].down);
     assert(poll.events[1].code == 'W' && poll.events[1].down);
     assert(poll.events[2].kind == PW_HID_EVENT_BUTTON && poll.events[2].code == 0 && poll.events[2].down);
-    assert(lines == 2);                                   /* the first data is dumped */
+    assert(lines == 3);                                   /* the first data is dumped, the first records noted */
 
     keyboard(0, NULL, 0);
     mouse(0, 2, 0, 0, 0, 0);
     pw_hid_ps5_poll(&hid, &poll);
     assert(poll.count == 3 && !poll.events[0].down && poll.events[0].code == 'W' &&
            poll.events[1].code == 0x11 && !poll.events[2].down);
-    assert(lines == 3);                                   /* an empty keyboard is not dumped */
+    assert(lines == 4);                                   /* an empty keyboard is not dumped */
 
     /* No new records: nothing changes. */
     mouse_count = 0;
@@ -164,11 +171,48 @@ static void test_open_and_poll(void)
     assert(poll.count == 0 && !poll.dx && !poll.dy);
 }
 
+/* A read count the system refuses is halved until a read is taken; merged
+ * reads that give nothing for about a minute open the mouse per device. */
+static void test_mouse_refusal_and_silence(void)
+{
+    PwHidPs5 hid;
+    PwHidPs5Poll poll;
+
+    keyboard_loads = 0;
+    mouse_loads = 1;
+    merged_refused = 0;
+    merged_calls = mouse_closes = 0;
+    assert(pw_hid_ps5_open(&hid, &ops, 1) == PW_OK && hid.mouse == 4 && hid.mouse_count == PW_HID_PS5_MOUSE_RECORDS);
+    mouse_refuse_above = 8;
+    mouse(0, 5, 0, 3, 4, 0);
+    mouse_count = 1;
+    for (int i = 0; i < 3; i++) {
+        pw_hid_ps5_poll(&hid, &poll);
+        assert(poll.dx == 0 && hid.mouse_records == 0);
+    }
+    assert(hid.mouse_count == 8 && hid.mouse_refusals == 3 && hid.mouse_last_rc == (int32_t)0x80df0003);
+    pw_hid_ps5_poll(&hid, &poll);
+    assert(hid.mouse_records == 1 && poll.dx == 3 && poll.dy == 4 && hid.mouse_reads == 4 && !mouse_closes);
+    mouse_refuse_above = 0;
+
+    merged_calls = 0;
+    assert(pw_hid_ps5_open(&hid, &ops, 1) == PW_OK && merged_calls == 1 && merged_flags[0] == 1);
+    mouse_count = 0;
+    for (int i = 0; i < PW_HID_PS5_MOUSE_SILENT_READS - 1; i++) pw_hid_ps5_poll(&hid, &poll);
+    assert(!mouse_closes && !hid.mouse_unmerged);
+    pw_hid_ps5_poll(&hid, &poll);
+    assert(mouse_closes == 1 && hid.mouse_unmerged && hid.mouse == 4 && merged_calls == 2 && merged_flags[1] == 0);
+    /* Per device, silence is only silence: no further reopen. */
+    for (int i = 0; i < PW_HID_PS5_MOUSE_SILENT_READS + 1; i++) pw_hid_ps5_poll(&hid, &poll);
+    assert(mouse_closes == 1 && merged_calls == 2);
+}
+
 int main(void)
 {
     test_keyboard_layout();
     test_mouse_layout();
     test_open_and_poll();
+    test_mouse_refusal_and_silence();
     puts("ps5 usb keyboard and mouse passed");
     return 0;
 }

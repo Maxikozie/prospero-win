@@ -1,0 +1,67 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: keep a hot host page whole beside a read-only page
+
+Patch 0974 single-steps writes to a writable page whose host page holds a
+read-only one. After 256 such writes on one host page it reported the next
+write as a write to the read-only page, so that an emulator protecting its
+recompiled code would drop that protection. An ordinary program gets a fault
+it never caused: the Unofficial Patch of Vampire: The Masquerade - Bloodlines
+maps a module itself, makes one of its pages read-only and goes on filling the
+page before it, and its loader.dll took the reported write for an access
+violation and failed to load ("Failed to load the loader DLL: No access to
+memory location"). The PC's Wine with WINE_HOST_PAGE_SIZE=16384 does the same
+and loads the DLL once the report is gone.
+
+Instead, the hot host page gets the union of its pages' protections, as before
+0974, and the write runs again without a step, as patch 0986 upstream does for
+accesses beside an inaccessible page. The host page is split again when a
+protection in it changes (mprotect_range recomputes it), and its count starts
+again. Until then a write to the read-only page itself is not seen, as before
+0974: a program that watches its own read-only pages through faults, beside
+pages it writes this often, no longer gets that fault.
+---
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5227,9 +5227,9 @@ static struct { const char *page; unsigned int steps; } subpage_heat[64];
+  *
+  * Counts a write stepped over in a host page because a page in it is read-only.
+  * Once the host page has had SUBPAGE_HOT_STEPS of them, returns that read-only
+- * page, to report the write there instead; NULL to step this one. The count
+- * starts again after a report, so a program that keeps the page read-only gets
+- * one report per SUBPAGE_HOT_STEPS writes and the rest are stepped, not a loop.
++ * page: the caller then keeps the host page whole instead of stepping; NULL to
++ * step this one. The count starts again then, for when the host page is split
++ * again by a protection change.
+  */
+ static char *subpage_hot_write( char *page )
+ {
+@@ -5323,17 +5323,21 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+          * again in virtual_subpage_step_done when the single step traps. */
+         int need = err == EXCEPTION_WRITE_FAULT ? PROT_WRITE : err == EXCEPTION_EXECUTE_FAULT ? PROT_EXEC : PROT_READ;
+         int prot = get_unix_prot( get_page_vprot( addr ) );
+-        char *protected_page;
+ 
+         if (!(prot & need) || (get_host_page_unix_prot( page, NULL, NULL, 0, 0 ) & need))
+             ;
+-        else if (err == EXCEPTION_WRITE_FAULT && (protected_page = subpage_hot_write( page )))
+-        {
+-            /* Writes beside a read-only page come too often to step each one: report a
+-             * write to that page instead, as if this one had touched it. A program that
+-             * protects pages to learn when they change (an emulator's recompiled code)
+-             * then drops its protection, and the host page is writable again. */
+-            rec->ExceptionInformation[1] = (ULONG_PTR)protected_page;
++        else if (err == EXCEPTION_WRITE_FAULT && subpage_hot_write( page ))
++        {
++            /* Writes beside a read-only page come too often to step each one. Give the
++             * host page the union of its pages' protections, as before the split, and
++             * let this write run again unstepped. A fault reported on the read-only page
++             * instead would be one the program never caused: a loader filling the page
++             * next to a section it made read-only takes it for a real access violation.
++             * The host page is split again when a protection in it changes, since that
++             * goes through mprotect_range. Until then a write to the read-only page
++             * itself is not seen, as before the split. */
++            if (!mprotect_exec( page, host_page_size, get_unix_prot( get_host_page_vprot( page ) ) ))
++                ret = STATUS_SUCCESS;
+         }
+         else if (!mprotect_exec( page, host_page_size, get_unix_prot( get_host_page_vprot( page ) ) ))
+         {

@@ -101,16 +101,19 @@ static void open_mouse(PwHidPs5 *hid)
     if (module >= 0 && !hid->ops.resolve(module, "sceMouseInit", (void **)&init) &&
         !hid->ops.resolve(module, "sceMouseOpen", (void **)&open) &&
         !hid->ops.resolve(module, "sceMouseRead", (void **)&hid->mouse_read)) {
+        if (hid->ops.resolve(module, "sceMouseClose", (void **)&hid->mouse_close)) hid->mouse_close = NULL;
         init_rc = init();
         /* Every mouse through one handle, as the PS5 ports that ran on
-         * hardware open it; one per device where the system refuses that. */
-        param[0] = 1;
+         * hardware open it; one per device where the system refuses that,
+         * or once merged reads gave nothing (pw_hid_ps5_poll). */
+        param[0] = hid->mouse_unmerged ? 0 : 1;
         handle = open(hid->user_id, 0, 0, param);
-        if (handle < 0) {
+        if (handle < 0 && param[0]) {
             param[0] = 0;
             handle = open(hid->user_id, 0, 0, param);
         }
     }
+    if (hid->mouse_count <= 0 || hid->mouse_count > PW_HID_PS5_MOUSE_RECORDS) hid->mouse_count = PW_HID_PS5_MOUSE_RECORDS;
     if (handle >= 0) hid->mouse = handle;
     if (handle >= 0 || !hid->mouse_failed) {
         snprintf(line, sizeof(line), "mouse module=%#x init=%#x open=%#x merged=%u user=%d",
@@ -160,11 +163,52 @@ void pw_hid_ps5_poll(PwHidPs5 *hid, PwHidPs5Poll *poll)
     }
     if (hid->mouse >= 0) {
         uint8_t records[PW_HID_PS5_MOUSE_RECORDS * PW_HID_PS5_MOUSE_RECORD];
-        int got = hid->mouse_read(hid->mouse, records, PW_HID_PS5_MOUSE_RECORDS);
+        int32_t count = hid->mouse_count > 0 && hid->mouse_count <= PW_HID_PS5_MOUSE_RECORDS ? hid->mouse_count
+                                                                                              : PW_HID_PS5_MOUSE_RECORDS;
+        int got = hid->mouse_read(hid->mouse, records, count);
+        char line[160];
+
+        hid->mouse_reads++;
+        /* What the reads return is not established on the PS4: log each new result that is not a
+         * record count (0 is "nothing new"), so a refusal or a silent mouse shows at once. */
+        if (got <= 0 && (hid->mouse_reads == 1 || got != hid->mouse_last_rc)) {
+            snprintf(line, sizeof(line), "mouse read rc=%d (%#x) count=%d after %llu read(s), %llu record(s)",
+                     got, (unsigned)got, (int)count, (unsigned long long)hid->mouse_reads,
+                     (unsigned long long)hid->mouse_records);
+            logf_(hid, line);
+        }
+        if (got <= 0) hid->mouse_last_rc = got;
+        if (got < 0 && count > 1) {
+            /* A refused count: ask for fewer records. */
+            hid->mouse_count = count / 2;
+            hid->mouse_refusals++;
+            snprintf(line, sizeof(line), "mouse read refused (%#x): asking for %d record(s) now", (unsigned)got,
+                     (int)hid->mouse_count);
+            logf_(hid, line);
+        } else if (!hid->mouse_unmerged && !hid->mouse_records &&
+                   ((got < 0 && count == 1) || hid->mouse_reads >= PW_HID_PS5_MOUSE_SILENT_READS)) {
+            /* Merged reads refused at one record, or nothing in about a minute of polling: open the
+             * mouse again per device. */
+            snprintf(line, sizeof(line), "mouse: %s after %llu merged read(s), opening it per device",
+                     got < 0 ? "refused" : "no record", (unsigned long long)hid->mouse_reads);
+            logf_(hid, line);
+            if (hid->mouse_close) hid->mouse_close(hid->mouse);
+            hid->mouse = -1;
+            hid->mouse_unmerged = 1;
+            hid->mouse_failed = 0;
+            open_mouse(hid);
+            return;
+        }
 
         if (got > 0) {
+            if (!hid->mouse_records) {
+                snprintf(line, sizeof(line), "mouse read gave %d record(s) after %llu read(s), count=%d%s", got,
+                         (unsigned long long)hid->mouse_reads, (int)count, hid->mouse_unmerged ? ", per device" : "");
+                logf_(hid, line);
+            }
+            hid->mouse_records += (uint64_t)got;
             uint32_t buttons = hid->buttons;
-            if (got > PW_HID_PS5_MOUSE_RECORDS) got = PW_HID_PS5_MOUSE_RECORDS;
+            if (got > count) got = count;
             for (int i = 0; i < got && hid->mouse_dumps < PW_HID_PS5_DUMPS; i++, hid->mouse_dumps++)
                 dump(hid, "mouse record", records + (size_t)i * PW_HID_PS5_MOUSE_RECORD, PW_HID_PS5_MOUSE_RECORD);
             pw_hid_ps5_mouse_records(records, got, &poll->dx, &poll->dy, &poll->wheel, &buttons,
