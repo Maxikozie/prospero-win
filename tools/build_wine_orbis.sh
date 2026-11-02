@@ -469,12 +469,15 @@ case " $modules " in *" libvulkan "*)
     # The archive is whole: Mesa's entry points are reached through lookup
     # tables, not by name.
     [ -f "$prx/ntdll.shared.elf" ] || fail "libvulkan imports from ntdll: build ntdll in the same run"
+    # win32u's patch 0740 looks up pw_videoout_cursor after each present;
+    # RADV's VideoOut open and close are wrapped so the hardware cursor
+    # follows the swapchain's output (pw_vulkan_radv_orbis.c).
     desc libvulkan vkGetInstanceProcAddr vkGetDeviceProcAddr pw_vulkan_stats pw_vulkan_thread_stats pw_wine_setenv \
-        pw_vulkan_alias_stats pw_vulkan_present_hist
+        pw_vulkan_alias_stats pw_vulkan_present_hist pw_videoout_cursor pw_vulkan_cursor_stats
     # shellcheck disable=SC2086
     link_prx libvulkan - "$prx/obj/libvulkan_desc.o $obj/pw_vulkan_radv_orbis.o $obj/pw_emutls_orbis.o \
         $obj/pw_wine_env_orbis.o --whole-archive $PROSPERO_RADV_ARCHIVE --no-whole-archive $PROSPERO_RADV_ZLIB \
-        $exit_wraps $import_wraps" ntdll
+        --wrap=sceVideoOutOpen --wrap=sceVideoOutClose $exit_wraps $import_wraps" ntdll
     ;;
 esac
 

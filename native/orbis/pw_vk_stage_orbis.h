@@ -36,6 +36,20 @@ void pw_vk_caps(char *fields, size_t size);
  * DXVK's swapchain recreation does). shot names the file RADV's
  * ORBIS_WSI_SHOT writes; fb=ok when it holds a whole frame. */
 void pw_vk_present(const char *shot, char *fields, size_t size);
+/* vk_present with frames of its own (gc2: the hardware cursor over RADV's
+ * frames): first and reopen frames per swapchain (0: e1's), frame called
+ * after each present (swapchain 0 or 1, the frame's index), between with no
+ * swapchain (the first destroyed, VideoOut closed, the second not made). */
+typedef struct PwVkFrames {
+    unsigned first, reopen;
+    void (*frame)(void *context, unsigned swapchain, unsigned index);
+    void (*between)(void *context);
+    void *context;
+} PwVkFrames;
+void pw_vk_present_frames(const char *shot, const PwVkFrames *frames, char *fields, size_t size);
+/* An export of the libvulkan.prx pw_vk_open opened (as win32u's dlsym finds
+ * it); NULL when missing or not open. */
+void *pw_vk_symbol(const char *name);
 /* Free direct memory (the largest block: the kernel reports no total) and
  * free flexible memory, in MiB. */
 void pw_vk_memory(unsigned long long *dmem_mib, unsigned long long *flex_mib);

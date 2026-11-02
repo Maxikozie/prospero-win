@@ -5,6 +5,8 @@
 #include "pw_videoout_orbis.h"
 #include "pw_pad_orbis.h"
 #include "pw_vk_stage_orbis.h"
+#include "pw_cursor_probe_orbis.h"
+#include "pw_videoout_cursor_orbis.h"
 #include "pw_wine_prx.h"
 #include "pw_wine_display.h"
 #include "pw_wine_exit_orbis.h"
@@ -2085,6 +2087,26 @@ static void stage_vk_present(char *fields, size_t size)
     pw_vk_present(shot, fields, size);
 }
 
+/* gc1: VideoOut's hardware cursor on the title's own display (pw_cursor_probe_orbis.h). */
+static void stage_cursor(char *fields, size_t size)
+{
+    PwCursorProbeHost host = { vk_step, cfg.now_ns };
+    pw_cursor_probe_videoout(&host, fields, size);
+}
+
+/* gc2: libvulkan.prx's pw_videoout_cursor over e1's frames. */
+static void stage_vk_cursor(char *fields, size_t size)
+{
+    PwCursorProbeHost host = { vk_step, cfg.now_ns };
+    char why[96], shot[512];
+    if (vk_ready(why, sizeof(why))) {
+        snprintf(fields, size, "present=fail:%s gpu_hang=0 cursor_export=-", why);
+        return;
+    }
+    snprintf(shot, sizeof(shot), "%s/shot.raw", cfg.root);
+    pw_cursor_probe_vulkan(&host, shot, fields, size);
+}
+
 /* ---- e2 + e3: winevulkan, win32u's surface, the hand-over through Wine ------------------- */
 
 static int vulkan_plan(void);
@@ -2723,6 +2745,29 @@ static void alias_fields(char *out, size_t size)
              (unsigned long long)(live_bytes >> 10), (unsigned long long)(peak_bytes >> 10), failed);
 }
 
+/* VideoOut's hardware cursor through libvulkan.prx (pw_videoout_cursor,
+ * which win32u's patch 0740 calls after each present): its counters. */
+static void cursor_fields(char *out, size_t size)
+{
+    struct pw_vulkan_cursor_stats c;
+    void *address;
+    char rc[16];
+    const char *found = ntdll_symbol("pw_vulkan_cursor_stats", &address);
+
+    memset(&c, 0, sizeof(c));
+    c.size = sizeof(c);
+    if (!strcmp(found, "ok") && ((int (*)(struct pw_vulkan_cursor_stats *))(uintptr_t)address)(&c)) found = "readfailed";
+    if (strcmp(found, "ok")) {
+        snprintf(out, size, "cursor_stats=%s cursor_shows=- cursor_errors=-", found);
+        return;
+    }
+    snprintf(out, size, "cursor_stats=ok cursor_calls=%llu cursor_shows=%llu cursor_updates=%llu cursor_hides=%llu "
+             "cursor_noout=%llu cursor_errors=%llu cursor_rc=%s cursor_at=%u,%u cursor_output=%u cursor_format=%u",
+             (unsigned long long)c.calls, (unsigned long long)c.shows, (unsigned long long)c.updates,
+             (unsigned long long)c.hides, (unsigned long long)c.noout, (unsigned long long)c.errors,
+             pw_cursor_orbis_rc(c.last_rc, rc, sizeof(rc)), c.x, c.y, c.output, c.format);
+}
+
 /* The CPU a 32-bit program ran on: the translator when a thread ran on it,
  * native when wow64native.prx is loaded, else why neither. */
 static const char *wow_cpu(void)
@@ -2898,6 +2943,8 @@ static void g1n_lines(void);
 static void g1m_lines(void);
 static void g1_lines(void);
 static void g_lines(void);
+static void gc1_lines(void);
+static void gc2_lines(void);
 
 static const PwMsStage d1_stages[] = {
     { "bind_early", 10, stage_bind_early, "early_load=fault order_needed=-" },
@@ -3089,6 +3136,21 @@ static const PwMsStage g_stages[] = {
     { "audio", 15, stage_audio, "audio_open=fault" },
     { "vtmb", 0, NULL, "exit=fault" },
 };
+/* g's input step, VideoOut's hardware cursor: gc1 the four calls on the
+ * title's own display (no Wine, no RADV), then hello.exe; gc2 e1's stages
+ * with libvulkan.prx's pw_videoout_cursor called after every present. */
+static const PwMsStage gc1_stages[] = {
+    { "cursor", 90, stage_cursor, "cursor=fault mem=fault" },
+    { "hello", 0, NULL, "hello=fault" },
+};
+static const PwMsStage gc2_stages[] = {
+    { "vk_load", 30, stage_vk_load, "vk_load=fault vk_bound=fault" },
+    { "vk_caps", 30, stage_vk_caps, "inst=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "release", 10, stage_release, "release=fault" },
+    { "vk_cursor", 90, stage_vk_cursor, "present=fault gpu_hang=- cursor_export=fault" },
+    { "hello", 0, NULL, "hello=fault" },
+};
 static const PwMsPlan plans[] = {
     { "d1", d1_stages, sizeof(d1_stages) / sizeof(d1_stages[0]), "C:\\hello.exe", 1, d1_lines },
     { "d2", d2_stages, sizeof(d2_stages) / sizeof(d2_stages[0]), "C:\\gdi64.exe", 0, d2_lines },
@@ -3110,6 +3172,8 @@ static const PwMsPlan plans[] = {
     { "g1m", g1m_stages, sizeof(g1m_stages) / sizeof(g1m_stages[0]), "C:\\vk32.exe", 0, g1m_lines },
     { "g1", g1_stages, sizeof(g1_stages) / sizeof(g1_stages[0]), "C:\\d3d9tri32.exe", 0, g1_lines },
     { "g", g_stages, sizeof(g_stages) / sizeof(g_stages[0]), "C:\\VTMB\\Vampire.exe", 0, g_lines },
+    { "gc1", gc1_stages, sizeof(gc1_stages) / sizeof(gc1_stages[0]), "C:\\hello.exe", 1, gc1_lines },
+    { "gc2", gc2_stages, sizeof(gc2_stages) / sizeof(gc2_stages[0]), "C:\\hello.exe", 1, gc2_lines },
     /* p6 and p5w before p5: the last plan is the default. */
     { "p6", p6_stages, sizeof(p6_stages) / sizeof(p6_stages[0]), "C:\\wincb32.exe", 0, p6_lines },
     { "p5w", p5w_stages, sizeof(p5w_stages) / sizeof(p5w_stages[0]), "C:\\wincb32.exe", 0, p5w_lines },
@@ -3494,6 +3558,12 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
         pthread_mutex_unlock(&present_lock);
     }
     if (g1_plans()) g1_extra_fields(g_extra, sizeof(g_extra));
+    if (vulkan_plan()) {
+        /* Recorded, not in the line: VideoOut's hardware cursor (win32u's patch 0740). */
+        char cursor[400];
+        cursor_fields(cursor, sizeof(cursor));
+        step("cursor at the end: %s", cursor);
+    }
     pw_stage_end(&run, wine_stage(), fields);
     pw_ms_emit_lines();
 }
@@ -3620,6 +3690,36 @@ static void e1_lines(void)
         { "swapchain", PRESENT }, { "fps", PRESENT }, { "fb", PRESENT }, { "reopen", PRESENT }, { "hello", HELLO },
     };
     emit_line("PS4WINE e1 vk", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* gc1: the four cursor calls' statuses on the title's VideoOut (the picture
+ * is the HDMI recording's), then hello.exe. */
+static void gc1_lines(void)
+{
+    enum { CURSOR, HELLO };
+    static const LineKey keys[] = {
+        { "cursor", CURSOR }, { "mem", CURSOR }, { "mem_align", CURSOR }, { "mem_rc", CURSOR }, { "enable", CURSOR },
+        { "position", CURSOR }, { "image", CURSOR }, { "disable", CURSOR }, { "enable_twice", CURSOR },
+        { "position_moved", CURSOR }, { "position_back", CURSOR }, { "position_edge", CURSOR },
+        { "enable_again", CURSOR }, { "reopen", CURSOR }, { "reopen_disable", CURSOR }, { "flips", CURSOR },
+        { "flip_errors", CURSOR }, { "hello", HELLO },
+    };
+    emit_line("PS4WINE gc1 cursor", keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+/* gc2: libvulkan.prx's pw_videoout_cursor over RADV's frames. */
+static void gc2_lines(void)
+{
+    enum { LOAD, CAPS, DISPLAY, RELEASE, CURSOR, HELLO };
+    static const LineKey keys[] = {
+        { "present", CURSOR }, { "frames", CURSOR }, { "gpu_hang", CURSOR }, { "swapchain", CURSOR },
+        { "reopen", CURSOR }, { "cursor_export", CURSOR }, { "cursor_shows", CURSOR },
+        { "cursor_reopen_shows", CURSOR }, { "cursor_hides", CURSOR }, { "cursor_noout", CURSOR },
+        { "cursor_errors", CURSOR }, { "cursor_rc", CURSOR }, { "vk_cursor_updates", CURSOR },
+        { "vk_cursor_rc", CURSOR }, { "vk_cursor_format", CURSOR }, { "fb_cursor", CURSOR }, { "release", RELEASE },
+        { "hello", HELLO },
+    };
+    emit_line("PS4WINE gc2 vkcursor", keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 /* e2: winevulkan and Wine's Vulkan under vk64.exe; e3: win32u's surface,
@@ -3898,6 +3998,18 @@ static const char *g_input_used(void)
     return g_kbm_events && g_pad_events ? "kbm+pad" : g_kbm_events ? "kbm" : g_pad_events ? "pad" : "none";
 }
 
+/* The cursor line beside the menu line: VideoOut's hardware cursor over
+ * Bloodlines' DXVK frames, from libvulkan.prx's counters. */
+static void gc_emit(int menu, const char *exit_text)
+{
+    char extra[600], cursor[400];
+
+    cursor_fields(cursor, sizeof(cursor));
+    snprintf(extra, sizeof(extra), " menu=%d %s faults_unresolved=%llu exit=%s", menu, cursor, faults_unresolved_g(),
+             exit_text);
+    emit_line_with("PS4WINE gc vtmb", NULL, 0, extra);
+}
+
 /* The menu line: the first mark (menu=1), or with g's line when there was none. */
 static void g2_emit(int menu, const char *exit_text)
 {
@@ -3914,6 +4026,7 @@ static void g2_emit(int menu, const char *exit_text)
              module_loaded("ws2_32") == 1 ? "loaded" : "no", wow_cpu(), g_profile_id, g_profile_status, dxvk_oom,
              g_hid.keyboard >= 0 ? "ok" : "no", g_hid.mouse >= 0 ? "ok" : "no", g_input_used());
     emit_line_with("PS4WINE g2 vtmb", NULL, 0, extra);
+    gc_emit(menu, exit_text);
 }
 
 /* Milestone g's own line: the window from the gameplay mark to now (300 s when

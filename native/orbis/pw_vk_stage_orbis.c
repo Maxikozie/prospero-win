@@ -353,7 +353,7 @@ static int make_swapchain(Present *p)
 
 /* FRAMES frames, one in flight; a fence or an acquire not back within
  * TIMEOUT_NS is a hang. The number presented successfully, or -1. */
-static int run_frames(Present *p, unsigned frames)
+static int run_frames(Present *p, unsigned frames, const PwVkFrames *hook, unsigned swapchain)
 {
     unsigned done = 0;
     VkResult r;
@@ -378,12 +378,25 @@ static int run_frames(Present *p, unsigned frames)
         r = vkWaitForFences(device, 1, &p->fence, VK_TRUE, TIMEOUT_NS);
         if (r == VK_TIMEOUT) { p->hang = 1; failed(p, "vkWaitForFences", r); done++; break; }
         if (r || (r = vkResetFences(device, 1, &p->fence))) { failed(p, "vkWaitForFences", r); done++; break; }
+        if (hook && hook->frame) hook->frame(hook->context, swapchain, done);
     }
     return p->failed[0] && !done ? -1 : (int)done;
 }
 
+void *pw_vk_symbol(const char *name)
+{
+    return library && host.dlsym ? host.dlsym(library, name) : NULL;
+}
+
 void pw_vk_present(const char *shot, char *fields, size_t size)
 {
+    pw_vk_present_frames(shot, NULL, fields, size);
+}
+
+void pw_vk_present_frames(const char *shot, const PwVkFrames *hook, char *fields, size_t size)
+{
+    unsigned first = hook && hook->first ? hook->first : PW_VK_E1_FRAMES;
+    unsigned again = hook && hook->reopen ? hook->reopen : PW_VK_E1_REOPEN_FRAMES;
     Present p;
     struct pw_vulkan_stats stats;
     struct stat st;
@@ -443,9 +456,8 @@ void pw_vk_present(const char *shot, char *fields, size_t size)
     /* The first swapchain: RADV's WSI opens VideoOut here. */
     if (!p.failed[0] && !make_swapchain(&p)) {
         uint64_t t0 = host.now_ns(), elapsed;
-        vstep("vk_present swapchain images=%u format=%d: %u frames", p.image_count, (int)p.format.format,
-              PW_VK_E1_FRAMES);
-        shown = run_frames(&p, PW_VK_E1_FRAMES);
+        vstep("vk_present swapchain images=%u format=%d: %u frames", p.image_count, (int)p.format.format, first);
+        shown = run_frames(&p, first, hook, 0);
         elapsed = host.now_ns() - t0;
         if (shown > 0 && elapsed) fps10 = (unsigned long long)shown * 10000000000ull / elapsed;
     }
@@ -459,7 +471,8 @@ void pw_vk_present(const char *shot, char *fields, size_t size)
         vkDeviceWaitIdle(device);
         vkDestroySwapchainKHR(device, p.swapchain, NULL);
         p.swapchain = VK_NULL_HANDLE;
-        if (!make_swapchain(&p)) reopened = run_frames(&p, PW_VK_E1_REOPEN_FRAMES);
+        if (hook && hook->between) hook->between(hook->context);
+        if (!make_swapchain(&p)) reopened = run_frames(&p, again, hook, 1);
         if (reopened > 0) reopen_frames = (unsigned long long)reopened;
         vkDeviceWaitIdle(device);
         if (p.swapchain) vkDestroySwapchainKHR(device, p.swapchain, NULL);
@@ -470,7 +483,7 @@ void pw_vk_present(const char *shot, char *fields, size_t size)
              "flex_free_mib=%llu",
              p.failed[0] ? p.failed : "ok", frames, p.hang || stats.device_lost, stats.width, stats.height,
              (int)p.format.format, p.image_count, fps10 / 10, fps10 % 10, fb ? "ok" : "none",
-             reopened == PW_VK_E1_REOPEN_FRAMES ? "ok" : reopened < 0 ? "-" : "fail", reopen_frames,
+             reopened == (int)again ? "ok" : reopened < 0 ? "-" : "fail", reopen_frames,
              shown >= 0 && stats.presents == (uint64_t)shown + reopen_frames, stats.device_lost, stats.last_error,
              dmem_free_mib(), flex_free_mib());
 }
