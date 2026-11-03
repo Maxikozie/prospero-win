@@ -150,7 +150,8 @@ void pw_ms_stdout(const char *line);
 /* The plan's defaults for Wine's environment (RADV's variables in the e
  * plans), added before <root>/env.txt is read. */
 void pw_ms_environment(void (*add)(const char *name, const char *value));
-/* Milestone g: the plan's game profile (g: "vtmb"), NULL for none; env.txt's
+/* Milestones g, k, l1: the plan's game profile (g: "vtmb", k: "psychonauts", l1:
+ * "xinput32"), NULL for none; env.txt's
  * PS4WINE_PROFILE wins (wine64_main_orbis.c). */
 const char *pw_ms_profile_id(void);
 /* The profile the title loaded from <root>/profiles/<id>.ini, NULL when none

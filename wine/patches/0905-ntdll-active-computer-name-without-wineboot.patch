@@ -1,0 +1,81 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll: set ActiveComputerName when wineboot cannot be started
+
+wineboot makes the volatile key
+System\CurrentControlSet\Control\ComputerName\ActiveComputerName at each
+start, from the stored ComputerName\ComputerName. A process that cannot
+create another (a PS4 title: NtCreateUserProcess returns c00000bb) never
+runs wineboot, so the key never exists, GetComputerNameW fails, and with it
+dxdiagn's DxDiag_SystemInfo: IDxDiagProvider::Initialize returns E_FAIL and
+the DirectX SDK's GetDXVersion finds no DirectX 9.0c (Psychonauts stops at
+its startup check). When wineboot cannot be started, ntdll now creates that
+one key itself, volatile, from the stored name, as wineboot would.
+
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 27cc5248af..5e369060f5 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1545,6 +1545,55 @@ static WCHAR *build_command_line( WCHAR **wargv )
+ }
+ 
+ 
++/***********************************************************************
++ *           create_active_computer_name
++ *
++ * When wineboot cannot be started (a process that cannot create another,
++ * such as a console title), make the one volatile key GetComputerNameW
++ * reads, from the stored computer name, as wineboot's
++ * create_computer_name_keys does at each start.
++ */
++static void create_active_computer_name(void)
++{
++    static const WCHAR keyW[] = {'\\','R','e','g','i','s','t','r','y','\\','M','a','c','h','i','n','e','\\',
++        'S','y','s','t','e','m','\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t','\\',
++        'C','o','n','t','r','o','l','\\','C','o','m','p','u','t','e','r','N','a','m','e',0};
++    static const WCHAR storedW[] = {'C','o','m','p','u','t','e','r','N','a','m','e',0};
++    static const WCHAR activeW[] = {'A','c','t','i','v','e','C','o','m','p','u','t','e','r','N','a','m','e',0};
++    static const WCHAR valueW[] = {'C','o','m','p','u','t','e','r','N','a','m','e',0};
++    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data[256 * sizeof(WCHAR)])];
++    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING nameW;
++    HANDLE root, key;
++    ULONG size;
++
++    init_unicode_string( &nameW, keyW );
++    InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
++    if (NtOpenKey( &root, KEY_ALL_ACCESS, &attr )) return;
++    attr.RootDirectory = root;
++    init_unicode_string( &nameW, storedW );
++    if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
++    {
++        init_unicode_string( &nameW, valueW );
++        if (NtQueryValueKey( key, &nameW, KeyValuePartialInformation, buffer, sizeof(buffer), &size ) ||
++            (info->Type != REG_SZ && info->Type != REG_EXPAND_SZ))
++            info->DataLength = 0;
++        NtClose( key );
++        init_unicode_string( &nameW, activeW );
++        if (info->DataLength &&
++            !NtCreateKey( &key, KEY_ALL_ACCESS, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL ))
++        {
++            init_unicode_string( &nameW, valueW );
++            NtSetValueKey( key, &nameW, 0, info->Type, info->Data, info->DataLength );
++            NtClose( key );
++            WARN( "no wineboot: ActiveComputerName set from the stored name\n" );
++        }
++    }
++    NtClose( root );
++}
++
++
+ /***********************************************************************
+  *           run_wineboot
+  */
+@@ -1608,6 +1657,7 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
+     {
+         ERR( "failed to start wineboot %x\n", status );
+         NtClose( handles[0] );
++        create_active_computer_name();
+         return;
+     }
+     NtResumeThread( thread, NULL );

@@ -90,6 +90,12 @@
  *                               ; frequency at launch and sets
  *                               ; PW_QPC_TSC_VALIDATED/PW_QPC_TSC_HZ only
  *                               ; when it is consistent; default false
+ *   saves = C:\Games\X\Saves     ; where the game writes its saves: an
+ *                               ; absolute Windows path (drive, colon,
+ *                               ; backslash; no '/', no '..'), at most
+ *                               ; PW_APP_PATH_CAPACITY - 1 characters;
+ *                               ; nothing sets it in Wine's environment, a
+ *                               ; launcher may watch it; default empty
  *
  * Buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 up down left
  * right options create touchpad. An input preset file holds only an [input]
@@ -170,6 +176,8 @@ typedef struct PwGameRuntime {
     int shared_input;           /* PW_INPUT_SHARED_FAST=1 */
     int fast_clock;             /* the title calibrates the TSC, then sets
                                    PW_QPC_TSC_VALIDATED and PW_QPC_TSC_HZ */
+    char saves[PW_APP_PATH_CAPACITY];   /* the game's save directory, an
+                                           absolute Windows path; empty if unset */
 } PwGameRuntime;
 
 /* A variable of Wine's environment; both strings are static. */

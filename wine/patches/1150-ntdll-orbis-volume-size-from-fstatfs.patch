@@ -1,0 +1,90 @@
+From: prospero-win orbis <noreply@localhost>
+Subject: ntdll/orbis: a volume's size from libkernel's _fstatfs, or a fixed answer
+
+get_full_size_info called fstatvfs, and libc.a's fstatvfs calls libkernel's
+_fstatfs into a frame of its own and returns 0 or -1 without filling the
+caller's struct statvfs, so on success ntdll read uninitialised stack;
+GetDiskFreeSpace then told Psychonauts there was not enough free space to
+create a save profile. On __ORBIS__ the size now comes from
+pw_orbis_volume_size (wine/orbis/pw_disk_size_orbis.c, linked into
+ntdll.prx): _fstatfs into a FreeBSD struct statfs of its own, or 65 GiB free
+of 130 GiB when it fails or reports no blocks (the game multiplies
+GetDiskFreeSpaceA's three DWORDs in 32 bits: 64 GiB would read as 0);
+WINE_PS5_DISK_FREE_GIB overrides both. The first query logs _fstatfs's rc,
+errno, f_version, f_bsize, f_blocks and f_bavail (PW_DISK_SIZE). Other
+platforms are unchanged.
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index a167e45cb5..5f6c40cfd1 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2216,11 +2216,24 @@ done:
+ }
+ #endif
+ 
++#ifdef __ORBIS__
++/* wine/orbis/pw_disk_size_orbis.c, linked into ntdll.prx: libc.a's fstatvfs
++ * returns without filling its caller's statvfs, so the size comes from
++ * libkernel's _fstatfs, or 65 GiB free of 130 GiB when that gives none. */
++extern int pw_orbis_volume_size( int fd, const char *override_gib, unsigned long long out[4], long long diag[4] );
++#endif
++
+ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
+     struct stat st;
+-    ULONGLONG bsize;
+-
+-#if !defined(linux) || !defined(HAVE_FSTATFS)
++    ULONGLONG bsize, blocks, bfree, bavail;
++
++#ifdef __ORBIS__
++    static const char *const sources[] = { "statfs", "fallback", "override" };
++    static int logged;
++    unsigned long long size[4];
++    long long diag[4];
++    int source;
++#elif !defined(linux) || !defined(HAVE_FSTATFS)
+     struct statvfs stfs;
+ #else
+     struct statfs stfs;
+@@ -2233,6 +2246,17 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info)
+     if (fstat( fd, &st ) < 0) return errno_to_status( errno );
+     if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return STATUS_INVALID_DEVICE_REQUEST;
+ 
++#ifdef __ORBIS__
++    source = pw_orbis_volume_size( fd, getenv( "WINE_PS5_DISK_FREE_GIB" ), size, diag );
++    if (!logged++)
++        ERR( "PW_DISK_SIZE rc=%lld errno=%lld f_version=%#llx f_bsize=%llu f_blocks=%llu f_bavail=%lld "
++             "source=%s free_gib=%llu total_gib=%llu\n", diag[0], diag[1], (unsigned long long)diag[2],
++             size[0], size[1], diag[3], sources[source], size[0] * size[3] >> 30, size[0] * size[1] >> 30 );
++    bsize = size[0];
++    blocks = size[1];
++    bfree = size[2];
++    bavail = size[3];
++#else
+     /* Linux's fstatvfs is buggy */
+ #if !defined(linux) || !defined(HAVE_FSTATFS)
+     if (fstatvfs( fd, &stfs ) < 0) return errno_to_status( errno );
+@@ -2246,6 +2270,10 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info)
+     important_free_bytes = get_free_bytes_for_important_data( fd );
+     if (important_free_bytes != -1) stfs.f_bavail = stfs.f_bfree = important_free_bytes / bsize;
+ #endif
++    blocks = stfs.f_blocks;
++    bfree = stfs.f_bfree;
++    bavail = stfs.f_bavail;
++#endif
+ 
+     if (bsize == 2048)  /* assume CD-ROM */
+     {
+@@ -2257,9 +2285,9 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info)
+         info->BytesPerSector = 512;
+         info->SectorsPerAllocationUnit = 8;
+     }
+-    info->TotalAllocationUnits.QuadPart = bsize * stfs.f_blocks / (info->BytesPerSector * info->SectorsPerAllocationUnit);
+-    info->CallerAvailableAllocationUnits.QuadPart = bsize * stfs.f_bavail / (info->BytesPerSector * info->SectorsPerAllocationUnit);
+-    info->ActualAvailableAllocationUnits.QuadPart = bsize * stfs.f_bfree / (info->BytesPerSector * info->SectorsPerAllocationUnit);
++    info->TotalAllocationUnits.QuadPart = bsize * blocks / (info->BytesPerSector * info->SectorsPerAllocationUnit);
++    info->CallerAvailableAllocationUnits.QuadPart = bsize * bavail / (info->BytesPerSector * info->SectorsPerAllocationUnit);
++    info->ActualAvailableAllocationUnits.QuadPart = bsize * bfree / (info->BytesPerSector * info->SectorsPerAllocationUnit);
+     return STATUS_SUCCESS;
+ }
+ 

@@ -252,6 +252,50 @@ static void test_runtime(void)
     assert(!strcmp(env[0].name, "WINE_PS5_SCHED") && !strcmp(env[1].name, "PW_INPUT_SHARED_FAST"));
 }
 
+/* [runtime] saves: the game's save directory, an absolute Windows path as
+ * the executable's, once; nothing in Wine's environment. */
+static void test_saves(void)
+{
+    PwGameEnv env[PW_GAME_RUNTIME_ENV_MAX];
+    PwGameProfile p;
+    char text[1024], path[PW_APP_PATH_CAPACITY + 1];
+
+    assert(parse(APP, &p) == PW_OK && !p.runtime.saves[0]);
+    assert(parse(APP "[runtime]\ncpu = native\nsaves = C:\\Psychonauts\\Profiles\n", &p) == PW_OK);
+    assert(!strcmp(p.runtime.saves, "C:\\Psychonauts\\Profiles") && p.runtime.cpu == PW_GAME_CPU_NATIVE);
+    assert(pw_game_runtime_env(&p.runtime, env) == 0);
+    /* Spaces inside, a trailing backslash, a drive root, any case of the key. */
+    assert(parse(APP "[runtime]\nSaves =  d:\\My Games\\Profile 1\\ \n", &p) == PW_OK);
+    assert(!strcmp(p.runtime.saves, "d:\\My Games\\Profile 1\\"));
+    assert(parse(APP "[runtime]\nsaves = C:\\\n", &p) == PW_OK && !strcmp(p.runtime.saves, "C:\\"));
+    /* The longest that fits, and one more. */
+    memcpy(path, "C:\\", 3);
+    memset(path + 3, 'a', sizeof(path) - 3);
+    path[PW_APP_PATH_CAPACITY - 1] = 0;
+    snprintf(text, sizeof(text), APP "[runtime]\nsaves = %s\n", path);
+    assert(parse(text, &p) == PW_OK && strlen(p.runtime.saves) == PW_APP_PATH_CAPACITY - 1);
+    path[PW_APP_PATH_CAPACITY - 1] = 'a';
+    path[PW_APP_PATH_CAPACITY] = 0;
+    snprintf(text, sizeof(text), APP "[runtime]\nsaves = %s\n", path);
+    assert(parse(text, &p) == PW_ERR_LIMIT);
+    /* Refused: relative, a forward slash, no drive, a UNC path, "..", an
+     * empty segment, a second colon, empty, given twice. */
+    const char *refused[] = {
+        "saves = Profiles\n", "saves = .\\Profiles\n", "saves = \\Psychonauts\\Profiles\n",
+        "saves = C:Profiles\n", "saves = C:/Psychonauts/Profiles\n", "saves = C:\\Psychonauts/Profiles\n",
+        "saves = \\\\server\\share\n", "saves = C:\\Psychonauts\\..\\Windows\n", "saves = C:\\\\Psychonauts\n",
+        "saves = C:\\a:b\n", "saves = 1:\\Profiles\n", "saves =\n", "saves = \n",
+        "saves = C:\\A\nsaves = C:\\B\n", "saves = C:\\A\nsaves = C:\\A\n",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        snprintf(text, sizeof(text), APP "[runtime]\n%s", refused[i]);
+        assert(parse(text, &p) == PW_ERR_MALFORMED);
+    }
+    /* Only in [runtime]. */
+    assert(parse(APP "[display]\nsaves = C:\\Saves\n", &p) == PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[debug]\nsaves = C:\\Saves\n", &p) != PW_OK);
+}
+
 static void test_refusals(void)
 {
     static const char *const bad[] = {
@@ -692,6 +736,7 @@ int main(void)
     test_profile();
     test_runtime();
     test_cpu();
+    test_saves();
     test_debug_env();
     test_refusals();
     test_presets();
@@ -699,7 +744,7 @@ int main(void)
     test_keyboard_stick();
     test_layer_hold_toggle_chord();
     printf("game profile passed: application plus display and input, every binding kind, "
-           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile, "
+           "runtime settings and their environment, the CPU backend choice, the save directory, debug env variables, refusals, shared presets overridden by the profile, "
            "a stick driving the direction keys, the layer, tap/hold, latches, chords and walk/run\n");
     return 0;
 }

@@ -207,7 +207,7 @@ for unit in pw_wine_heap pw_wine_heap_libc pw_wine_dmem pw_wine_dmem_ps5 \
     compile_shim "$root/wine/ps5/$unit.c"
 done
 for unit in pw_wine_exit_orbis pw_wine_compat_orbis pw_wine_env_orbis pw_wine_stdio_orbis pw_wine_dl_orbis pw_wine_dup_orbis \
-        pw_wine_threads_orbis; do
+        pw_wine_threads_orbis pw_disk_size_orbis; do
     compile_shim "$root/wine/orbis/$unit.c"
 done
 case " $modules " in *" libvulkan "*)
@@ -380,7 +380,7 @@ case " $modules " in *" ntdll "*)
     shims=""
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc \
             pw_wine_compat_orbis pw_wine_sink pw_wine_cwd pw_wine_cwd_libc pw_wine_exit_orbis pw_wine_env_orbis pw_wine_stdio_orbis \
-            pw_wine_dl_orbis pw_wine_dup_orbis pw_wine_threads_orbis; do
+            pw_wine_dl_orbis pw_wine_dup_orbis pw_wine_threads_orbis pw_disk_size_orbis; do
         shims="$shims $obj/$unit.o"
     done
     link_prx ntdll dlls/ntdll/ntdll.so "$heap $dmem $shims $prx/obj/ntdll_desc.o $cwd_wraps $exit_wraps"

@@ -494,14 +494,46 @@ static int debug_field(PwGameProfile *profile, const uint8_t *key, size_t key_le
     return PW_OK;
 }
 
+/* An absolute Windows path, as pw_app_profile wants the executable and the
+ * working directory: a drive letter, ':' and '\\', then segments split by
+ * '\\', none empty but the last, none "..", no '/', ':' or control
+ * characters. */
+static int windows_path(const uint8_t *v, size_t n)
+{
+    size_t segment = 3;
+
+    if (n < 3 || !((v[0] >= 'A' && v[0] <= 'Z') || (v[0] >= 'a' && v[0] <= 'z')) ||
+        v[1] != ':' || v[2] != '\\')
+        return 0;
+    for (size_t i = 3; i <= n; i++) {
+        if (i < n && (v[i] == '/' || v[i] == ':' || v[i] < 0x20 || v[i] == 0x7f)) return 0;
+        if (i == n || v[i] == '\\') {
+            if (i == segment && i != n) return 0;
+            if (i - segment == 2 && v[segment] == '.' && v[segment + 1] == '.') return 0;
+            segment = i + 1;
+        }
+    }
+    return 1;
+}
+
 /* [runtime] thread_scheduling, shared_input, fast_clock: true/false or
- * 1/0; cpu: native or translator; each once. */
+ * 1/0; cpu: native or translator; saves: an absolute Windows path; each
+ * once. */
 static int runtime_field(PwGameRuntime *runtime, uint32_t *seen, const uint8_t *key, size_t key_length,
                          const uint8_t *v, size_t n)
 {
     uint32_t bit;
     int *field, on;
 
+    if (is(key, key_length, "saves")) {
+        if ((*seen & 16u) || !n) return PW_ERR_MALFORMED;
+        if (n >= sizeof(runtime->saves)) return PW_ERR_LIMIT;
+        if (!windows_path(v, n)) return PW_ERR_MALFORMED;
+        memcpy(runtime->saves, v, n);
+        runtime->saves[n] = 0;
+        *seen |= 16u;
+        return PW_OK;
+    }
     if (is(key, key_length, "cpu")) {
         if (*seen & 2u) return PW_ERR_MALFORMED;
         if (is(v, n, "native")) runtime->cpu = PW_GAME_CPU_NATIVE;

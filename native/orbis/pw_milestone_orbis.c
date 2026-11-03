@@ -15,6 +15,7 @@
 #include "pw_game_profile.h"
 #include "pw_hid_ps5.h"
 #include "pw_pad_ps4_orbis.h"
+#include "pw_loaddll_orbis.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -95,8 +96,9 @@ static void p6_lines(void);
 static void hold_sample(int at);
 static const char *ntdll_symbol(const char *name, void **address);
 static void pause_ms(unsigned ms);
-/* Milestone g (docs/ps4/HANDOFF-g.md in ps4-wine). */
+/* Milestone g (the PS4 port's HANDOFF-g.md); k (its HANDOFF-i.md) runs on the same machinery. */
 static int g_plan(void);
+static int k_plan(void);
 static void g_hid_open_once(void);
 static int i_plan(void);
 static int l1_plan(void);
@@ -108,6 +110,7 @@ static void l1_lines(void);
 static void g1m_lines(void);
 static void g1_lines(void);
 static void g_lines(void);
+static void k_lines(void);
 /* session_s counts from here when set (g: from the gameplay mark), else from the title's start. */
 static uint64_t session_base_ns;
 
@@ -222,7 +225,7 @@ void pw_ms_eboot_release_prepare(void)
     char line[200];
     int primed = pw_videoout_orbis_prime(), pad_status = pw_pad_orbis_open(&pad);
 
-    /* g: the keyboard and the mouse too (g_script uses them; it may not have run yet). */
+    /* g and k: the keyboard and the mouse too (g_script uses them; it may not have run yet). */
     if (g_plan()) g_hid_open_once();
 
     snprintf(line, sizeof(line), "PW_MS stage=eboot_prepare vo_prime=%s pad=%s pad_failed=%s pad_status=0x%x",
@@ -2813,9 +2816,18 @@ static uint32_t wine_unhandled;
 /* DXVK's out-of-memory reports (memoryTrackTest makes D3D9 refuse images). */
 static uint32_t dxvk_oom;
 /* +loaddll: where the game's program landed (0x400000 is the eboot's), its
- * UP loader plugins (.vtm), Bink and Miles. */
+ * UP loader plugins (.vtm), Bink and Miles; for k, Psychonauts' sound chain
+ * (isactwin -> AudioDrv -> OpenAL32 -> dsound). Wine's missing imports
+ * (err:module:import_dll) and DXVK's "Found config file" are counted for
+ * every game. */
 static char exe_base[24] = "-";
-static uint32_t g_vtm, g_bink, g_miles;
+static uint32_t g_vtm, g_bink, g_miles, k_openal, k_audiodrv, k_isact, k_dsound, import_errors, dxvk_conf_found;
+
+/* The game's file name: the profile's executable, else the plan's. */
+static const char *game_exe_name(void)
+{
+    return pw_loaddll_file_name(g_profile && g_profile->app.executable[0] ? g_profile->app.executable : plan->exe);
+}
 
 static uint64_t field_u64(const char *line, const char *key, int *found)
 {
@@ -2850,14 +2862,17 @@ void pw_ms_wine_line(const char *line)
         __atomic_add_fetch(&wine_unhandled, 1, __ATOMIC_RELAXED);
     if (strstr(line, "OUTOFVIDEOMEMORY") || strstr(line, "Failed to allocate"))
         __atomic_add_fetch(&dxvk_oom, 1, __ATOMIC_RELAXED);
+    if (strstr(line, "err:module:import_dll")) __atomic_add_fetch(&import_errors, 1, __ATOMIC_RELAXED);
+    if (strstr(line, "Found config file")) dxvk_conf_found = 1;
     if (strstr(line, "Loaded L\"")) {
-        if ((p = strstr(line, "Vampire.exe\" at "))) {
-            size_t n = strspn(p + 16, "0123456789abcdefABCDEF");
-            snprintf(exe_base, sizeof(exe_base), "0x%.*s", (int)(n < 20 ? n : 20), p + 16);
-        }
+        if (plan) pw_loaddll_base(line, game_exe_name(), exe_base, sizeof(exe_base));
         if (strstr(line, ".vtm\"")) __atomic_add_fetch(&g_vtm, 1, __ATOMIC_RELAXED);
         if (strstr(line, "binkw32.dll\"")) g_bink = 1;
         if (strstr(line, "Mss32.dll\"") || strstr(line, "mss32.dll\"")) g_miles = 1;
+        if (pw_loaddll_is(line, "OpenAL32.dll")) k_openal = 1;
+        if (pw_loaddll_is(line, "AudioDrv.dll")) k_audiodrv = 1;
+        if (pw_loaddll_is(line, "isactwin.dll")) k_isact = 1;
+        if (pw_loaddll_is(line, "dsound.dll")) k_dsound = 1;
     }
 }
 
@@ -2971,15 +2986,16 @@ static void g_snap(GSnap *s, int reset_max, uint64_t *max_ns)
 }
 
 /* The window [a, b]: presents per second (fps_avg: RADV's counter, one per D3D9
- * Present), the frame times from the present intervals (p95 as the upper edge
- * of its 1 ms bucket; max only where the window reset it: max_ns, else "-"),
- * frames of 50 ms or more, crossings per present. */
+ * Present), the frame times from the present intervals (p95 and p99 as the
+ * upper edge of their 1 ms bucket; fps_low_1pct = 1e6 / p99, the "1% low";
+ * max only where the window reset it: max_ns, else "-"), frames of 50 ms or
+ * more, crossings per present. */
 #define G_NO_MAX UINT64_MAX
 static void g_window(const GSnap *a, const GSnap *b, uint64_t max_ns, const char *prefix, char *out, size_t size)
 {
     double seconds = b->ns > a->ns ? (double)(b->ns - a->ns) / 1e9 : 0.0;
     uint64_t presents = b->presents - a->presents, total = 0, cum = 0, hitches = 0;
-    char crossings[24], p95[24] = "-", max[24] = "-";
+    char crossings[24], p95[24] = "-", p99[24] = "-", low[24] = "-", max[24] = "-";
 
     if (a->hist_ok && b->hist_ok) {
         for (size_t i = 0; i < PW_VULKAN_HIST_BUCKETS; i++) total += b->hist[i] - a->hist[i];
@@ -2988,6 +3004,10 @@ static void g_window(const GSnap *a, const GSnap *b, uint64_t max_ns, const char
             if (i >= 50) hitches += d;
             cum += d;
             if (p95[0] == '-' && cum * 100 >= total * 95) snprintf(p95, sizeof(p95), "%u", (unsigned)(i + 1) * 1000u);
+            if (p99[0] == '-' && cum * 100 >= total * 99) {
+                snprintf(p99, sizeof(p99), "%u", (unsigned)(i + 1) * 1000u);
+                snprintf(low, sizeof(low), "%.1f", 1000.0 / (double)(i + 1));
+            }
         }
     }
     if (max_ns != G_NO_MAX && a->hist_ok) snprintf(max, sizeof(max), "%llu", (unsigned long long)(max_ns / 1000));
@@ -3011,9 +3031,10 @@ static void g_window(const GSnap *a, const GSnap *b, uint64_t max_ns, const char
     out += used;
     size -= used;
     snprintf(out, size, " %sfps_avg=%.1f %spresents=%llu %swindow_s=%.0f %scrossings_per_frame=%s %sframe_us_avg=%.0f "
-             "%sframe_us_p95=%s %sframe_us_max=%s %shitches_50ms=%s%llu", prefix,
+             "%sframe_us_p95=%s %sframe_us_p99=%s %sfps_low_1pct=%s %sframe_us_max=%s %shitches_50ms=%s%llu", prefix,
              seconds > 0 ? (double)presents / seconds : 0.0, prefix, (unsigned long long)presents, prefix, seconds,
-             prefix, crossings, prefix, presents ? seconds * 1e6 / (double)presents : 0.0, prefix, p95, prefix, max,
+             prefix, crossings, prefix, presents ? seconds * 1e6 / (double)presents : 0.0, prefix, p95, prefix, p99,
+             prefix, low, prefix, max,
              prefix, total ? "" : "-", total ? (unsigned long long)hitches : 0ull);
     if (!total) {
         char *zero = strstr(out, "hitches_50ms=-0");
@@ -3303,6 +3324,14 @@ static const PwMsStage g_stages[] = {
     { "audio", 15, stage_audio, "audio_open=fault" },
     { "vtmb", 0, NULL, "exit=fault" },
 };
+/* Milestone k: Psychonauts' main menu with sound, on g's stages and machinery (HANDOFF-i.md). */
+static const PwMsStage k_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "wow_bind", 20, stage_wow_bind, "wow_load=fault wow_bound=fault" },
+    { "display", 15, stage_display, "display=fault" },
+    { "audio", 15, stage_audio, "audio_open=fault" },
+    { "psychonauts", 0, NULL, "exit=fault" },
+};
 /* g's input step, VideoOut's hardware cursor: gc1 the four calls on the
  * title's own display (no Wine, no RADV), then hello.exe; gc2 e1's stages
  * with libvulkan.prx's pw_videoout_cursor called after every present. */
@@ -3341,6 +3370,8 @@ static const PwMsPlan plans[] = {
     { "l1", l1_stages, sizeof(l1_stages) / sizeof(l1_stages[0]), "C:\\xinput32.exe", 0, l1_lines },
     { "g1", g1_stages, sizeof(g1_stages) / sizeof(g1_stages[0]), "C:\\d3d9tri32.exe", 0, g1_lines },
     { "g", g_stages, sizeof(g_stages) / sizeof(g_stages[0]), "C:\\VTMB\\Vampire.exe", 0, g_lines },
+    /* Milestone k: Psychonauts from its profile (<root>/profiles/psychonauts.ini), g's machinery. */
+    { "k", k_stages, sizeof(k_stages) / sizeof(k_stages[0]), "C:\\Psychonauts\\Psychonauts.exe", 0, k_lines },
     { "gc1", gc1_stages, sizeof(gc1_stages) / sizeof(gc1_stages[0]), "C:\\hello.exe", 1, gc1_lines },
     { "gc2", gc2_stages, sizeof(gc2_stages) / sizeof(gc2_stages[0]), "C:\\hello.exe", 1, gc2_lines },
     /* p6 and p5w before p5: the last plan is the default. */
@@ -3353,7 +3384,9 @@ static int g1_plans(void)
 {
     return plan && (plan->lines == g1n_lines || plan->lines == g1m_lines || plan->lines == g1_lines);
 }
-static int g_plan(void) { return plan && plan->lines == g_lines; }
+/* g's machinery (profile, batching, sound, input, marks): g and k. */
+static int g_plan(void) { return plan && (plan->lines == g_lines || plan->lines == k_lines); }
+static int k_plan(void) { return plan && plan->lines == k_lines; }
 static int i_plan(void) { return plan && plan->lines == i_lines; }
 static int l1_plan(void) { return plan && plan->lines == l1_lines; }
 static int vulkan_plan(void)
@@ -3361,7 +3394,10 @@ static int vulkan_plan(void)
     return plan && (plan->lines == e2_lines || plan->lines == e_lines || plan->lines == g1m_lines ||
                     plan->lines == g1_lines || g_plan());
 }
-const char *pw_ms_profile_id(void) { return g_plan() ? "vtmb" : l1_plan() ? "xinput32" : NULL; }
+const char *pw_ms_profile_id(void)
+{
+    return k_plan() ? "psychonauts" : g_plan() ? "vtmb" : l1_plan() ? "xinput32" : NULL;
+}
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
 {
@@ -3482,8 +3518,8 @@ void pw_ms_start(const PwMsConfig *config)
         if (cfg.setting && cfg.setting("PS4WINE_PRESENT_MODE", v, sizeof(v)))
             p_async = !strcmp(v, "async") ? 1 : !strcmp(v, "sync") ? 0 : p_async;
     }
-    if (plan->lines == g_lines) {
-        /* g plays with sound through the port p5 measured (stage_audio, Wine's ps5 audio driver);
+    if (g_plan()) {
+        /* g and k play with sound through the port p5 measured (stage_audio, Wine's ps5 audio driver);
          * PS4WINE_AUDIO=off in env.txt turns it off. */
         char v[32];
         p_audio = 1;
@@ -4419,12 +4455,67 @@ static void g_seg_end(GSeg *seg)
     seg->kind = -1;
 }
 
+/* Milestone k's line: the user's first mark on Psychonauts' main menu
+ * (menu=1, exit=running), or at the session's end without one (menu=0). Sent
+ * once. The line word is the profile's id. */
+static volatile int k_marks, k_sent;
+static long long k_menu_s = -1;
+
+static void k_emit(int menu, const char *exit_text)
+{
+    char extra[1200], head[64], dmem[80], menu_s[24];
+    struct pw_vulkan_stats vk;
+    long long flex = flex_free();
+
+    if (__atomic_exchange_n(&k_sent, 1, __ATOMIC_ACQ_REL)) return;
+    vulkan_stats(&vk);
+    dmem_fields(dmem, sizeof(dmem));
+    if (flex >= 0 && (g_flex_min < 0 || flex < g_flex_min)) g_flex_min = flex;
+    if (k_menu_s >= 0) snprintf(menu_s, sizeof(menu_s), "%lld", k_menu_s);
+    else snprintf(menu_s, sizeof(menu_s), "-");
+    snprintf(extra, sizeof(extra),
+             " menu=%d exe_base=%s audio=%s grains=%llu grains_nonzero=%llu audio_errors=%llu faults_unresolved=%llu "
+             "faults_unhandled=%u exit=%s presents=%llu menu_s=%s marks=%d cpu=%s profile=%s profile_status=%s "
+             "saves=%s dxvk_conf=%s dxvk_oom=%u input=%s kbd=%s mouse=%s bink=%u openal=%u audiodrv=%u isact=%u "
+             "dsound=%u import_errors=%u flex_mib_start=%lld flex_mib_min=%lld %s",
+             menu, exe_base, p_audio != 1 ? "off" : audio_handle >= 0 ? "on" : "fail",
+             (unsigned long long)audio_grains, (unsigned long long)audio_nonzero, (unsigned long long)audio_errors,
+             faults_unresolved_g(), __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), exit_text,
+             (unsigned long long)vk.presents, menu_s, k_marks, wow_cpu(), g_profile_id, g_profile_status,
+             g_profile && g_profile->runtime.saves[0] ? g_profile->runtime.saves : "-",
+             dxvk_conf_found ? "found" : "-", dxvk_oom, g_input_used(), g_hid.keyboard >= 0 ? "ok" : "no",
+             g_hid.mouse >= 0 ? "ok" : "no", g_bink, k_openal, k_audiodrv, k_isact, k_dsound,
+             __atomic_load_n(&import_errors, __ATOMIC_RELAXED), flex_start >= 0 ? flex_start >> 20 : -1,
+             g_flex_min >= 0 ? g_flex_min >> 20 : -1, dmem);
+    snprintf(head, sizeof(head), "PS4WINE k %s", strcmp(g_profile_id, "-") ? g_profile_id : "psychonauts");
+    emit_line_with(head, NULL, 0, extra);
+}
+
+/* k's end of session: the line without a mark, with the Wine stage's exit. */
+static void k_lines(void)
+{
+    char exit_text[32];
+    value(plan->count - 1, "exit", exit_text, sizeof(exit_text));
+    k_emit(0, exit_text);
+}
+
 /* A mark (the DS4's touchpad, or Pause on the keyboard): the first at the
  * main menu sends g2's line, the second, with the player in control in the
  * first map, starts g's window. */
 static void g_mark(uint64_t now, uint64_t started)
 {
-    int mark = __atomic_add_fetch(&g_marks, 1, __ATOMIC_ACQ_REL);
+    int mark;
+    if (k_plan()) {
+        /* k: the first mark is the main menu; later ones are counted only (k has no window). */
+        mark = __atomic_add_fetch(&k_marks, 1, __ATOMIC_ACQ_REL);
+        step("k mark %d at t=%llus", mark, (unsigned long long)((now - started) / 1000000000ull));
+        if (mark == 1) {
+            k_menu_s = (long long)((now - started) / 1000000000ull);
+            k_emit(1, "running");
+        }
+        return;
+    }
+    mark = __atomic_add_fetch(&g_marks, 1, __ATOMIC_ACQ_REL);
     step("g mark %d at t=%llus", mark, (unsigned long long)((now - started) / 1000000000ull));
     if (mark == 1) g2_emit(1, "running");
     if (mark == 2) {
@@ -4485,6 +4576,21 @@ static void *g_script(void *arg)
                 }
             }
             if ((now - started) / 1000000000ull % 60 == 59) gpad_emit();
+            if (k_plan() && (now - started) / 1000000000ull % 10 == 0) {
+                /* k: the last 10 s's frame times (g_window over its own snapshots; the max reset each time). */
+                static GSnap k_prev;
+                static int k_have;
+                GSnap cur;
+                uint64_t max_ns = 0;
+                char window[600];
+                g_snap(&cur, 1, &max_ns);
+                if (k_have) {
+                    g_window(&k_prev, &cur, max_ns, "", window, sizeof(window));
+                    step("k fps t=%llus%s", (unsigned long long)((now - started) / 1000000000ull), window);
+                }
+                k_prev = cur;
+                k_have = 1;
+            }
             if ((now - started) / 1000000000ull % 10 == 0) {
                 vulkan_stats(&vk);
                 step("g t=%llus marks=%d presents=%llu flex_mib=%lld batch_lines=%llu unhandled=%u inputs=%u "
