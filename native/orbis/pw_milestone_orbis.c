@@ -16,6 +16,7 @@
 #include "pw_hid_ps5.h"
 #include "pw_pad_ps4_orbis.h"
 #include "pw_loaddll_orbis.h"
+#include "pw_xinput_feed_orbis.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -111,6 +112,7 @@ static void g1m_lines(void);
 static void g1_lines(void);
 static void g_lines(void);
 static void k_lines(void);
+static void l_lines(void);
 /* session_s counts from here when set (g: from the gameplay mark), else from the title's start. */
 static uint64_t session_base_ns;
 
@@ -2705,40 +2707,81 @@ void pw_ms_set_profile(const PwGameProfile *profile, const char *id, const char 
  * no look-up (Bloodlines' keyboard mode keeps L15's input code alone). */
 static void (*x_set_pad)(const PwWinePad *pad);
 static int (*x_rumble)(uint32_t *left, uint32_t *right);
+static uint32_t (*x_pads_wanted)(void);
 static PwPadPs5 x_pad;
-static int x_on, x_open_status = 1;
-static uint64_t x_reads, x_packets, x_rumbles, x_rumbles_on, x_marks;
+static PwXinputFeed x_feed;
+static PwGameInput x_input;
+static const char *x_input_from = "-";
+static int x_on, x_open_status = 1, x_connected_at_start;
+static uint64_t x_reads, x_packets, x_rumbles, x_rumbles_on;
 static int x_vibration_rc;
 static uint32_t x_buttons_fed;
-/* The core needs a key map; nothing is posted from it in xinput mode. */
+/* The core needs a key map; the keys come from x_input (pw_xinput_feed_step). */
 static const PwPadKeyMap x_open_map[] = { { 0x4000u, 0x20, 0, 0, "cross" } };
 
 static int xinput_mode(void) { return g_profile && g_profile->input.mode == PW_GAME_INPUT_XINPUT; }
+static void g_mark(uint64_t now, uint64_t started);
+static volatile uint64_t g_started_ns;
+
+/* The keys xinput mode posts beside the pad: the profile's preset
+ * (<root>/input/<preset>.input) under its own [input] lines; no built-in
+ * keys (g's are Bloodlines'). The touchpad's own entry stays the title's;
+ * touchpad_left is the left half's key. */
+static void x_bindings(PwGameInput *input)
+{
+    static uint8_t text[4096];
+    char path[512];
+    FILE *file;
+
+    pw_game_input_init(input);
+    x_input_from = "none";
+    if (g_profile && g_profile->input.preset[0]) {
+        snprintf(path, sizeof(path), "%s/input/%s.input", cfg.root, g_profile->input.preset);
+        if ((file = fopen(path, "rb"))) {
+            size_t got = fread(text, 1, sizeof(text), file);
+            fclose(file);
+            if (pw_game_input_parse(text, got, input) == PW_OK) x_input_from = "file";
+            else { step("xinput: %s does not parse: no keys", path); pw_game_input_init(input); }
+        } else {
+            step("xinput: no %s: no keys", path);
+        }
+    }
+    if (g_profile) pw_game_input_overlay(input, &g_profile->input);
+    input->bindings[16].kind = input->layer_bindings[16].kind = input->hold_bindings[16].kind = PW_GAME_BIND_NONE;
+}
 
 /* Every 4 ms: the DS4 to controller 0 (pw_wine_game_pad's mapping: the touchpad's
- * left half is Back; its right half is the title's mark, counted on release and
- * never given to the game), and the game's rumble to the DS4's motors. */
+ * left half is Back, and touchpad_left's key; its right half is the title's mark,
+ * counted on release and never given to the game), the bound keys beside it, the
+ * wake once a second (pw_xinput_feed_orbis.h), and the game's rumble to the DS4's
+ * motors. None of it counts as kbm (the USB keyboard's and mouse's events). */
 static void *xinput_feed(void *arg)
 {
     PwWinePad out, last;
-    int right_held = 0;
+    PwWineInput events[PW_GAME_BUTTON_COUNT * 2 + 2];
     (void)arg;
     memset(&last, 0, sizeof(last));
     for (;;) {
         uint32_t left, right;
-        int right_now;
+        int mark;
+        size_t n;
         pw_pad_ps5_read(&x_pad);
         x_reads++;
-        pw_wine_game_pad(&x_pad, &out);
-        right_now = (out.buttons & 0x0400u) != 0;
-        out.buttons &= (uint16_t)~0x0400u;
-        if (right_held && !right_now) x_marks++;
-        right_held = right_now;
+        /* The keys, then once a second the wake (a (0,0) move: Wine's driver makes the newest
+         * shown window foreground only while it takes posted input; Psychonauts reads XInput
+         * only while foreground, and DXVK showed its window without activating it). */
+        n = pw_xinput_feed_step(&x_feed, &x_input, &x_pad, cfg.now_ns() / 1000u, &out, &mark, events,
+                                sizeof(events) / sizeof(events[0]));
         if (memcmp(&out, &last, sizeof(out))) {
             x_set_pad(out.connected ? &out : NULL);
             x_packets++;
             x_buttons_fed |= out.buttons;
             last = out;
+        }
+        for (size_t i = 0; i < n; i++) post(events[i].type, events[i].code, 0, 0, events[i].down);
+        if (mark && g_plan()) {
+            uint64_t now = cfg.now_ns(), started = __atomic_load_n(&g_started_ns, __ATOMIC_ACQUIRE);
+            g_mark(now, started ? started : now);
         }
         if (x_rumble && x_rumble(&left, &right)) {
             x_rumbles++;
@@ -2756,7 +2799,7 @@ void pw_ms_xinput_start(const PwPrxDescriptor *ntdll)
     PwPadPs5Ops ops;
     PwWinePad neutral;
     pthread_t thread;
-    char line[200];
+    char line[300];
 
     if (!xinput_mode()) {
         step("xinput: off (the profile's input mode is not xinput)");
@@ -2764,6 +2807,9 @@ void pw_ms_xinput_start(const PwPrxDescriptor *ntdll)
     }
     x_set_pad = (void (*)(const PwWinePad *))(uintptr_t)pw_prx_lookup(ntdll, "pw_wine_set_pad");
     x_rumble = (int (*)(uint32_t *, uint32_t *))(uintptr_t)pw_prx_lookup(ntdll, "pw_wine_rumble");
+    x_pads_wanted = (uint32_t (*)(void))(uintptr_t)pw_prx_lookup(ntdll, "pw_wine_pads_wanted");
+    x_bindings(&x_input);
+    pw_xinput_feed_init(&x_feed);
     pw_pad_ps4_orbis_ops(&ops);
     x_open_status = pw_pad_ps5_open(&x_pad, &ops, x_open_map, sizeof(x_open_map) / sizeof(x_open_map[0]));
     if (x_set_pad && !x_open_status) {
@@ -2771,6 +2817,7 @@ void pw_ms_xinput_start(const PwPrxDescriptor *ntdll)
         memset(&neutral, 0, sizeof(neutral));
         neutral.connected = 1;
         x_set_pad(&neutral);
+        x_connected_at_start = 1;
         {
             /* Its own small stack (a caller-set stack passes orbis-compat's floor untouched,
              * patches/orbis-compat/0001 in ps4-wine): no 16 MiB of flexible memory for a poll loop. */
@@ -2783,9 +2830,11 @@ void pw_ms_xinput_start(const PwPrxDescriptor *ntdll)
         }
         if (x_on) pthread_detach(thread);
     }
-    snprintf(line, sizeof(line), "PW_MS stage=xinput xinput=%s set_pad=%d rumble=%d pad_open=%d pad_handle=%d user=%d",
-             x_on ? "on" : "off", x_set_pad != NULL, x_rumble != NULL, x_open_status, (int)x_pad.pad_handle,
-             (int)x_pad.user_id);
+    snprintf(line, sizeof(line), "PW_MS stage=xinput xinput=%s set_pad=%d rumble=%d pads_wanted=%d pad_open=%d "
+             "pad_handle=%d user=%d bindings=%s touchpad_left=%s", x_on ? "on" : "off", x_set_pad != NULL,
+             x_rumble != NULL, x_pads_wanted != NULL, x_open_status, (int)x_pad.pad_handle, (int)x_pad.user_id,
+             x_input_from, x_input.touchpad_left.kind == PW_GAME_BIND_KEY ? "key" :
+             x_input.touchpad_left.kind == PW_GAME_BIND_MOUSE ? "mouse" : "none");
     cfg.emit(line);
 }
 
@@ -2796,7 +2845,7 @@ static void xinput_fields(char *out, size_t size)
              x_on ? "on" : "off", x_open_status, (unsigned long long)x_reads, (unsigned long long)x_packets,
              (unsigned)x_buttons_fed, (unsigned long long)x_rumbles, (unsigned long long)x_rumbles_on,
              (unsigned)x_vibration_rc, (unsigned long long)x_pad.intercepted_samples,
-             (unsigned long long)x_pad.disconnected_samples, (unsigned long long)x_marks);
+             (unsigned long long)x_pad.disconnected_samples, (unsigned long long)x_feed.marks);
 }
 
 /* 32-bit winevulkan's counters (wine/ps5/vulkan/pw_vk_batch_pe.c, PW_VK_BATCH_STATS=1):
@@ -3372,6 +3421,8 @@ static const PwMsPlan plans[] = {
     { "g", g_stages, sizeof(g_stages) / sizeof(g_stages[0]), "C:\\VTMB\\Vampire.exe", 0, g_lines },
     /* Milestone k: Psychonauts from its profile (<root>/profiles/psychonauts.ini), g's machinery. */
     { "k", k_stages, sizeof(k_stages) / sizeof(k_stages[0]), "C:\\Psychonauts\\Psychonauts.exe", 0, k_lines },
+    /* Milestone l: k's stages, the DS4 as XInput controller 0 (the profile's [input] mode). */
+    { "l", k_stages, sizeof(k_stages) / sizeof(k_stages[0]), "C:\\Psychonauts\\Psychonauts.exe", 0, l_lines },
     { "gc1", gc1_stages, sizeof(gc1_stages) / sizeof(gc1_stages[0]), "C:\\hello.exe", 1, gc1_lines },
     { "gc2", gc2_stages, sizeof(gc2_stages) / sizeof(gc2_stages[0]), "C:\\hello.exe", 1, gc2_lines },
     /* p6 and p5w before p5: the last plan is the default. */
@@ -3384,9 +3435,15 @@ static int g1_plans(void)
 {
     return plan && (plan->lines == g1n_lines || plan->lines == g1m_lines || plan->lines == g1_lines);
 }
-/* g's machinery (profile, batching, sound, input, marks): g and k. */
-static int g_plan(void) { return plan && (plan->lines == g_lines || plan->lines == k_lines); }
+/* g's machinery (profile, batching, sound, input, marks): g, k and l. */
+static int g_plan(void)
+{
+    return plan && (plan->lines == g_lines || plan->lines == k_lines || plan->lines == l_lines);
+}
 static int k_plan(void) { return plan && plan->lines == k_lines; }
+static int l_plan(void) { return plan && plan->lines == l_lines; }
+/* Psychonauts' plans: the first mark sends the line, 10 s frame-time windows. */
+static int psy_plan(void) { return k_plan() || l_plan(); }
 static int i_plan(void) { return plan && plan->lines == i_lines; }
 static int l1_plan(void) { return plan && plan->lines == l1_lines; }
 static int vulkan_plan(void)
@@ -3396,7 +3453,7 @@ static int vulkan_plan(void)
 }
 const char *pw_ms_profile_id(void)
 {
-    return k_plan() ? "psychonauts" : g_plan() ? "vtmb" : l1_plan() ? "xinput32" : NULL;
+    return psy_plan() ? "psychonauts" : g_plan() ? "vtmb" : l1_plan() ? "xinput32" : NULL;
 }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
@@ -4460,6 +4517,9 @@ static void g_seg_end(GSeg *seg)
  * once. The line word is the profile's id. */
 static volatile int k_marks, k_sent;
 static long long k_menu_s = -1;
+/* The last 10 s frame-time window of k and l (g_window's fields), for l's line. */
+static char psy_window[600];
+static pthread_mutex_t psy_window_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void k_emit(int menu, const char *exit_text)
 {
@@ -4499,19 +4559,76 @@ static void k_lines(void)
     k_emit(0, exit_text);
 }
 
+/* Milestone l's line: the DS4 as XInput controller 0 in Psychonauts, at the
+ * user's first mark (exit=running) or at the session's end without one. Sent
+ * once. pad_reads is 1 once the game has read controller 0 (the sink's
+ * pads_wanted, bit 0), "-" without the look-up; kbm counts the USB keyboard's
+ * and mouse's events. */
+static volatile int l_sent;
+
+static void l_emit(const char *exit_text)
+{
+    char extra[2400], head[64], dmem[80], wanted[8], window[600];
+    struct pw_vulkan_stats vk;
+    long long flex = flex_free();
+
+    if (__atomic_exchange_n(&l_sent, 1, __ATOMIC_ACQ_REL)) return;
+    vulkan_stats(&vk);
+    dmem_fields(dmem, sizeof(dmem));
+    if (flex >= 0 && (g_flex_min < 0 || flex < g_flex_min)) g_flex_min = flex;
+    pthread_mutex_lock(&psy_window_lock);
+    snprintf(window, sizeof(window), "%s", psy_window[0] ? psy_window : " fps_avg=-");
+    pthread_mutex_unlock(&psy_window_lock);
+    if (x_pads_wanted) snprintf(wanted, sizeof(wanted), "%u", (unsigned)(x_pads_wanted() & 1u));
+    else snprintf(wanted, sizeof(wanted), "-");
+    snprintf(extra, sizeof(extra),
+             " input=%s pad_connected_at_start=%d pad_reads=%s kbm=%u faults_unresolved=%llu exit=%s marks=%d "
+             "lt_min=%u rt_min=%u trigger_samples=%llu xinput=%s pad_open=%d feed_reads=%llu pad_packets=%llu "
+             "pad_buttons=0x%04x keys_posted=%llu touchpad_left_downs=%llu wakes=%llu bindings=%s pad_rumbles=%llu "
+             "pad_rumbles_on=%llu vibration_rc=0x%x pad_intercepted=%llu pad_disconnected=%llu pad_events=%u "
+             "faults_unhandled=%u presents=%llu exe_base=%s audio=%s grains_nonzero=%llu audio_errors=%llu cpu=%s "
+             "profile=%s profile_status=%s dxvk_oom=%u kbd=%s mouse=%s flex_mib_start=%lld flex_mib_min=%lld %s%s",
+             xinput_mode() ? "xinput" : "keyboard", x_connected_at_start, wanted, g_kbm_events, faults_unresolved_g(),
+             exit_text, k_marks, (unsigned)x_feed.lt_min, (unsigned)x_feed.rt_min,
+             (unsigned long long)x_feed.trigger_samples, x_on ? "on" : "off", x_open_status,
+             (unsigned long long)x_reads, (unsigned long long)x_packets, (unsigned)x_buttons_fed,
+             (unsigned long long)x_feed.keys, (unsigned long long)x_feed.left_downs,
+             (unsigned long long)x_feed.wakes, x_input_from,
+             (unsigned long long)x_rumbles, (unsigned long long)x_rumbles_on, (unsigned)x_vibration_rc,
+             (unsigned long long)x_pad.intercepted_samples, (unsigned long long)x_pad.disconnected_samples,
+             g_pad_events, __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), (unsigned long long)vk.presents,
+             exe_base, p_audio != 1 ? "off" : audio_handle >= 0 ? "on" : "fail", (unsigned long long)audio_nonzero,
+             (unsigned long long)audio_errors, wow_cpu(), g_profile_id, g_profile_status, dxvk_oom,
+             g_hid.keyboard >= 0 ? "ok" : "no", g_hid.mouse >= 0 ? "ok" : "no",
+             flex_start >= 0 ? flex_start >> 20 : -1, g_flex_min >= 0 ? g_flex_min >> 20 : -1, dmem,
+             window);
+    snprintf(head, sizeof(head), "PS4WINE l %s", strcmp(g_profile_id, "-") ? g_profile_id : "psychonauts");
+    emit_line_with(head, NULL, 0, extra);
+}
+
+/* l's end of session: the line without a mark, with the Wine stage's exit. */
+static void l_lines(void)
+{
+    char exit_text[32];
+    value(plan->count - 1, "exit", exit_text, sizeof(exit_text));
+    l_emit(exit_text);
+}
+
 /* A mark (the DS4's touchpad, or Pause on the keyboard): the first at the
  * main menu sends g2's line, the second, with the player in control in the
  * first map, starts g's window. */
 static void g_mark(uint64_t now, uint64_t started)
 {
     int mark;
-    if (k_plan()) {
-        /* k: the first mark is the main menu; later ones are counted only (k has no window). */
+    if (psy_plan()) {
+        /* k: the first mark is the main menu; l: the user's checks are done. Later ones
+         * are counted only (neither has a window). */
         mark = __atomic_add_fetch(&k_marks, 1, __ATOMIC_ACQ_REL);
-        step("k mark %d at t=%llus", mark, (unsigned long long)((now - started) / 1000000000ull));
+        step("%s mark %d at t=%llus", plan->name, mark, (unsigned long long)((now - started) / 1000000000ull));
         if (mark == 1) {
             k_menu_s = (long long)((now - started) / 1000000000ull);
-            k_emit(1, "running");
+            if (k_plan()) k_emit(1, "running");
+            else l_emit("running");
         }
         return;
     }
@@ -4546,7 +4663,15 @@ static void *g_script(void *arg)
 
     g_bindings(&input);
     pw_wine_pad_map_init(&g_map);
-    have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
+    __atomic_store_n(&g_started_ns, started, __ATOMIC_RELEASE);
+    /* In xinput mode the feed (xinput_feed) is the pad's only reader: its marks and keys. */
+    memset(&pad, 0, sizeof(pad));
+    if (xinput_mode()) {
+        have_pad = 0;
+        pad.failed = "xinput";
+    } else {
+        have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
+    }
     g_hid_open_once();
     user = g_hid_user;
     step("g play: pad=%s user=%d keyboard=%s mouse=%s bindings=%s (touchpad or Pause: mark the menu, then the "
@@ -4576,7 +4701,7 @@ static void *g_script(void *arg)
                 }
             }
             if ((now - started) / 1000000000ull % 60 == 59) gpad_emit();
-            if (k_plan() && (now - started) / 1000000000ull % 10 == 0) {
+            if (psy_plan() && (now - started) / 1000000000ull % 10 == 0) {
                 /* k: the last 10 s's frame times (g_window over its own snapshots; the max reset each time). */
                 static GSnap k_prev;
                 static int k_have;
@@ -4587,6 +4712,9 @@ static void *g_script(void *arg)
                 if (k_have) {
                     g_window(&k_prev, &cur, max_ns, "", window, sizeof(window));
                     step("k fps t=%llus%s", (unsigned long long)((now - started) / 1000000000ull), window);
+                    pthread_mutex_lock(&psy_window_lock);
+                    snprintf(psy_window, sizeof(psy_window), "%s", window);
+                    pthread_mutex_unlock(&psy_window_lock);
                 }
                 k_prev = cur;
                 k_have = 1;

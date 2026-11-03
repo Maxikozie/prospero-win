@@ -147,6 +147,10 @@ typedef struct PwGameInput {
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
     PwGameBinding layer_bindings[PW_GAME_BUTTON_COUNT];   /* while the layer button is held */
     PwGameBinding hold_bindings[PW_GAME_BUTTON_COUNT];    /* once held hold_ms */
+    /* touchpad_left: a key or mouse button for a click on the touchpad's left
+     * half, which XInput mode also gives the game as Back. Read by the Orbis
+     * title's XInput feed only; mask 0. */
+    PwGameBinding touchpad_left;
     char preset[PW_APP_ID_CAPACITY];
     char player2[PW_APP_ID_CAPACITY];   /* the second pad's preset, profile only */
     uint32_t set;       /* which of mode/mouse/mouse_speed a file set (overlay) */

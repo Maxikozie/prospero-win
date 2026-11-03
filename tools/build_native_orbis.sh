@@ -92,7 +92,7 @@ native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/
 native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c \
 native/orbis/pw_vk_stage_orbis.c native/orbis/pw_cursor_probe_orbis.c native/orbis/pw_hist.c native/orbis/pw_loaddll_orbis.c src/pw_wine_launch.c \
 native/pw_hid_ps5.c src/pw_hid.c src/pw_eboot_release.c native/pw_pad_ps5.c src/pw_pad.c \
-native/orbis/pw_pad_ps4_orbis.c"
+native/orbis/pw_pad_ps4_orbis.c native/orbis/pw_xinput_feed_orbis.c"
 objects=""
 for source in $sources; do
     object=$out/obj/$(basename "${source%.c}").o

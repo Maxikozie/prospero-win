@@ -137,6 +137,7 @@ $(eval $(call test_rule,test_pw_videoout_tile,tests/test_pw_videoout_tile.c src/
 $(eval $(call test_rule,test_pw_pad_ps5,tests/test_pw_pad_ps5.c native/pw_pad_ps5.c src/pw_pad.c,-DPW_PAD_PS5_HOST_TEST))
 $(eval $(call test_rule,test_pw_pad_players,tests/test_pw_pad_players.c native/pw_pad_ps5.c src/pw_pad.c,-DPW_PAD_PS5_HOST_TEST))
 $(eval $(call test_rule,test_pw_pad_ps4_orbis,tests/test_pw_pad_ps4_orbis.c native/orbis/pw_pad_ps4_orbis.c native/pw_pad_ps5.c src/pw_pad.c,-DPW_PAD_PS5_HOST_TEST -DPW_PAD_PS4_ORBIS_HOST_TEST -Inative))
+$(eval $(call test_rule,test_pw_xinput_feed_orbis,tests/test_pw_xinput_feed_orbis.c native/orbis/pw_xinput_feed_orbis.c native/orbis/pw_pad_ps4_orbis.c native/pw_pad_ps5.c src/pw_pad.c native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c,-DPW_PAD_PS5_HOST_TEST -DPW_PAD_PS4_ORBIS_HOST_TEST -Inative -pthread))
 # A DualShock 4 on the host as XInput controller 0 under the host desktop
 # Wine (an LD_PRELOAD exporting only pw_wine_pad_at and pw_wine_set_rumble_at),
 # and the same code as a program that prints the controller without Wine.
@@ -176,7 +177,7 @@ TESTS := test_pw_qpc_clock test_pw_key_shared test_pw_diagnostics test_pw_x86_ho
 	test_pw_guest_fp test_pw_vm test_pw_x86_block test_pw_x86_flat test_pw_x86_cache test_pw_x86_code_pages test_pw_wow_smc_pages test_pw_wow_thread_budget test_pw_wow_tsc_clock test_pw_wow_call_top \
 	test_pw_x86_engine test_pw_x86_chaining test_pw_x86_residency test_pw_x86_global_residency test_pw_x86_reencode test_pw_x86_smc test_pw_x86_fault_markers test_pw_x86_lazyflags \
 	test_pw_guest_call test_pw_x87 test_pw_x87_native test_pw_audio_ps5 test_pw_audio_mix test_pw_agc_submit_lifecycle \
-	test_pw_videoout_layout test_pw_videoout_tile test_pw_pad_ps5 test_pw_pad_players test_pw_pad_ps4_orbis test_host_pad_evdev test_pw_data_mount \
+	test_pw_videoout_layout test_pw_videoout_tile test_pw_pad_ps5 test_pw_pad_players test_pw_pad_ps4_orbis test_pw_xinput_feed_orbis test_host_pad_evdev test_pw_data_mount \
 	test_pw_data_mount_native test_pw_lapy_elevation \
 	test_vk_present_interval test_vk_radv_profile
 

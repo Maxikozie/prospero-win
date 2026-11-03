@@ -253,6 +253,14 @@ static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length
         input->set |= SET_LAYER;
         return PW_OK;
     }
+    if (is(key, key_length, "touchpad_left")) {
+        PwGameBinding parsed = { 0, 0, 0, 0, 0 };
+        int status;
+        if (input->touchpad_left.kind != PW_GAME_BIND_UNSET) return PW_ERR_MALFORMED;
+        if ((status = binding(v, n, &parsed)) != PW_OK) return status;
+        input->touchpad_left = parsed;
+        return PW_OK;
+    }
     if (is(key, key_length, "hold_ms")) {
         uint32_t ms;
         if ((input->set & SET_HOLD_MS) || number(v, n, &ms) != PW_OK || ms < HOLD_MS_MIN || ms > HOLD_MS_MAX)
@@ -759,6 +767,7 @@ void pw_game_input_overlay(PwGameInput *base, const PwGameInput *overrides)
     base->stick_keys_set |= overrides->stick_keys_set;
     base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED | SET_KEYBOARD_STICK | SET_STICK_DEADZONE |
                                    SET_STICK_WALK | SET_STICK_RUN | SET_LAYER | SET_HOLD_MS);
+    if (overrides->touchpad_left.kind != PW_GAME_BIND_UNSET) base->touchpad_left = overrides->touchpad_left;
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
         if (overrides->bindings[i].kind != PW_GAME_BIND_UNSET) base->bindings[i] = overrides->bindings[i];
         if (overrides->layer_bindings[i].kind != PW_GAME_BIND_UNSET)

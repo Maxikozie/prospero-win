@@ -729,6 +729,39 @@ static void test_layer_hold_toggle_chord(void)
     }
 }
 
+/* touchpad_left (the Orbis XInput feed): one key for a left-half click, kept
+ * outside bindings[], so clearing the touchpad's own binding leaves it. */
+static void test_touchpad_left(void)
+{
+    PwGameInput input;
+    PwGameProfile p;
+
+    pw_game_input_init(&input);
+    assert(input.touchpad_left.kind == PW_GAME_BIND_UNSET);
+    assert(preset("[input]\nmode = xinput\ntouchpad_left = enter\n", &input) == PW_OK);
+    assert(input.mode == PW_GAME_INPUT_XINPUT && input.touchpad_left.kind == PW_GAME_BIND_KEY &&
+           input.touchpad_left.code == 0x0d && input.touchpad_left.mask == 0);
+    for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) assert(input.bindings[i].kind == PW_GAME_BIND_UNSET);
+    input.bindings[TOUCHPAD].kind = PW_GAME_BIND_NONE;
+    assert(input.touchpad_left.code == 0x0d);
+
+    /* The profile overrides it; a profile without it keeps the preset's. */
+    assert(parse(APP "[input]\npreset = psy\ntouchpad_left = escape\n", &p) == PW_OK);
+    pw_game_input_overlay(&input, &p.input);
+    assert(input.touchpad_left.code == 0x1b);
+    assert(parse(APP "[input]\npreset = psy\n", &p) == PW_OK && p.input.touchpad_left.kind == PW_GAME_BIND_UNSET);
+    pw_game_input_overlay(&input, &p.input);
+    assert(input.touchpad_left.code == 0x1b);
+
+    /* Once per file, a plain key or mouse button only. */
+    pw_game_input_init(&input);
+    assert(preset("[input]\ntouchpad_left = enter\ntouchpad_left = space\n", &input) == PW_ERR_MALFORMED);
+    assert(preset("[input]\ntouchpad_left = warp\n", &input) == PW_ERR_UNSUPPORTED);
+    assert(preset("[input]\ntouchpad_left = toggle:enter\n", &input) == PW_ERR_UNSUPPORTED);
+    assert(preset("[input]\ntouchpad_left.hold = enter\n", &input) == PW_ERR_UNSUPPORTED);
+    assert(input.touchpad_left.kind == PW_GAME_BIND_UNSET);
+}
+
 int main(void)
 {
     test_graphics_env();
@@ -743,8 +776,9 @@ int main(void)
     test_default_mode();
     test_keyboard_stick();
     test_layer_hold_toggle_chord();
+    test_touchpad_left();
     printf("game profile passed: application plus display and input, every binding kind, "
            "runtime settings and their environment, the CPU backend choice, the save directory, debug env variables, refusals, shared presets overridden by the profile, "
-           "a stick driving the direction keys, the layer, tap/hold, latches, chords and walk/run\n");
+           "a stick driving the direction keys, the layer, tap/hold, latches, chords and walk/run, touchpad_left\n");
     return 0;
 }
