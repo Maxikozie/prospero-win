@@ -15,7 +15,9 @@ _Static_assert(sizeof(PwPadPs5TriggerCommand)==56,"ScePad trigger command ABI");
 _Static_assert(sizeof(PwPadPs5TriggerEffect)==120,"ScePad trigger effect ABI");
 _Static_assert(offsetof(PwPadPs5TriggerEffect,command)==8,"ScePad trigger command offset");
 
-#ifndef PW_PAD_PS5_HOST_TEST
+/* The PS4 (__ORBIS__) has no scePadSetVibrationMode or scePadSetTriggerEffect:
+ * its title fills the ops itself (native/orbis/pw_pad_ps4_orbis.c). */
+#if !defined(PW_PAD_PS5_HOST_TEST) && !defined(__ORBIS__)
 extern int sceUserServiceInitialize(const void *);
 extern int sceUserServiceGetForegroundUser(int32_t *);
 extern int sceUserServiceTerminate(void);
@@ -47,7 +49,7 @@ static int platform_pad_set_trigger_effect(int32_t h,const PwPadPs5TriggerEffect
 int pw_pad_ps5_platform_ops(PwPadPs5Ops *ops)
 {
     if(!ops)return PW_ERR_PRECONDITION;
-#ifdef PW_PAD_PS5_HOST_TEST
+#if defined(PW_PAD_PS5_HOST_TEST) || defined(__ORBIS__)
     memset(ops,0,sizeof(*ops));return PW_ERR_UNSUPPORTED;
 #else
     *ops=(PwPadPs5Ops){platform_user_initialize,platform_foreground_user,

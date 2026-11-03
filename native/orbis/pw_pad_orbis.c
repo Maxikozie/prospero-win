@@ -2,6 +2,7 @@
 /* The DualShock 4 through libScePad (pw_pad_orbis.h). */
 #include "pw_pad_orbis.h"
 
+#include <pthread.h>
 #include <string.h>
 
 extern int32_t sceUserServiceInitialize(const void *parameters);
@@ -17,7 +18,14 @@ static int fail(PwPadOrbis *pad, const char *call, int status)
     return pad->status;
 }
 
-int pw_pad_orbis_open(PwPadOrbis *pad)
+/* One open per process: scePadInit fails once the title has released the
+ * eboot (ps4-wine i1: scePadOpen 0x80920005 after the release), so the title
+ * opens the pad before the release and every later caller gets that pad. */
+static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
+static PwPadOrbis shared;
+static int shared_done;
+
+static int open_once(PwPadOrbis *pad)
 {
     int32_t rc;
 
@@ -31,6 +39,27 @@ int pw_pad_orbis_open(PwPadOrbis *pad)
     if ((rc = scePadInit())) return fail(pad, "scePadInit", rc);
     if ((pad->handle = scePadOpen(pad->user, 0, 0, NULL)) < 0) return fail(pad, "scePadOpen", pad->handle);
     return 0;
+}
+
+int pw_pad_orbis_open(PwPadOrbis *pad)
+{
+    pthread_mutex_lock(&shared_lock);
+    if (!shared_done) {
+        open_once(&shared);
+        shared_done = 1;
+    }
+    *pad = shared;
+    pthread_mutex_unlock(&shared_lock);
+    return pad->status;
+}
+
+int pw_pad_orbis_opened(void)
+{
+    int done;
+    pthread_mutex_lock(&shared_lock);
+    done = shared_done;
+    pthread_mutex_unlock(&shared_lock);
+    return done;
 }
 
 int pw_pad_orbis_read(const PwPadOrbis *pad, PwPadOrbisState *state)

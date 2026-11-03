@@ -3,10 +3,23 @@
 #
 # The PS4 title: native/orbis/wine64_main_orbis.c with the start sequence,
 # diagnostics and PRX descriptor code it shares with the PS5 title, compiled
-# by tools/orbis-clang and linked as an OpenOrbis executable (the SDK's
-# link.x and crt1.o, orbis-compat's corrections ahead of the SDK's libc).
-# The packaging (create-fself --eboot, param.sfo, the .pkg) is the
-# consumer's: this prints the ELF's path last.
+# by tools/orbis-clang and linked as an app PRX, ps4wine.prx (the Wine PRXs'
+# recipe: -e module_start, a PRXDESC1 descriptor exporting pw_title_main,
+# orbis-compat's corrections ahead of the SDK's libc), and a stub eboot,
+# native/orbis/pw_stub_orbis.c (the SDK's link.x and crt1.o), that loads it
+# from /app0/sce_module/ps4wine.prx. The title releases the eboot's segments
+# before Wine starts, so that a PE fixed at 0x400000 can map there (ps4-wine
+# milestone i). The packaging (create-fself --eboot, ps4wine.prx into
+# sce_module/, param.sfo, the .pkg) is the consumer's: this prints the
+# eboot's path last; ps4wine.prx is next to it.
+#
+# Checks: no raw syscall; no sigsetjmp/siglongjmp import; ps4wine.prx exports
+# module_start and pw_title_main and has no PT_LOAD mid-page; the stub NEEDs
+# every Sony library ps4wine.prx NEEDs; the stub's PT_TLS (the storage for
+# every PRX's local-exec thread-locals) is .tbss only and at least as large
+# as the PT_TLS of ps4wine.prx and of each Wine PRX in $WINE_PRX_DIR
+# (default .deps/wine-orbis/prx; none skips the Wine PRXs), each rounded to its
+# alignment; the stub also NEEDs every Sony library those Wine PRXs NEED.
 #
 # Also builds pw_probe_mod.prx, a module linked like the Wine PRXs, which
 # the title loads to check the recipe on the console, and milestone d1's
@@ -78,7 +91,8 @@ src/pw_result.c src/pw_wine_start.c wine/ps5/pw_wine_prx.c native/orbis/pw_stage
 native/orbis/pw_milestone_orbis.c native/orbis/pw_videoout_orbis.c native/orbis/pw_pad_orbis.c \
 native/pw_wine_display.c src/pw_game_profile.c src/pw_app_profile.c src/pw_script_input.c \
 native/orbis/pw_vk_stage_orbis.c native/orbis/pw_cursor_probe_orbis.c native/orbis/pw_hist.c src/pw_wine_launch.c \
-native/pw_hid_ps5.c src/pw_hid.c"
+native/pw_hid_ps5.c src/pw_hid.c src/pw_eboot_release.c native/pw_pad_ps5.c src/pw_pad.c \
+native/orbis/pw_pad_ps4_orbis.c"
 objects=""
 for source in $sources; do
     object=$out/obj/$(basename "${source%.c}").o
@@ -86,21 +100,86 @@ for source in $sources; do
     "$cc" $common -c "$root/$source" -o "$object" || fail "cannot compile $source"
     objects="$objects $object"
 done
+"$cc" $common -c "$root/native/orbis/pw_stub_orbis.c" -o "$out/obj/pw_stub_orbis.o" || fail "cannot compile the stub"
+python3 "$root/tools/gen_prx_descriptor.py" --orbis "$out/obj/ps4wine_desc.c" pw_title_main ||
+    fail "cannot generate the title's descriptor"
+"$cc" -std=c11 -O2 -Wall -Wextra -Werror -I"$root/wine/ps5" -c "$out/obj/ps4wine_desc.c" -o "$out/obj/ps4wine_desc.o" ||
+    fail "cannot compile the title's descriptor"
 # A raw syscall instruction outside libkernel kills the process.
 if llvm-objdump -d "$out"/obj/*.o | grep -qw syscall; then fail "a raw syscall instruction in the title's objects"; fi
 
+# The title PRX (tools/build_wine_orbis.sh's ld_prx recipe, without lazy or unresolved symbols).
+sce_libs="-lSceNet -lSceSystemService -lSceUserService -lSceVideoOut -lScePad -lSceAudioOut -lSceSysmodule -lSceGnmDriver"
 # shellcheck disable=SC2086
-ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
-    $objects -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
-    -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ -lSceNet -lSceSystemService -lSceUserService \
-    -lSceVideoOut -lScePad -lSceAudioOut -lSceSysmodule \
-    "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" ||
-    fail "the title does not link"
+ld.lld -m elf_x86_64 -pie --export-dynamic -e module_start --script "$OO_PS4_TOOLCHAIN/link.x" \
+    -T "$root/wine/ps5/prx_eh_frame.ld" --eh-frame-hdr --no-rosegment -z max-page-size=0x4000 -soname ps4wine.so \
+    $objects "$out/obj/ps4wine_desc.o" -L"$compat_lib" -lorbis-compat "$compat_lib"/libc16/libc16_*.o \
+    -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel -lc++ $sce_libs \
+    -o "$out/ps4wine.shared.elf" --Map="$out/ps4wine.map" || fail "the title PRX does not link"
 # libc.a has setjmp/longjmp/siglongjmp but no sigsetjmp: a sigsetjmp would bind to libkernel's
 # (FreeBSD's jmp_buf) and pair with musl's siglongjmp (milestone e1: the stage recovery jumped to 0x20).
-if llvm-nm -D "$out/eboot.elf" | grep -qE ' U (sigsetjmp|siglongjmp)$'; then
+if llvm-nm -D "$out/ps4wine.shared.elf" | grep -qE ' U (sigsetjmp|siglongjmp)$'; then
     fail "the title imports sigsetjmp/siglongjmp; use setjmp/longjmp (one libc's pair)"
 fi
+syms=$(llvm-readelf --dyn-syms "$out/ps4wine.shared.elf")
+for name in module_start pw_title_main; do
+    printf '%s\n' "$syms" | grep -qE "GLOBAL +DEFAULT +[0-9]+ $name\$" || fail "ps4wine.prx does not export $name"
+done
+# A PT_LOAD that starts mid-page is ENOEXEC for an app PRX.
+for vaddr in $(llvm-readelf -lW "$out/ps4wine.shared.elf" | awk '$1 == "LOAD" { print $3 }'); do
+    [ $((vaddr % 16384)) -eq 0 ] || fail "ps4wine.prx has a PT_LOAD at $vaddr, not 16 KiB aligned"
+done
+(cd "$out" && "$fself" -in=ps4wine.shared.elf -out=ps4wine.oelf --lib=ps4wine.prx -libname=ps4wine \
+    --paid 0x3800000000000011 > /dev/null) || fail "create-fself refused ps4wine"
+rm -f "$out/ps4wine.oelf"
+chmod 755 "$out/ps4wine.prx"
+
+# The stub eboot: NEEDs the same Sony libraries, so the loader has them when it loads the PRX.
+# shellcheck disable=SC2086
+ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
+    "$out/obj/pw_stub_orbis.o" "$out/obj/pw_wine_prx.o" \
+    -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel $sce_libs \
+    "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" || fail "the stub does not link"
+
+# The release reads module 0's segments through pw_prx_parse_module_info, which takes at most four.
+loads=$(llvm-readelf -lW "$out/eboot.elf" | grep -c '^ *LOAD ')
+[ "$loads" -le 4 ] || fail "the stub has $loads PT_LOADs; module info lists at most 4 (PW_PRX_MAX_SEGMENTS)"
+needed() { llvm-readelf -d "$1" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sed 's|.*/||' | LC_ALL=C sort -u; }
+needed "$out/eboot.elf" > "$out/obj/stub.needed"
+# The Wine PRXs the title loads: their PT_TLS and their Sony libraries are checked against the
+# stub too (WINE_PRX_DIR=none skips them, for a title built without a Wine tree).
+wine_prx_dir=${WINE_PRX_DIR:-$root/.deps/wine-orbis/prx}
+if [ "$wine_prx_dir" != none ]; then
+    ls "$wine_prx_dir"/*.shared.elf > /dev/null 2>&1 ||
+        fail "no Wine PRXs in $wine_prx_dir to check the stub against (build them, or WINE_PRX_DIR=none)"
+fi
+checked=ps4wine
+for elf in "$out/ps4wine.shared.elf" "$wine_prx_dir"/*.shared.elf; do
+    [ -f "$elf" ] || continue
+    missing=$(needed "$elf" | grep '^libSce' | LC_ALL=C comm -23 - "$out/obj/stub.needed" | tr '\n' ' ')
+    [ -z "$missing" ] || fail "the stub does not NEED what $(basename "$elf") NEEDs: $missing"
+done
+# TLS: "filesz memsz align" in decimal, or "0 0 1" without a PT_TLS. A PRX's local-exec offsets
+# reach back memsz rounded up to its alignment from the thread pointer; the stub's block, rounded
+# the same way, must cover that.
+tls_of() {
+    set -- $(llvm-readelf -lW "$1" | awk '$1 == "TLS" { print $5, $6, $NF }')
+    [ $# -eq 3 ] && echo "$(($1)) $(($2)) $(($3))" || echo "0 0 1"
+}
+round_up() { [ "$2" -gt 1 ] && echo $((($1 + $2 - 1) / $2 * $2)) || echo "$1"; }
+set -- $(tls_of "$out/eboot.elf"); stub_filesz=$1; stub_memsz=$2; stub_block=$(round_up "$2" "$3")
+[ "$stub_memsz" -gt 0 ] || fail "the stub has no PT_TLS"
+[ "$stub_filesz" -eq 0 ] || fail "the stub's PT_TLS has $stub_filesz initialised bytes: its image is released with the eboot"
+for elf in "$out/ps4wine.shared.elf" "$wine_prx_dir"/*.shared.elf; do
+    [ -f "$elf" ] || continue
+    set -- $(tls_of "$elf")
+    block=$(round_up "$2" "$3")
+    [ "$block" -le "$stub_block" ] ||
+        fail "$(basename "$elf")'s TLS block is $block bytes, more than the stub's $stub_block"
+    [ "$elf" = "$out/ps4wine.shared.elf" ] || checked="$checked $(basename "${elf%.shared.elf}")"
+done
+tls_checked=$checked
+echo "title: stub PT_TLS $stub_memsz bytes .tbss (block $stub_block); TLS and Sony libraries checked against: $tls_checked" >&2
 
 # The probe modules, linked as tools/build_wine_orbis.sh links the Wine PRXs:
 # pw_probe_mod (the recipe) and pw_probe_tls (the same with libc's TLS
@@ -198,6 +277,6 @@ bind_module pw_bind_use pw_bind_use.c import pw_bind_use_run
 bind_module pw_bind_early pw_bind_use.c import pw_bind_use_run
 bind_module pw_bind_data pw_bind_data.c data pw_bind_data_read pw_bind_data_address
 bind_module pw_bind_thunk pw_bind_thunk.c thunk pw_bind_thunk_run pw_prx_bind_imports
-echo "title: $out/eboot.elf ($build_id); probe modules: $out/pw_probe_mod.prx $out/pw_probe_tls.prx;" \
+echo "title: $out/eboot.elf (stub) + $out/ps4wine.prx ($build_id); probe modules: $out/pw_probe_mod.prx $out/pw_probe_tls.prx;" \
     "binding modules: pw_bind_lib pw_bind_use pw_bind_early pw_bind_data pw_bind_thunk"
 echo "$out/eboot.elf"

@@ -56,6 +56,11 @@ typedef struct PwVideoOutOrbis {
 /* 0, or the failing call's status (also in vo->status/failed): the default
  * mode, 1920x1080 A8B8G8R8_SRGB, two buffers, a synchronous flip. */
 int pw_videoout_orbis_open(PwVideoOutOrbis *vo);
+/* Whether an open of this process succeeded; and, when none has, one
+ * sceVideoOutOpen and its close: 1 when it primed, 0 when an open had already
+ * happened, else the failing call's return (ps4-wine milestone i). */
+int pw_videoout_orbis_opened_once(void);
+int pw_videoout_orbis_prime(void);
 /* The same in another mode (NULL: the default). */
 int pw_videoout_orbis_open_mode(PwVideoOutOrbis *vo, const PwVideoOutOrbisMode *mode);
 /* Async mode: waits (sceKernelUsleep, at most 2 s) until fewer than

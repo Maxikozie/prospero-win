@@ -59,6 +59,24 @@ static const PwVideoOutOrbisMode default_mode = {
     PW_VIDEOOUT_ORBIS_WIDTH, PW_VIDEOOUT_ORBIS_HEIGHT, PW_VIDEOOUT_ORBIS_WIDTH, 0, PW_VIDEOOUT_ORBIS_BUFFERS, 0,
 };
 
+/* Whether a sceVideoOutOpen of this process succeeded (here or through
+ * pw_videoout_orbis_prime): Sony's display setup reads the eboot's data on the
+ * first open, so one must precede the eboot's release (ps4-wine milestone i). */
+static int opened_once;
+
+int pw_videoout_orbis_opened_once(void) { return opened_once; }
+
+int pw_videoout_orbis_prime(void)
+{
+    int handle, rc;
+
+    if (opened_once) return 0;
+    if ((handle = sceVideoOutOpen(VIDEOOUT_USER_SYSTEM, VIDEOOUT_BUS_MAIN, 0, NULL)) < 0) return handle;
+    opened_once = 1;
+    rc = sceVideoOutClose(handle);
+    return rc ? rc : 1;
+}
+
 int pw_videoout_orbis_open(PwVideoOutOrbis *vo)
 {
     return pw_videoout_orbis_open_mode(vo, NULL);
@@ -92,6 +110,7 @@ int pw_videoout_orbis_open_mode(PwVideoOutOrbis *vo, const PwVideoOutOrbisMode *
     }
     if ((vo->handle = sceVideoOutOpen(VIDEOOUT_USER_SYSTEM, VIDEOOUT_BUS_MAIN, 0, NULL)) < 0)
         return fail(vo, "sceVideoOutOpen", vo->handle);
+    opened_once = 1;
     memset(attribute, 0, sizeof(attribute));
     sceVideoOutSetBufferAttribute(attribute, vo->mode.bgra ? FORMAT_A8R8G8B8_SRGB : FORMAT_A8B8G8R8_SRGB,
                                   TILING_LINEAR, 0, vo->mode.width, vo->mode.height, vo->mode.pitch);

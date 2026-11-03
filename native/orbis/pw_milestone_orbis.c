@@ -14,6 +14,7 @@
 #include "pw_hist.h"
 #include "pw_game_profile.h"
 #include "pw_hid_ps5.h"
+#include "pw_pad_ps4_orbis.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -96,9 +97,14 @@ static const char *ntdll_symbol(const char *name, void **address);
 static void pause_ms(unsigned ms);
 /* Milestone g (docs/ps4/HANDOFF-g.md in ps4-wine). */
 static int g_plan(void);
+static void g_hid_open_once(void);
+static int i_plan(void);
+static int l1_plan(void);
 static int g1_plans(void);
 static void *g_script(void *arg);
 static void g1n_lines(void);
+static void i_lines(void);
+static void l1_lines(void);
 static void g1m_lines(void);
 static void g1_lines(void);
 static void g_lines(void);
@@ -187,6 +193,46 @@ static int module_info(int32_t handle, Module *m)
         if (a + m->segments[i].size > m->high) m->high = a + m->segments[i].size;
     }
     return 0;
+}
+
+/* ---- the eboot's release (milestone i) -------------------------------------------- */
+
+static char eboot_release_state[32] = "-";
+static uint64_t eboot_low_end;
+
+void pw_ms_set_eboot_release(const char *state, uint64_t low_end)
+{
+    snprintf(eboot_release_state, sizeof(eboot_release_state), "%s", state);
+    eboot_low_end = low_end;
+}
+
+const char *pw_ms_eboot_release_fields(void)
+{
+    static char fields[80];
+    if (eboot_low_end)
+        snprintf(fields, sizeof(fields), " eboot_release=%s low_end=0x%llx", eboot_release_state,
+                 (unsigned long long)eboot_low_end);
+    else snprintf(fields, sizeof(fields), " eboot_release=%s low_end=-", eboot_release_state);
+    return fields;
+}
+
+void pw_ms_eboot_release_prepare(void)
+{
+    PwPadOrbis pad;
+    char line[200];
+    int primed = pw_videoout_orbis_prime(), pad_status = pw_pad_orbis_open(&pad);
+
+    /* g: the keyboard and the mouse too (g_script uses them; it may not have run yet). */
+    if (g_plan()) g_hid_open_once();
+
+    snprintf(line, sizeof(line), "PW_MS stage=eboot_prepare vo_prime=%s pad=%s pad_failed=%s pad_status=0x%x",
+             primed == 1 ? "1" : primed == 0 ? "0" : "err", pad_status ? "err" : "ok", pad.failed ? pad.failed : "-",
+             (unsigned)pad_status);
+    if (primed < 0) {
+        size_t n = strlen(line);
+        snprintf(line + n, sizeof(line) - n, " vo_prime_rc=0x%x", (unsigned)primed);
+    }
+    cfg.emit(line);
 }
 
 const char *pw_orbis_module_of(uint64_t address, char *out, size_t size)
@@ -2206,6 +2252,10 @@ static void stage_low_map(char *fields, size_t size)
  * remembers only the last stdout line. */
 static char vk64_line[256], vk64s_line[256], d3d11_line[256];
 static char hello32_line[160], hello32s_line[160], gdi32_line[320];
+/* i: fixed32.exe's "FIXED32 k=v ..." line (a PE32 fixed at 0x400000, no relocations). */
+static char fixed32_line[320];
+/* l1: xinput32.exe's "XINPUT k=v ..." line. */
+static char xinput32_line[512];
 static int hello32_done;
 /* p5w, p6: wincb.exe's summary (WINCB done); its hold markers are sampled as they come. */
 static char wincb_done[400];
@@ -2220,6 +2270,8 @@ void pw_ms_stdout(const char *line)
     else if (!strncmp(line, "HELLO32S ", 9)) snprintf(hello32s_line, sizeof(hello32s_line), "%s", line + 9);
     else if (!strncmp(line, "GDI32 ", 6)) snprintf(gdi32_line, sizeof(gdi32_line), "%s", line + 6);
     else if (!strcmp(line, "Hello from PE32")) hello32_done = 1;
+    else if (!strncmp(line, "FIXED32 ", 8)) snprintf(fixed32_line, sizeof(fixed32_line), "%s", line + 8);
+    else if (!strncmp(line, "XINPUT ", 7)) snprintf(xinput32_line, sizeof(xinput32_line), "%s", line + 7);
     else if (!strncmp(line, "WINCB done ", 11)) snprintf(wincb_done, sizeof(wincb_done), "%s", line + 11);
     else if (!strcmp(line, "WINCB hold_begin")) hold_sample(0);
     else if (!strncmp(line, "WINCB hold n=", 13)) hold_sample(1);
@@ -2240,6 +2292,8 @@ void pw_ms_environment(void (*add)(const char *name, const char *value))
     /* p2: 32-bit code on the hardware backend (patch 0611); wow64 falls back to
      * the prefix's wowprospero.dll when it does not start (0614). */
     if (native_plan()) add("WINE_PS5_WOW64_CPU", "wow64native.dll");
+    /* i: fixed32.exe on the native CPU (env.txt may choose the translator). */
+    if (i_plan()) add("WINE_PS5_WOW64_CPU", "wow64native.dll");
     if (g1_plans() || g_plan()) {
         /* Milestone g: the native CPU (g's comes from its profile; env.txt's
          * WINE_PS5_WOW64_CPU=wowprospero.dll chooses the translator), Vulkan
@@ -2642,6 +2696,106 @@ void pw_ms_set_profile(const PwGameProfile *profile, const char *id, const char 
     snprintf(g_profile_status, sizeof(g_profile_status), "%s", status && status[0] ? status : "-");
 }
 
+/* ---- XInput (milestone l1): the DS4 as controller 0 ---------------------------------- */
+
+/* Off unless the profile's [input] mode is xinput: no slot connected, no feed,
+ * no look-up (Bloodlines' keyboard mode keeps L15's input code alone). */
+static void (*x_set_pad)(const PwWinePad *pad);
+static int (*x_rumble)(uint32_t *left, uint32_t *right);
+static PwPadPs5 x_pad;
+static int x_on, x_open_status = 1;
+static uint64_t x_reads, x_packets, x_rumbles, x_rumbles_on, x_marks;
+static int x_vibration_rc;
+static uint32_t x_buttons_fed;
+/* The core needs a key map; nothing is posted from it in xinput mode. */
+static const PwPadKeyMap x_open_map[] = { { 0x4000u, 0x20, 0, 0, "cross" } };
+
+static int xinput_mode(void) { return g_profile && g_profile->input.mode == PW_GAME_INPUT_XINPUT; }
+
+/* Every 4 ms: the DS4 to controller 0 (pw_wine_game_pad's mapping: the touchpad's
+ * left half is Back; its right half is the title's mark, counted on release and
+ * never given to the game), and the game's rumble to the DS4's motors. */
+static void *xinput_feed(void *arg)
+{
+    PwWinePad out, last;
+    int right_held = 0;
+    (void)arg;
+    memset(&last, 0, sizeof(last));
+    for (;;) {
+        uint32_t left, right;
+        int right_now;
+        pw_pad_ps5_read(&x_pad);
+        x_reads++;
+        pw_wine_game_pad(&x_pad, &out);
+        right_now = (out.buttons & 0x0400u) != 0;
+        out.buttons &= (uint16_t)~0x0400u;
+        if (right_held && !right_now) x_marks++;
+        right_held = right_now;
+        if (memcmp(&out, &last, sizeof(out))) {
+            x_set_pad(out.connected ? &out : NULL);
+            x_packets++;
+            x_buttons_fed |= out.buttons;
+            last = out;
+        }
+        if (x_rumble && x_rumble(&left, &right)) {
+            x_rumbles++;
+            if (left || right) x_rumbles_on++;
+            pw_pad_ps5_vibrate(&x_pad, (uint8_t)(left >> 8), (uint8_t)(right >> 8));
+            x_vibration_rc = x_pad.vibration_rc;
+        }
+        pause_ms(4);
+    }
+    return NULL;
+}
+
+void pw_ms_xinput_start(const PwPrxDescriptor *ntdll)
+{
+    PwPadPs5Ops ops;
+    PwWinePad neutral;
+    pthread_t thread;
+    char line[200];
+
+    if (!xinput_mode()) {
+        step("xinput: off (the profile's input mode is not xinput)");
+        return;
+    }
+    x_set_pad = (void (*)(const PwWinePad *))(uintptr_t)pw_prx_lookup(ntdll, "pw_wine_set_pad");
+    x_rumble = (int (*)(uint32_t *, uint32_t *))(uintptr_t)pw_prx_lookup(ntdll, "pw_wine_rumble");
+    pw_pad_ps4_orbis_ops(&ops);
+    x_open_status = pw_pad_ps5_open(&x_pad, &ops, x_open_map, sizeof(x_open_map) / sizeof(x_open_map[0]));
+    if (x_set_pad && !x_open_status) {
+        /* Some games (Psychonauts) look for a pad only at startup: connected before Wine runs. */
+        memset(&neutral, 0, sizeof(neutral));
+        neutral.connected = 1;
+        x_set_pad(&neutral);
+        {
+            /* Its own small stack (a caller-set stack passes orbis-compat's floor untouched,
+             * patches/orbis-compat/0001 in ps4-wine): no 16 MiB of flexible memory for a poll loop. */
+            static uint8_t stack[256u << 10] __attribute__((aligned(64)));
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstack(&attr, stack, sizeof(stack));
+            x_on = !pthread_create(&thread, &attr, xinput_feed, NULL);
+            pthread_attr_destroy(&attr);
+        }
+        if (x_on) pthread_detach(thread);
+    }
+    snprintf(line, sizeof(line), "PW_MS stage=xinput xinput=%s set_pad=%d rumble=%d pad_open=%d pad_handle=%d user=%d",
+             x_on ? "on" : "off", x_set_pad != NULL, x_rumble != NULL, x_open_status, (int)x_pad.pad_handle,
+             (int)x_pad.user_id);
+    cfg.emit(line);
+}
+
+static void xinput_fields(char *out, size_t size)
+{
+    snprintf(out, size, " xinput=%s pad_open=%d pad_reads=%llu pad_packets=%llu pad_buttons=0x%04x pad_rumbles=%llu "
+             "pad_rumbles_on=%llu vibration_rc=0x%x pad_intercepted=%llu pad_disconnected=%llu marks=%llu",
+             x_on ? "on" : "off", x_open_status, (unsigned long long)x_reads, (unsigned long long)x_packets,
+             (unsigned)x_buttons_fed, (unsigned long long)x_rumbles, (unsigned long long)x_rumbles_on,
+             (unsigned)x_vibration_rc, (unsigned long long)x_pad.intercepted_samples,
+             (unsigned long long)x_pad.disconnected_samples, (unsigned long long)x_marks);
+}
+
 /* 32-bit winevulkan's counters (wine/ps5/vulkan/pw_vk_batch_pe.c, PW_VK_BATCH_STATS=1):
  * cumulative, so the difference between any two records is exact whatever
  * PW_VK_BATCH_STATS_EVERY drops between them. */
@@ -2918,7 +3072,7 @@ static void g1_extra_fields(char *out, size_t size)
     live_thread_fields(live, sizeof(live));
     n = (size_t)snprintf(out, size, " cpu=%s native_caps=%s faults_unresolved=%llu faults_unhandled=%u %s", wow_cpu(),
                          caps, faults_unresolved_g(), __atomic_load_n(&wine_unhandled, __ATOMIC_RELAXED), live);
-    if (plan->lines == g1n_lines || n >= size) return;
+    if (plan->lines == g1n_lines || plan->lines == i_lines || plan->lines == l1_lines || n >= size) return;
     alias_fields(alias, sizeof(alias));
     snprintf(out + n, size - n, " batch=%d crossings_per_frame=%s batch_lines=%llu %s", batch_on(&b),
              crossings_between(&a, &b, crossings, sizeof(crossings)), (unsigned long long)batch_lines, alias);
@@ -3117,6 +3271,19 @@ static const PwMsStage g1n_stages[] = {
     { "display", 15, stage_display, "display=fault" },
     { "wow32", 0, NULL, "exit=fault" },
 };
+/* Milestone i (docs/ps4/HANDOFF-i.md in ps4-wine): the low base. fixed32.exe, a PE32 fixed at
+ * 0x400000 without relocations, on the native CPU, after the title released the eboot. */
+static const PwMsStage i_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "low_map", 10, stage_low_map, "low_map=fault" },
+    { "fixed32", 0, NULL, "exit=fault" },
+};
+/* l1 (HANDOFF-i.md in ps4-wine): xinput32.exe from <root>/profiles/xinput32.ini (xinput
+ * mode, the native CPU) reads the DS4 as XInput controller 0 for 30 s, then rumbles. */
+static const PwMsStage l1_stages[] = {
+    { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
+    { "xinput32", 0, NULL, "exit=fault" },
+};
 static const PwMsStage g1m_stages[] = {
     { "cpu_probe", 10, stage_cpu_probe, "cpu_probe=fault" },
     { "w32u_bind", 20, stage_w32u_bind, "w32u_load=fault w32u_bound=fault" },
@@ -3170,6 +3337,8 @@ static const PwMsPlan plans[] = {
     /* Milestone g: g's program comes from its profile (<root>/profiles/vtmb.ini). */
     { "g1n", g1n_stages, sizeof(g1n_stages) / sizeof(g1n_stages[0]), "C:\\wow32.exe", 0, g1n_lines },
     { "g1m", g1m_stages, sizeof(g1m_stages) / sizeof(g1m_stages[0]), "C:\\vk32.exe", 0, g1m_lines },
+    { "i", i_stages, sizeof(i_stages) / sizeof(i_stages[0]), "C:\\fixed32.exe", 0, i_lines },
+    { "l1", l1_stages, sizeof(l1_stages) / sizeof(l1_stages[0]), "C:\\xinput32.exe", 0, l1_lines },
     { "g1", g1_stages, sizeof(g1_stages) / sizeof(g1_stages[0]), "C:\\d3d9tri32.exe", 0, g1_lines },
     { "g", g_stages, sizeof(g_stages) / sizeof(g_stages[0]), "C:\\VTMB\\Vampire.exe", 0, g_lines },
     { "gc1", gc1_stages, sizeof(gc1_stages) / sizeof(gc1_stages[0]), "C:\\hello.exe", 1, gc1_lines },
@@ -3185,12 +3354,14 @@ static int g1_plans(void)
     return plan && (plan->lines == g1n_lines || plan->lines == g1m_lines || plan->lines == g1_lines);
 }
 static int g_plan(void) { return plan && plan->lines == g_lines; }
+static int i_plan(void) { return plan && plan->lines == i_lines; }
+static int l1_plan(void) { return plan && plan->lines == l1_lines; }
 static int vulkan_plan(void)
 {
     return plan && (plan->lines == e2_lines || plan->lines == e_lines || plan->lines == g1m_lines ||
                     plan->lines == g1_lines || g_plan());
 }
-const char *pw_ms_profile_id(void) { return g_plan() ? "vtmb" : NULL; }
+const char *pw_ms_profile_id(void) { return g_plan() ? "vtmb" : l1_plan() ? "xinput32" : NULL; }
 static int dxvk_plan(void) { return plan && plan->lines == e_lines; }
 static int p_plan(void)
 {
@@ -3525,6 +3696,13 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  pick(gdi32_line, "screen", screen, sizeof(screen)), pick(gdi32_line, "pixel", pixel, sizeof(pixel)),
                  pick(gdi32_line, "window", window, sizeof(window)), pick(gdi32_line, "fonts", fonts, sizeof(fonts)));
         pthread_mutex_unlock(&present_lock);
+    } else if (l1_plan()) {
+        /* xinput32.exe: its exit here; its line and the feed's counters go in g_extra. */
+        snprintf(fields, sizeof(fields), "exit=%s server=%s", exit_text, server_connected ? "inprocess" : "none");
+    } else if (i_plan()) {
+        /* fixed32.exe: its exit and its own line as it came. */
+        snprintf(fields, sizeof(fields), "exit=%s server=%s %s", exit_text, server_connected ? "inprocess" : "none",
+                 fixed32_line[0] ? fixed32_line : "base=-");
     } else if (g_plan()) {
         /* Bloodlines: its exit here; the line's fields are g's window (g_lines). */
         snprintf(fields, sizeof(fields), "exit=%s server=%s", exit_text, server_connected ? "inprocess" : "none");
@@ -3557,7 +3735,16 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
                  frame_width, frame_height, fb_saved == 0 ? "ok" : fb_saved == -1 ? "none" : "fail", gdi);
         pthread_mutex_unlock(&present_lock);
     }
-    if (g1_plans()) g1_extra_fields(g_extra, sizeof(g_extra));
+    if (g1_plans() || i_plan()) g1_extra_fields(g_extra, sizeof(g_extra));
+    if (l1_plan()) {
+        /* The program's line as it came, the feed's counters, then cpu and the faults. */
+        char feed[400], cpu[600];
+        size_t n;
+        xinput_fields(feed, sizeof(feed));
+        g1_extra_fields(cpu, sizeof(cpu));
+        n = (size_t)snprintf(g_extra, sizeof(g_extra), " %s%s%s", xinput32_line[0] ? xinput32_line : "get0=-", feed, cpu);
+        (void)n;
+    }
     if (vulkan_plan()) {
         /* Recorded, not in the line: VideoOut's hardware cursor (win32u's patch 0740). */
         char cursor[400];
@@ -3594,6 +3781,8 @@ static void emit_line_with(const char *head, const LineKey *keys, size_t count, 
         n += (size_t)snprintf(line + n, sizeof(line) - n, " %s=%s", keys[i].key,
                               value(keys[i].stage, keys[i].key, v, sizeof(v)));
     if (extra && n < sizeof(line)) n += (size_t)snprintf(line + n, sizeof(line) - n, "%s", extra);
+    /* Milestone i: whether this launch released the eboot (every plan line). */
+    if (n < sizeof(line)) n += (size_t)snprintf(line + n, sizeof(line) - n, "%s", pw_ms_eboot_release_fields());
     pw_stage_summary(&run, summary, sizeof(summary));
     if (n < sizeof(line))
         snprintf(line + n, sizeof(line) - n, " build=%s %s session_s=%llu", cfg.build_id, summary,
@@ -3927,6 +4116,30 @@ static void g1n_lines(void)
     emit_line_with("PS4WINE g1n hello32", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
 }
 
+/* l1: xinput32.exe's line (bits, get0, caps, buttons_seen, the sticks' and triggers'
+ * extremes, set0, rumble_events, ...), the title's feed and cpu from g_extra. */
+static void l1_lines(void)
+{
+    enum { PROBE, XINPUT32 };
+    static const LineKey keys[] = { { "exit", XINPUT32 }, { "cpu_probe", PROBE } };
+    emit_line_with("PS4WINE l1 xinput32", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
+}
+
+/* i: fixed32.exe's fields (where its image landed, its sections' protections, SEH, a
+ * thread); cpu, native_caps and the unresolved faults from g_extra, eboot_release and
+ * low_end from emit_line_with. */
+static void i_lines(void)
+{
+    enum { PROBE, LOW, FIXED32 };
+    static const LineKey keys[] = {
+        { "bits", FIXED32 }, { "base", FIXED32 }, { "relocs", FIXED32 }, { "size_kib", FIXED32 },
+        { "text_rx", FIXED32 }, { "rdata_ro", FIXED32 }, { "rdata_shared", FIXED32 }, { "data_rw", FIXED32 }, { "seh", FIXED32 },
+        { "thread", FIXED32 }, { "exit", FIXED32 }, { "server", FIXED32 }, { "low_free_mib", LOW },
+        { "low_hole", LOW }, { "cpu_probe", PROBE },
+    };
+    emit_line_with("PS4WINE i fixed32", keys, sizeof(keys) / sizeof(keys[0]), g_extra);
+}
+
 /* g1m: vk32.exe (wine_vk64.c for i686), e2's and e3's fields in one line. */
 static void g1m_lines(void)
 {
@@ -3991,6 +4204,29 @@ static PwHidPs5 g_hid;
 static int g_hid_status = -1;
 
 static void g_hid_log(const char *line) { step("g hid %s", line); }
+
+/* The keyboard's and the mouse's system modules and their opens, once per process: from
+ * pw_ms_eboot_release_prepare (before the release; the mouse was never measured after it,
+ * ps4-wine i1) or from g_script, whichever comes first. user: the pad's, else the initial user. */
+static pthread_mutex_t g_hid_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_hid_opened;
+static int32_t g_hid_user = -1;
+
+static void g_hid_open_once(void)
+{
+    pthread_mutex_lock(&g_hid_lock);
+    if (!g_hid_opened) {
+        PwPadOrbis pad;
+        int32_t user = -1;
+        if (pw_pad_orbis_open(&pad) == 0) user = pad.user;
+        else if (sceUserServiceInitialize(NULL), sceUserServiceGetInitialUser(&user)) user = -1;
+        g_hid_user = user;
+        pw_hid_ps5_preload(g_hid_log);
+        g_hid_status = pw_hid_ps5_open(&g_hid, pw_hid_ps5_system_ops(g_hid_log), user);
+        g_hid_opened = 1;
+    }
+    pthread_mutex_unlock(&g_hid_lock);
+}
 
 /* What the player used: kbm, pad, both, or none yet. */
 static const char *g_input_used(void)
@@ -4209,10 +4445,8 @@ static void *g_script(void *arg)
     g_bindings(&input);
     pw_wine_pad_map_init(&g_map);
     have_pad = (d_pad = pw_pad_orbis_open(&pad) == 0);
-    if (have_pad) user = pad.user;
-    else if (sceUserServiceInitialize(NULL), sceUserServiceGetInitialUser(&user)) user = -1;
-    pw_hid_ps5_preload(g_hid_log);
-    g_hid_status = pw_hid_ps5_open(&g_hid, pw_hid_ps5_system_ops(g_hid_log), user);
+    g_hid_open_once();
+    user = g_hid_user;
     step("g play: pad=%s user=%d keyboard=%s mouse=%s bindings=%s (touchpad or Pause: mark the menu, then the "
          "first map; square: interior segment; triangle: hub segment)", have_pad ? "ok" : pad.failed, (int)user,
          g_hid.keyboard >= 0 ? "ok" : "no", g_hid.mouse >= 0 ? "ok" : "no", g_input_from);

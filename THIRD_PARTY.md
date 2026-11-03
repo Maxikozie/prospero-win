@@ -41,10 +41,14 @@ that the PRXs and the title link; `tools/gen_prx_descriptor.py --orbis` restates
 module parameter block (size, magic, SDK version: three numbers measured from the SDK's
 `crtlib.o`).
 
-`src/pw_eboot_release.c` follows the eboot release of
-[orbis-win](https://github.com/plastikman/orbis-win) `2610706` (`src/reloc-wine-app/app_entry.c`,
-LGPL-2.1-or-later): read module 0's segments and unmap each before Wine starts. It is rewritten on
-`pw_prx_parse_module_info`, and each ported block carries a `From:` line.
+From [orbis-win](https://github.com/plastikman/orbis-win) `2610706` (LGPL-2.1-or-later), each
+ported block with a `From:` line:
+- `src/pw_eboot_release.c` follows its eboot release (`src/reloc-wine-app/app_entry.c`): read module
+  0's segments and unmap each before Wine starts, rewritten on `pw_prx_parse_module_info`.
+- `native/orbis/pw_stub_orbis.c` follows its stub eboot (`src/reloc-wine-app/stub.c`): load the title
+  PRX, find its descriptor's entry, call it with argc/argv.
+- `native/orbis/pw_pad_ps4_orbis.c` follows its DS4 ops for the PS5 pad core
+  (`src/native/pw_pad_ps4.c`).
 
 `wine/orbis/include/` restates FreeBSD 9 amd64 ABI facts (signal numbers and flags,
 `mcontext_t`, selectors, trap numbers, socket and kevent layouts, cdio, sysctl and mount

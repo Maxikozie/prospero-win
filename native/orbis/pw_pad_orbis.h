@@ -33,7 +33,12 @@ typedef struct PwPadOrbis {
     const char *failed;
 } PwPadOrbis;
 
+/* The process's one pad: the first call initialises and opens it (the
+ * initial user, scePadInit, scePadOpen), every call gets a copy of that
+ * result; 0 once open. The title calls it before releasing the eboot. */
 int pw_pad_orbis_open(PwPadOrbis *pad);
+/* Whether the first open has happened (whatever its result). */
+int pw_pad_orbis_opened(void);
 /* scePadReadState into state; 0 on success. */
 int pw_pad_orbis_read(const PwPadOrbis *pad, PwPadOrbisState *state);
 /* How many bytes of a 512-byte buffer scePadReadState wrote (the last byte

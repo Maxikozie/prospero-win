@@ -104,3 +104,22 @@ const char *pw_eboot_release_after_name(int after)
     default: return "-";
     }
 }
+
+int pw_eboot_copy_argv(int argc, char *const *argv, char *store, size_t store_size, char **out, int max_args)
+{
+    size_t used = 0;
+    int n = 0;
+
+    if (!out || max_args < 1) return 0;
+    for (int i = 0; argv && store && i < argc && n < max_args - 1 && argv[i]; i++)
+    {
+        size_t length = strlen(argv[i]) + 1;
+
+        if (length > store_size - used) break;
+        memcpy(store + used, argv[i], length);
+        out[n++] = store + used;
+        used += length;
+    }
+    out[n] = NULL;
+    return n;
+}

@@ -61,6 +61,12 @@
  *   g1n f1's stages and wow32.exe on the native CPU (WINE_PS5_WOW64_CPU=wow64native.dll):
  *       guest SEH, x87/SSE2, a second thread (milestone g, docs/ps4/HANDOFF-g.md in ps4-wine)
  *       -> PS4WINE g1n hello32 cpu=native native_caps=N seh=ok fp=ok thread=ok faults_unresolved=N ...
+ *   l1  xinput32.exe (profile xinput32: xinput mode, native CPU), the DS4 as XInput controller 0
+ *       for 30 s, then 1 s of rumble per motor
+ *       -> PS4WINE l1 xinput32 bits=32 get0=0 caps=0 buttons_seen=0x.... ... xinput=on pad_packets=N ...
+ *   i   the low base (ps4-wine milestone i): fixed32.exe, a PE32 fixed at 0x400000 without
+ *       relocations, on the native CPU after the title released the eboot
+ *       -> PS4WINE i fixed32 bits=32 base=0x00400000 relocs=0 ... cpu=native ... eboot_release=ok ...
  *   g1m winevulkan's slots, the display, vk32.exe (vk64.exe built for i686): 32-bit placed
  *       maps (mesa-ps4 patch 0003) and the green square copied from mapped memory
  *       -> PS4WINE g1m vk32 bits=32 map=ok map32=ok frames=N fb=ok ...
@@ -155,6 +161,21 @@ void pw_ms_set_profile(const struct PwGameProfile *profile, const char *id, cons
  * PW_VK_BATCH records, Wine's unhandled-exception reports, +loaddll's lines
  * for the game's own modules. */
 void pw_ms_wine_line(const char *line);
+/* Milestone l1: when the profile's [input] mode is xinput, the DS4 as XInput
+ * controller 0 through ntdll's pad slot (pw_wine_set_pad, pw_wine_rumble):
+ * the slot set connected at once, then a feed thread. Call after ntdll loaded,
+ * before Wine runs. Nothing happens in any other mode. */
+struct PwPrxDescriptor;
+void pw_ms_xinput_start(const struct PwPrxDescriptor *ntdll);
+/* Milestone i: what must happen while the eboot is still mapped, called just
+ * before the release: a first VideoOut open of this process when nothing
+ * opened one yet (Sony's display setup reads the eboot's data then), and the
+ * pad's open (scePadInit fails after the release). Logged as a stage record. */
+void pw_ms_eboot_release_prepare(void);
+/* The release's outcome ("ok", "off", a failing call's return) and the end of
+ * the range, appended to every plan line as " eboot_release=... low_end=...". */
+void pw_ms_set_eboot_release(const char *state, uint64_t low_end);
+const char *pw_ms_eboot_release_fields(void);
 /* "module+0xoffset" for an address, "?" outside every loaded module. */
 const char *pw_orbis_module_of(uint64_t address, char *out, size_t size);
 

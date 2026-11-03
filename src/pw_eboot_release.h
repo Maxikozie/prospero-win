@@ -66,4 +66,11 @@ int pw_eboot_release_plan(const PwPrxSegment *segments, uint32_t count, PwEbootR
 int pw_eboot_release(const PwEbootReleaseOps *ops, PwEbootRelease *out);
 const char *pw_eboot_release_after_name(int after);
 
+/* The title PRX's copy of the argument vector the stub eboot hands over, so
+ * nothing the title keeps points into memory it did not allocate itself.
+ * Copies at most max_args - 1 arguments and their strings into store (NULs
+ * included), terminates out[] with NULL and returns the number copied; an
+ * argument that does not fit ends the copy there. */
+int pw_eboot_copy_argv(int argc, char *const *argv, char *store, size_t store_size, char **out, int max_args);
+
 #endif

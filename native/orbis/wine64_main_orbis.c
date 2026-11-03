@@ -11,6 +11,13 @@
  * the watchdog gives up, on the kernel log and the UDP log, after which the
  * title idles: on the PS4 a process that exits is reported as a crash.
  *
+ * The title is a PRX (ps4wine.prx) that a stub eboot (pw_stub_orbis.c) loads
+ * and enters at pw_title_main. Just before Wine starts, the title releases the
+ * eboot's segments (src/pw_eboot_release.h), so that a Windows program fixed
+ * at 0x400000 maps where the eboot was (ps4-wine milestone i); env.txt's
+ * PS4WINE_EBOOT_RELEASE=0 keeps the eboot for an A/B run. The pad is opened
+ * before the release (scePadInit failed after it, ps4-wine i1).
+ *
  * Before Wine, a milestone plan's stages run (pw_milestone_orbis.h; the
  * plan from PS4WINE_MILESTONE in <root>/env.txt, default d): d1 cross-PRX
  * binding, the title's VideoOut, the DS4, then hello.exe; d2 win32u's and
@@ -34,6 +41,7 @@
 #include "pw_wine_prx.h"
 #include "prospero_win.h"
 #include "pw_wine_exit_orbis.h"
+#include "pw_eboot_release.h"
 #include "pw_milestone_orbis.h"
 #include "pw_game_profile.h"
 #include "ps5log/ps5log.h"
@@ -73,6 +81,9 @@ extern uint32_t sceKernelLoadStartModule(const char *path, size_t argc, const vo
                                          const void *option, int *result);
 extern int sceKernelGetModuleInfo(int32_t handle, void *info);
 extern int sceKernelDlsym(int32_t handle, const char *symbol, void **address);
+extern int sceKernelMunmap(void *address, size_t bytes);
+extern int32_t sceGnmSubmitDone(void);
+extern int32_t sceGnmAreSubmitsAllowed(void);
 
 /* ---- state the exit hook reports --------------------------------------- */
 
@@ -121,9 +132,9 @@ static void report(const char *exit_text, const char *kind)
     pthread_mutex_unlock(&stdout_lock);
     snprintf(line, sizeof(line),
              "PS4WINE c hello.exe stdout=\"%s\" server=%s exit=%s build=%s load=%d stage=%d kind=%s "
-             "session_s=%llu",
+             "session_s=%llu%s",
              quoted, server_connected ? "inprocess" : "none", exit_text, PW_BUILD_ID, load_status,
-             start.stage, kind, (unsigned long long)((now_ns() - hello_ns) / 1000000000ull));
+             start.stage, kind, (unsigned long long)((now_ns() - hello_ns) / 1000000000ull), pw_ms_eboot_release_fields());
     if (pw_ms_c_line()) emit_line(line);
     else LOG("%s", line);
     pw_ms_wine_end(exit_text, quoted, server_connected);
@@ -515,13 +526,122 @@ static void load_env_file(const char *path)
     }
 }
 
+/* ---- the eboot's release (ps4-wine milestone i) ------------------------------ */
+
+static int eboot_info(void *context, void *info) { (void)context; return sceKernelGetModuleInfo(0, info); }
+static int eboot_unmap(void *context, void *address, size_t bytes) { (void)context; return sceKernelMunmap(address, bytes); }
+
+/* Everything that must happen while the eboot is mapped (a first VideoOut
+ * open, the pad), then every segment of module 0 unmapped. 0 when Wine may
+ * start: released, or kept by PS4WINE_EBOOT_RELEASE=0. */
+static int release_eboot(void)
+{
+    PwEbootReleaseOps ops = { eboot_info, eboot_unmap, NULL };
+    PwEbootRelease r;
+    char want[8], state[32];
+    const char *setting = early_setting("PS4WINE_EBOOT_RELEASE", want, sizeof(want));
+    int rc;
+
+    pw_ms_eboot_release_prepare();
+    if (setting && !strcmp(setting, "0")) {
+        pw_ms_set_eboot_release("off", 0);
+        LOG("PW_WINE64 eboot release off (PS4WINE_EBOOT_RELEASE=0)");
+        return 0;
+    }
+    rc = pw_eboot_release(&ops, &r);
+    for (uint32_t i = 0; i < r.segment_count; i++)
+        LOG("PW_WINE64 eboot segment %u address=%p size=0x%x prot=%u", i, r.segments[i].address, r.segments[i].size,
+            r.segments[i].protection);
+    for (uint32_t i = 0; i < r.range_count; i++)
+        LOG("PW_WINE64 eboot range 0x%llx-0x%llx %s", (unsigned long long)r.ranges[i].base,
+            (unsigned long long)r.ranges[i].end, i < r.unmapped ? "unmapped" : "kept");
+    switch (rc) {
+    case PW_EBOOT_OK: snprintf(state, sizeof(state), "ok"); break;
+    case PW_EBOOT_ERR_UNMAP: snprintf(state, sizeof(state), "0x%08x", (unsigned)r.unmap_rc); break;
+    case PW_EBOOT_ERR_MODULE_INFO: snprintf(state, sizeof(state), "modinfo:0x%08x", (unsigned)r.info_rc); break;
+    case PW_EBOOT_ERR_RANGE: snprintf(state, sizeof(state), "range"); break;
+    default: snprintf(state, sizeof(state), "err%d", rc); break;
+    }
+    pw_ms_set_eboot_release(state, (uint64_t)r.low_end);
+    LOG("PW_WINE64 eboot release=%s low_end=0x%llx module0_after=%s:%u", state, (unsigned long long)r.low_end,
+        pw_eboot_release_after_name(r.after), r.after_count);
+    return rc == PW_EBOOT_OK ? 0 : -1;
+}
+
+/* sceGnmSubmitDone every 20 ms on a thread of its own: the system expects it
+ * every frame and suspends a title that never calls it (0xa0d0c00a on the PS
+ * button, ps4-wine LOG L10). mesa-ps4 measured the call block with GPU work in
+ * flight, so it never runs on the main thread, which hands the display over
+ * to win32u and runs the watchdog. It is made only when
+ * sceGnmAreSubmitsAllowed() says 1 (the SDK's header: "Returns 1 if it won't
+ * stall"; not measured on this stack). PS4WINE_SUBMIT_DONE=0 turns it off.
+ * Recorded, not gated: the first nonzero rc, the skips, the longest call. */
+static int submit_done_on = -1;
+static uint64_t submit_done_calls, submit_done_skipped, submit_done_max_ns, submit_done_next_log;
+static int submit_done_first_rc;
+
+static void submit_done(uint64_t now)
+{
+    if (submit_done_on < 0) {
+        char v[8];
+        const char *setting = early_setting("PS4WINE_SUBMIT_DONE", v, sizeof(v));
+        submit_done_on = !(setting && !strcmp(setting, "0"));
+        LOG("PW_WINE64 submitdone %s", submit_done_on ? "on" : "off (PS4WINE_SUBMIT_DONE=0)");
+    }
+    if (!submit_done_on) return;
+    if (sceGnmAreSubmitsAllowed() != 1) submit_done_skipped++;
+    else {
+        uint64_t t0 = now_ns(), took;
+        int rc = sceGnmSubmitDone();
+        took = now_ns() - t0;
+        if (took > submit_done_max_ns) submit_done_max_ns = took;
+        if (rc && !submit_done_first_rc) submit_done_first_rc = rc;
+        submit_done_calls++;
+    }
+    if (now >= submit_done_next_log) {
+        LOG("PW_WINE64 submitdone calls=%llu skipped=%llu rc_first=0x%x max_us=%llu",
+            (unsigned long long)submit_done_calls, (unsigned long long)submit_done_skipped,
+            (unsigned)submit_done_first_rc, (unsigned long long)(submit_done_max_ns / 1000ull));
+        submit_done_next_log = now + 60000000000ull;
+    }
+}
+
+static void *submit_done_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        submit_done(now_ns());
+        usleep(20000);
+    }
+    return NULL;
+}
+
+static void start_submit_done(void)
+{
+    /* A caller-set stack: orbis-compat passes it through untouched (no 16 MiB floor). */
+    static uint8_t stack[256u << 10] __attribute__((aligned(64)));
+    pthread_attr_t attr;
+    pthread_t thread;
+    int rc;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, stack, sizeof(stack));
+    rc = pthread_create(&thread, &attr, submit_done_thread, NULL);
+    pthread_attr_destroy(&attr);
+    if (rc) LOG("PW_WINE64 submitdone thread not created rc=%d", rc);
+    else pthread_detach(thread);
+}
+
 /* ---- main ------------------------------------------------------------------- */
 
 static const char *const runtime_roots[] = { PW_ROOT "/runtime", "/app0" };
 
-int main(int argc, char **argv)
+/* The title's entry, called by the stub eboot on the main thread. Never returns. */
+__attribute__((visibility("default"), noreturn)) void pw_title_main(int stub_argc, char **stub_argv)
 {
     static char ntdll_dir[512], ntdll_path[512], exe[PW_WINE_LAUNCH_PATH_MAX];
+    static char argv_store[2048], *argv[64];
+    int argc;
     static const char *wine_argv[3 + PW_WINE_LAUNCH_WORDS];
     PwWineStartConfig config;
     PwWineStartOps ops = { load_start, module_info, set_env, start_thread };
@@ -530,6 +650,9 @@ int main(int argc, char **argv)
     int status, first = 1;
     uint64_t next_alive = 0;
 
+    /* Our own copy of what the stub was given. */
+    argc = pw_eboot_copy_argv(stub_argc, stub_argv, argv_store, sizeof(argv_store), argv,
+                              (int)(sizeof(argv) / sizeof(argv[0])));
     start_ns = now_ns();
     mkdir(PW_ROOT, 0777);
     mkdir(PW_ROOT "/logs", 0777);
@@ -542,6 +665,7 @@ int main(int argc, char **argv)
     pw_diagnostics_open(PW_ROOT, PW_BUILD_ID, "hello", 0);
     LOG("PW_WINE64 start build=%s argc=%d argv0=%s netlog=%s:%u", PW_BUILD_ID, argc,
         argc > 0 && argv[0] ? argv[0] : "", logcfg.server, (unsigned)logcfg.port);
+    start_submit_done();
 
     {
         char milestone[16];
@@ -684,6 +808,8 @@ int main(int argc, char **argv)
             }
             if (set_release) set_release(pw_ms_release_display, NULL);
             pw_ms_set_input(post_input);
+            /* Milestone l1: the DS4 as XInput controller 0 when the profile asks for xinput. */
+            pw_ms_xinput_start(start.descriptor);
         }
         {
             /* The same cross-check through the kernel's own lookup. */
@@ -710,11 +836,17 @@ int main(int argc, char **argv)
         profile_cwd(&start);
         status = pw_wine_start_environment(&start, &config, &ops);
         LOG("PW_WINE64 environment status=%d", status);
-        if (status == PW_OK) {
+        /* The eboot's range goes to Wine's reserve_area in __wine_main (milestone i). */
+        if (status == PW_OK && release_eboot() != 0) {
+            report("release-failed", "title");
+            status = PW_ERR_STATE;
+        } else if (status == PW_OK) {
             status = pw_wine_start_run(&start, &config, &ops);
             LOG("PW_WINE64 run status=%d", status);
+            if (status != PW_OK) report("start-failed", "title");
+        } else {
+            report("start-failed", "title");
         }
-        if (status != PW_OK) report("start-failed", "title");
     } else {
         report("load-failed", "title");
     }

@@ -14,7 +14,7 @@
 #
 # Usage:
 #   tools/build_wine_orbis.sh [--check-patches] [--jobs N] [--work DIR]
-#       [--modules "ntdll wineserver win32u wowprospero [libvulkan winevulkan]"] [--allow-unbound]
+#       [--modules "ntdll wineserver win32u wowprospero xinput1_3 [libvulkan winevulkan]"] [--allow-unbound]
 #
 # Environment:
 #   OO_PS4_TOOLCHAIN       the OpenOrbis toolchain (required)
@@ -37,7 +37,7 @@ source_dir=${PROSPERO_WINE_SOURCE:-$root/.deps/wine/source}
 host_tools=${PROSPERO_WINE_BUILD:-$root/.deps/wine/build}
 work=${PROSPERO_WINE_ORBIS_WORK:-$root/.deps/wine-orbis}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-modules="ntdll wineserver win32u wowprospero wow64native wineps5 ws2_32${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
+modules="ntdll wineserver win32u wowprospero wow64native wineps5 ws2_32 xinput1_3${PROSPERO_RADV_ARCHIVE:+ libvulkan winevulkan}"
 allow_unbound=0
 check_only=0
 
@@ -458,6 +458,25 @@ case " $modules " in *" ws2_32 "*)
     desc ws2_32 __wine_unix_call_funcs __wine_unix_call_wow64_funcs
     # shellcheck disable=SC2086
     link_prx ws2_32 dlls/ws2_32/ws2_32.so "$prx/obj/ws2_32_desc.o $exit_wraps $import_wraps" ntdll
+    ;;
+esac
+case " $modules " in *" xinput1_3 "*)
+    # xinput's Unix side (milestone l1): patch 0470/0471's PE code in every
+    # xinput loads "xinput1_3" by name, and its pad_init looks up the title's
+    # pad slot (pw_wine_pad_at, pw_wine_set_rumble_at, exported by ntdll.prx)
+    # with dlsym(RTLD_DEFAULT): ntdll's dlfcn under the __wrap_ names, which
+    # searches every module pw_wine_dl knows, ntdll.prx included. Without this
+    # PRX __wine_load_unix_lib fails (c0000135), xinput falls back to HID and
+    # finds nothing. Its structs hold no pointers, so the WoW64 table is the
+    # same functions (32-bit games need no thunk).
+    [ -f "$prx/ntdll.shared.elf" ] || fail "xinput1_3 imports from ntdll: build ntdll in the same run"
+    mkdir -p "$obj/xinput1_3"
+    "$cc" -std=gnu11 -O2 -Wall -Werror -D__WINESRC__ -DWINE_UNIX_LIB -D_REENTRANT -I"$tree/dlls/xinput1_3" \
+        -I"$build/include" -I"$tree/include" -c "$tree/dlls/xinput1_3/unixlib.c" -o "$obj/xinput1_3/unixlib.o" ||
+        fail "cannot compile dlls/xinput1_3/unixlib.c"
+    desc xinput1_3 __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    # shellcheck disable=SC2086
+    link_prx xinput1_3 - "$prx/obj/xinput1_3_desc.o $obj/xinput1_3/unixlib.o $exit_wraps $import_wraps" ntdll
     ;;
 esac
 case " $modules " in *" libvulkan "*)

@@ -147,6 +147,19 @@ int main(void)
         assert(pw_eboot_release_plan(segments, 0, &r) == PW_EBOOT_ERR_ARGUMENT);
         assert(pw_eboot_release_plan(segments, 5, &r) == PW_EBOOT_ERR_ARGUMENT);
     }
+    /* The argument vector the stub hands over: copied, strings and all. */
+    {
+        char a0[] = "path=C:\\fixed32.exe", a1[] = "x", *argv[] = { a0, a1, NULL }, store[64], *out[4];
+        assert(pw_eboot_copy_argv(2, argv, store, sizeof(store), out, 4) == 2);
+        assert(!strcmp(out[0], "path=C:\\fixed32.exe") && !strcmp(out[1], "x") && !out[2]);
+        assert(out[0] != a0 && out[0] >= store && out[1] < store + sizeof(store));
+        a0[0] = 'X';
+        assert(out[0][0] == 'p');
+        assert(pw_eboot_copy_argv(2, argv, store, sizeof(store), out, 2) == 1 && !out[1]);
+        assert(pw_eboot_copy_argv(2, argv, store, 5, out, 4) == 0 && !out[0]);
+        assert(pw_eboot_copy_argv(0, NULL, store, sizeof(store), out, 4) == 0 && !out[0]);
+        assert(pw_eboot_copy_argv(1, argv, store, sizeof(store), out, 0) == 0);
+    }
     /* Missing ops. */
     { PwEbootReleaseOps none = { NULL, fake_unmap, &fake };
       assert(pw_eboot_release(&none, &r) == PW_EBOOT_ERR_ARGUMENT);
