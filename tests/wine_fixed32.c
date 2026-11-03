@@ -24,7 +24,8 @@
  *   seh: a NULL read caught by a frame handler on the fs:[0] chain;
  *   thread: a second thread computes and returns its exit code.
  *
- * A failing check prints what it saw instead of "ok". Exit 0 when every check
+ * Each check is announced first ("FIXED32S step=<name>"), so a crash shows where
+ * it happened. A failing check prints what it saw instead of "ok". Exit 0 when every check
  * passed, 1 otherwise. Built with i686-w64-mingw32-gcc -O1 -s
  * -fno-omit-frame-pointer -Wl,--image-base,0x400000,--disable-dynamicbase,
  * --disable-reloc-section; tests/test_wine_fixed32.py runs it under the host
@@ -229,6 +230,13 @@ static const char *thread_check(void)
     return "ok";
 }
 
+/* Before each check: where a crash happened (the console's log keeps every stdout line). */
+static void step(const char *name)
+{
+    printf("FIXED32S step=%s\n", name);
+    fflush(stdout);
+}
+
 int main(void)
 {
     char base[16];
@@ -236,13 +244,21 @@ int main(void)
     const char *text, *rdata, *shared, *data, *seh, *thread;
     int ok;
 
+    step("image");
     image_fields(base, sizeof(base), &relocs, &size_kib);
+    step("text");
     text = text_check();
+    step("rdata_ro");
     rdata = rdata_check();
+    step("rdata_shared");
     shared = rdata_shared_check();
+    step("data");
     data = data_check();
+    step("seh");
     seh = seh_check();
+    step("thread");
     thread = thread_check();
+    step("done");
     printf("FIXED32 bits=%d base=%s relocs=%lu size_kib=%lu text_rx=%s rdata_ro=%s rdata_shared=%s data_rw=%s seh=%s "
            "thread=%s\n", (int)(sizeof(void *) * 8), base, relocs, size_kib, text, rdata, shared, data, seh, thread);
     fflush(stdout);

@@ -83,6 +83,34 @@ static void slow_end(uint64_t start, const char *what, size_t bytes)
                 (unsigned long long)((now - start) / 1000u));
 }
 
+/* WINE_PS5_TRACE_PROT=LOW-HIGH (hex addresses): every mmap and mprotect
+ * touching that range is written to stderr with its protection, the path
+ * (direct memory or libc) and the result (ps4-wine milestone i: which call
+ * left an image page without execute). */
+static uintptr_t trace_low, trace_high;
+static int trace_state = -1;
+
+static int traced(uintptr_t at, uintptr_t end)
+{
+    if (trace_state < 0) {
+        const char *value = getenv("WINE_PS5_TRACE_PROT");
+        char *rest = NULL;
+        trace_state = 0;
+        if (value) {
+            trace_low = (uintptr_t)strtoull(value, &rest, 16);
+            if (rest && *rest == '-') trace_high = (uintptr_t)strtoull(rest + 1, NULL, 16);
+            trace_state = trace_high > trace_low;
+        }
+    }
+    return trace_state && at < trace_high && end > trace_low;
+}
+
+static void trace_call(const char *what, uintptr_t at, size_t bytes, int protection, const char *path, int rc)
+{
+    fprintf(stderr, "wine-ps5: trace %s %#lx+%#lx prot=%#x path=%s rc=%d\n", what, (unsigned long)at,
+            (unsigned long)bytes, (unsigned)protection, path, rc);
+}
+
 /* CPU read-write, unless the kernel wants the GPU bits too. */
 static int map_protection = CPU_READ_WRITE;
 
@@ -381,10 +409,15 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
         return address;
     }
     for (; at < end; at += piece)
-        if (pw_wine_dmem_split(&dmem, at, end - at, &piece))
-            status |= pw_wine_dmem_replace(&dmem, at, piece, (unsigned)protection & 7);
-        else if (mmap((void *)at, piece, protection, flags, -1, 0) == MAP_FAILED)
-            status = -1;
+        if (pw_wine_dmem_split(&dmem, at, end - at, &piece)) {
+            int rc = pw_wine_dmem_replace(&dmem, at, piece, (unsigned)protection & 7);
+            if (traced(at, at + piece)) trace_call("mmap", at, piece, protection, "dmem", rc);
+            status |= rc;
+        } else {
+            int rc = mmap((void *)at, piece, protection, flags, -1, 0) == MAP_FAILED ? -1 : 0;
+            if (traced(at, at + piece)) trace_call("mmap", at, piece, protection, "libc", rc);
+            if (rc) status = -1;
+        }
     if (!status) return address;
     errno = ENOMEM;
     return MAP_FAILED;
@@ -416,10 +449,15 @@ int __wine_ps5_mprotect(void *address, size_t bytes, int protection)
 
     if (state <= 0) return mprotect(address, bytes, protection);
     for (; at < end; at += piece)
-        if (pw_wine_dmem_split(&dmem, at, end - at, &piece))
-            status |= pw_wine_dmem_protect(&dmem, at, piece, (unsigned)protection & 7);
-        else
-            status |= mprotect((void *)at, piece, protection);
+        if (pw_wine_dmem_split(&dmem, at, end - at, &piece)) {
+            int rc = pw_wine_dmem_protect(&dmem, at, piece, (unsigned)protection & 7);
+            if (traced(at, at + piece)) trace_call("mprotect", at, piece, protection, "dmem", rc);
+            status |= rc;
+        } else {
+            int rc = mprotect((void *)at, piece, protection);
+            if (traced(at, at + piece)) trace_call("mprotect", at, piece, protection, "libc", rc);
+            status |= rc;
+        }
     if (status) errno = ENOMEM;
     return status ? -1 : 0;
 }

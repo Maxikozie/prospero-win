@@ -3700,7 +3700,18 @@ void pw_ms_wine_end(const char *exit_text, const char *last_stdout, int server_c
         /* xinput32.exe: its exit here; its line and the feed's counters go in g_extra. */
         snprintf(fields, sizeof(fields), "exit=%s server=%s", exit_text, server_connected ? "inprocess" : "none");
     } else if (i_plan()) {
-        /* fixed32.exe: its exit and its own line as it came. */
+        /* fixed32.exe: its exit and its own line as it came. Recorded: what the kernel reports for
+         * each 16 KiB page of its image (0x400000-0x41c000) and its import table's page. */
+        static const uintptr_t pages[] = { 0x400000, 0x404000, 0x408000, 0x40c000, 0x410000, 0x414000, 0x418000,
+                                           0x818000 };
+        for (size_t p = 0; p < sizeof(pages) / sizeof(pages[0]); p++) {
+            VqInfo info;
+            int rc;
+            memset(&info, 0, sizeof(info));
+            rc = sceKernelVirtualQuery((const void *)pages[p], 0, &info, sizeof(info));
+            step("i page 0x%lx query=%d range=%p-%p prot=0x%x type=%d kind=0x%x", (unsigned long)pages[p], rc,
+                 info.start, info.end, (unsigned)info.protection, info.type, info.kind & 0x1f);
+        }
         snprintf(fields, sizeof(fields), "exit=%s server=%s %s", exit_text, server_connected ? "inprocess" : "none",
                  fixed32_line[0] ? fixed32_line : "base=-");
     } else if (g_plan()) {
