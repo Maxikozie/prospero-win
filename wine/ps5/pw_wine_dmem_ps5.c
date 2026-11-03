@@ -22,7 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 extern int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment);
 #ifdef __ORBIS__
@@ -83,14 +87,14 @@ static void slow_end(uint64_t start, const char *what, size_t bytes)
                 (unsigned long long)((now - start) / 1000u));
 }
 
-/* WINE_PS5_TRACE_PROT=LOW-HIGH (hex addresses): every mmap and mprotect
- * touching that range is written to stderr with its protection, the path
- * (direct memory or libc) and the result (ps4-wine milestone i: which call
- * left an image page without execute). */
+/* WINE_PS5_TRACE_PROT=LOW-HIGH (hex addresses): every mmap, munmap and
+ * mprotect touching that range is written to stderr with its protection,
+ * the path (direct memory or libc) and the result (ps4-wine milestone i:
+ * which call left an image page without execute). */
 static uintptr_t trace_low, trace_high;
 static int trace_state = -1;
 
-static int traced(uintptr_t at, uintptr_t end)
+static int trace_on(void)
 {
     if (trace_state < 0) {
         const char *value = getenv("WINE_PS5_TRACE_PROT");
@@ -102,13 +106,250 @@ static int traced(uintptr_t at, uintptr_t end)
             trace_state = trace_high > trace_low;
         }
     }
-    return trace_state && at < trace_high && end > trace_low;
+    return trace_state > 0;
+}
+
+static int traced(uintptr_t at, uintptr_t end)
+{
+    return trace_on() && at < trace_high && end > trace_low;
+}
+
+/* One line, one write(2): this libc's stderr takes no lock (its own pthread_create is not
+ * linked), and the watcher prints from a thread of its own. */
+static void trace_print(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void trace_print(const char *format, ...)
+{
+    char line[320];
+    va_list args;
+    int length;
+
+    va_start(args, format);
+    length = vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (length < 0) return;
+    if ((size_t)length >= sizeof(line)) {
+        length = (int)sizeof(line) - 1;
+        line[length - 1] = '\n';
+    }
+    (void)!write(2, line, (size_t)length);
 }
 
 static void trace_call(const char *what, uintptr_t at, size_t bytes, int protection, const char *path, int rc)
 {
-    fprintf(stderr, "wine-ps5: trace %s %#lx+%#lx prot=%#x path=%s rc=%d\n", what, (unsigned long)at,
-            (unsigned long)bytes, (unsigned)protection, path, rc);
+    trace_print("wine-ps5: trace %s %#lx+%#lx prot=%#x path=%s rc=%d\n", what, (unsigned long)at,
+                (unsigned long)bytes, (unsigned)protection, path, rc);
+}
+
+/* The kernel's view of the traced pages (ps4-wine milestone i: who changes an image page's
+ * protection after Wine set it). Every look compares each traced page (at most TRACE_PAGES) with
+ * the last look and logs what changed:
+ *   call   right after every mmap, munmap and mprotect that comes through here while tracing,
+ *          inside the range or not (a call beside the range can move a traced page's region edge);
+ *   dl-before, dl-after   around each module load (pw_wine_dl_libc.c), with the contents' hashes;
+ *   watch  from a thread that looks every millisecond, labelled with the load under way or the
+ *          last one ("during=", "after=").
+ * trace_lock is held across each of our calls and its look, so a change the watcher reports was
+ * made by none of them. A change of the region alone (the protection unchanged) is marked
+ * "range-only". */
+typedef struct VqInfo {
+    void *start, *end;
+    int64_t offset;
+    int32_t protection, type;
+    uint32_t kind;
+    char name[32];
+} VqInfo;
+extern int sceKernelVirtualQuery(const void *address, int flags, VqInfo *info, size_t size);
+
+enum { TRACE_PAGES = 8, TRACE_STACK = 256 << 10 };
+typedef struct TracePage { int known, prot; uintptr_t low, high; uint64_t hash; int hashed; } TracePage;
+typedef struct TraceHash { int valid; uint64_t value; } TraceHash;
+static TracePage trace_pages[TRACE_PAGES];
+static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t trace_owner;
+static int trace_held;
+static char trace_loading[64];          /* the load under way or the last one, for the watcher */
+static int trace_watcher;               /* 0 not started, 1 running, -1 off or refused */
+
+/* trace_lock, unless this thread holds it already (a fault inside a look that reaches
+ * __wine_ps5_mprotect through patch 1140): that call is then not traced. */
+static int trace_enter(void)
+{
+    if (__atomic_load_n(&trace_held, __ATOMIC_ACQUIRE) && pthread_equal(trace_owner, pthread_self())) return 0;
+    if (pthread_mutex_lock(&trace_lock)) return 0;
+    trace_owner = pthread_self();
+    __atomic_store_n(&trace_held, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+static void trace_leave(void)
+{
+    __atomic_store_n(&trace_held, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&trace_lock);
+}
+
+static unsigned long long trace_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000u + (unsigned long long)ts.tv_nsec / 1000u;
+}
+
+/* The protection the kernel reports for address (-1 if nothing is mapped there) and its region. */
+int __wine_ps5_prot_query(const void *address, uintptr_t *low, uintptr_t *high)
+{
+    VqInfo info;
+    memset(&info, 0, sizeof(info));
+    if (sceKernelVirtualQuery(address, 0, &info, sizeof(info))) {
+        if (low) *low = 0;
+        if (high) *high = 0;
+        return -1;
+    }
+    if (low) *low = (uintptr_t)info.start;
+    if (high) *high = (uintptr_t)info.end;
+    return info.protection;
+}
+
+static uint64_t page_hash(uintptr_t at)
+{
+    const uint8_t *bytes = (const uint8_t *)at;
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < PAGE; i++) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+    return hash;
+}
+
+/* The traced pages' contents, read without trace_lock: a page that faults on the read must not
+ * take the lock's holder into Wine's fault path. Only pages the kernel reports readable. */
+static void trace_hash_pages(TraceHash *hashes)
+{
+    uintptr_t at = trace_low & ~(uintptr_t)(PAGE - 1);
+    for (unsigned i = 0; i < TRACE_PAGES; i++, at += PAGE) {
+        int prot = at < trace_high ? __wine_ps5_prot_query((const void *)at, NULL, NULL) : -1;
+        hashes[i].valid = prot > 0 && (prot & 1);
+        hashes[i].value = hashes[i].valid ? page_hash(at) : 0;
+    }
+}
+
+/* With trace_lock held. hashes: NULL, or the contents (mode 1 a baseline before a load, mode 2
+ * compared with it after the load). Returns how many pages changed. */
+static unsigned trace_look(const char *what, const char *name, const TraceHash *hashes, int mode)
+{
+    unsigned long long now = trace_now_us();
+    uintptr_t at = trace_low & ~(uintptr_t)(PAGE - 1);
+    unsigned changed = 0;
+
+    for (unsigned i = 0; i < TRACE_PAGES && at < trace_high; i++, at += PAGE) {
+        TracePage *seen = &trace_pages[i];
+        uintptr_t low, high;
+        int prot = __wine_ps5_prot_query((const void *)at, &low, &high), hash_changed = 0, same;
+        char old[16];
+
+        if (hashes) {
+            hash_changed = mode == 2 && hashes[i].valid && seen->hashed && hashes[i].value != seen->hash;
+            seen->hashed = hashes[i].valid;
+            seen->hash = hashes[i].value;
+        }
+        same = seen->known && prot == seen->prot;
+        if (same && low == seen->low && high == seen->high && !hash_changed) continue;
+        if (seen->known) snprintf(old, sizeof(old), "%d", seen->prot);
+        else snprintf(old, sizeof(old), "?");
+        trace_print("wine-ps5: prot %s%s%s t_us=%llu page=%#lx prot=%s->%d range=%#lx-%#lx%s%s\n", what,
+                    name ? " " : "", name ? name : "", now, (unsigned long)at, old, prot, (unsigned long)low,
+                    (unsigned long)high, hash_changed ? " contents=changed" : "",
+                    same && !hash_changed ? " range-only" : "");
+        seen->known = 1;
+        seen->prot = prot;
+        seen->low = low;
+        seen->high = high;
+        changed++;
+    }
+    return changed;
+}
+
+static void *trace_watch(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (trace_enter()) {
+            trace_look("watch", trace_loading[0] ? trace_loading : NULL, NULL, 0);
+            trace_leave();
+        }
+        usleep(1000);
+    }
+    return NULL;
+}
+
+/* With trace_lock held: the watcher starts at the first look, unless WINE_PS5_TRACE_WATCH=0. Its
+ * stack is mapped only now (nothing in the module's .bss when not tracing) and set by the caller,
+ * which orbis-compat passes through untouched under the default thread-stack policy (keep). It
+ * starts with every signal blocked: it has no Wine thread data for a handler to use. */
+static void trace_start_watcher(void)
+{
+    const char *value = getenv("WINE_PS5_TRACE_WATCH");
+    sigset_t all, old;
+    pthread_attr_t attr;
+    pthread_t thread;
+    void *stack;
+    int rc, masked;
+
+    if (trace_watcher) return;
+    trace_watcher = -1;
+    if (value && !strcmp(value, "0")) return;
+    stack = mmap(NULL, TRACE_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (stack == MAP_FAILED) {
+        trace_print("wine-ps5: prot watcher not started (no stack, errno %d)\n", errno);
+        return;
+    }
+    sigfillset(&all);
+    masked = !pthread_sigmask(SIG_BLOCK, &all, &old);
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, stack, TRACE_STACK);
+    rc = pthread_create(&thread, &attr, trace_watch, NULL);
+    pthread_attr_destroy(&attr);
+    if (masked) pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (rc) {
+        munmap(stack, TRACE_STACK);
+        trace_print("wine-ps5: prot watcher not started rc=%d\n", rc);
+        return;
+    }
+    pthread_detach(thread);
+    trace_watcher = 1;
+    trace_print("wine-ps5: prot watcher on, %#lx-%#lx every 1 ms, signals %s\n", (unsigned long)trace_low,
+                (unsigned long)trace_high, masked ? "blocked" : "not blocked");
+}
+
+/* After one of our calls (trace_lock taken by trace_enter): the kernel's view of the traced pages,
+ * then the lock released. errno is the call's. */
+static void trace_after_call(const char *what, const void *address, size_t bytes)
+{
+    int saved = errno;
+    char name[64];
+
+    snprintf(name, sizeof(name), "%s@%#lx+%#lx", what, (unsigned long)(uintptr_t)address, (unsigned long)bytes);
+    trace_start_watcher();
+    trace_look("call", name, NULL, 0);
+    trace_leave();
+    errno = saved;
+}
+
+/* Around a module load (pw_wine_dl_libc.c): the traced pages before and after, with their contents'
+ * hashes; every bracket logs one line even when nothing changed. */
+void __wine_ps5_prot_snapshot(const char *phase, const char *module)
+{
+    TraceHash hashes[TRACE_PAGES];
+    const char *base;
+    unsigned changed;
+    int before;
+
+    if (!trace_on()) return;
+    base = module ? strrchr(module, '/') : NULL;
+    base = base ? base + 1 : module ? module : "?";
+    before = !strcmp(phase, "dl-before");
+    trace_hash_pages(hashes);
+    if (!trace_enter()) return;
+    trace_start_watcher();
+    snprintf(trace_loading, sizeof(trace_loading), "%s=%s", before ? "during" : "after", base);
+    changed = trace_look(phase, base, hashes, before ? 1 : 2);
+    trace_print("wine-ps5: prot %s %s t_us=%llu changed=%u\n", phase, base, trace_now_us(), changed);
+    trace_leave();
 }
 
 /* CPU read-write, unless the kernel wants the GPU bits too. */
@@ -375,7 +616,7 @@ void __wine_ps5_dmem_region(void *base, size_t size)
     }
 }
 
-void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, int fd, off_t offset)
+static void *mmap_body(void *address, size_t bytes, int protection, int flags, int fd, off_t offset)
 {
     uintptr_t at = page_down(address), end = at + page_span(address, bytes);
     size_t piece;
@@ -424,24 +665,26 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
 }
 
 /* Owned pages give their direct memory back, then their address space. */
-int __wine_ps5_munmap(void *address, size_t bytes)
+static int munmap_body(void *address, size_t bytes)
 {
     uintptr_t at = page_down(address), end = at + page_span(address, bytes);
     size_t piece;
     int status = 0;
 
     if (state <= 0) return munmap(address, bytes);
-    for (; at < end; at += piece)
-        if (pw_wine_dmem_split(&dmem, at, end - at, &piece))
-            status |= pw_wine_dmem_replace(&dmem, at, piece, 0) | sceKernelMunmap((void *)at, piece);
-        else
-            status |= munmap((void *)at, piece);
+    for (; at < end; at += piece) {
+        int owned = pw_wine_dmem_split(&dmem, at, end - at, &piece), rc;
+        if (owned) rc = pw_wine_dmem_replace(&dmem, at, piece, 0) | sceKernelMunmap((void *)at, piece);
+        else rc = munmap((void *)at, piece);
+        if (traced(at, at + piece)) trace_call("munmap", at, piece, 0, owned ? "dmem" : "libc", rc);
+        status |= rc;
+    }
     pw_wine_dmem_remove_regions(&dmem, page_down(address), page_span(address, bytes));
     if (status) errno = EINVAL;
     return status ? -1 : 0;
 }
 
-int __wine_ps5_mprotect(void *address, size_t bytes, int protection)
+static int mprotect_body(void *address, size_t bytes, int protection)
 {
     uintptr_t at = page_down(address), end = at + page_span(address, bytes);
     size_t piece;
@@ -460,6 +703,41 @@ int __wine_ps5_mprotect(void *address, size_t bytes, int protection)
         }
     if (status) errno = ENOMEM;
     return status ? -1 : 0;
+}
+
+/* While tracing, each call holds trace_lock with its look (trace_after_call). */
+void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, int fd, off_t offset)
+{
+    void *result;
+    int held;
+
+    if (!trace_on()) return mmap_body(address, bytes, protection, flags, fd, offset);
+    held = trace_enter();
+    result = mmap_body(address, bytes, protection, flags, fd, offset);
+    if (held) trace_after_call("mmap", address, bytes);
+    return result;
+}
+
+int __wine_ps5_munmap(void *address, size_t bytes)
+{
+    int result, held;
+
+    if (!trace_on()) return munmap_body(address, bytes);
+    held = trace_enter();
+    result = munmap_body(address, bytes);
+    if (held) trace_after_call("munmap", address, bytes);
+    return result;
+}
+
+int __wine_ps5_mprotect(void *address, size_t bytes, int protection)
+{
+    int result, held;
+
+    if (!trace_on()) return mprotect_body(address, bytes, protection);
+    held = trace_enter();
+    result = mprotect_body(address, bytes, protection);
+    if (held) trace_after_call("mprotect", address, bytes);
+    return result;
 }
 
 /* For the title's log, as __wine_virtual_stats: direct memory backed now and

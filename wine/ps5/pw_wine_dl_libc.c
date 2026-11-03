@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #ifndef RTLD_SELF
 #define RTLD_SELF ((void *)-3)   /* FreeBSD's value; the OpenOrbis SDK's musl dlfcn.h lacks it */
 #endif
@@ -27,9 +28,22 @@ static int self;
 /* A failed dlopen names what it tried on stderr, which reaches ps5log
  * through ntdll's output sink (patch 0560). */
 static void report(const char *line){fprintf(stderr,"%s\n",line);}
+/* pw_wine_dmem_ps5.c: with WINE_PS5_TRACE_PROT set, the kernel's view of the traced pages before
+ * and after each load (ps4-wine milestone i: does a module load change an image page's
+ * protection?); nothing otherwise. */
+void __wine_ps5_prot_snapshot(const char *phase,const char *module);
+static int32_t load_start(const char *path,size_t argc,const void *argv,uint32_t flags,const void *option,
+                          int *result)
+{
+    int32_t handle;
+    __wine_ps5_prot_snapshot("dl-before",path);
+    handle=sceKernelLoadStartModule(path,argc,argv,flags,option,result);
+    __wine_ps5_prot_snapshot("dl-after",path);
+    return handle;
+}
 static void configure(void)
 {
-    const PwWineDlOps ops={sceKernelLoadStartModule,sceKernelGetModuleInfo,
+    const PwWineDlOps ops={load_start,sceKernelGetModuleInfo,
                            sceKernelStopUnloadModule,report};
     const char *dir=getenv("WINE_PRX_DIR");
     pw_wine_dl_configure(&ops,dir && *dir?dir:"/app0/sce_module");
@@ -45,8 +59,11 @@ static void *resolve_handle(void *handle)
 
 void *dlopen(const char *path,int mode)
 {
+    void *handle;
     (void)mode;pthread_once(&once,configure);
-    return path?pw_wine_dl_open(path):&self;
+    if(!path)return &self;
+    handle=pw_wine_dl_open(path);
+    return handle;
 }
 void *dlsym(void *__restrict handle,const char *__restrict name)
 {

@@ -135,11 +135,23 @@ rm -f "$out/ps4wine.oelf"
 chmod 755 "$out/ps4wine.prx"
 
 # The stub eboot: NEEDs the same Sony libraries, so the loader has them when it loads the PRX.
+# Laid out without a read-only segment (tools/pw_stub_orbis.ld): the PS4's module loader re-protects
+# module 0's PT_SCE_RELRO on every module load, even after the release, over the program Wine maps
+# there (ps4-wine LOG L23-L26); tools/orbis_stub_norelro.py checks the layout and leaves create-fself
+# the empty PT_GNU_RELRO it needs, so the eboot gets none.
 # shellcheck disable=SC2086
-ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
+ld.lld -m elf_x86_64 -pie -z norelro --no-rosegment --script "$root/tools/pw_stub_orbis.ld" --eh-frame-hdr \
     "$out/obj/pw_stub_orbis.o" "$out/obj/pw_wine_prx.o" \
     -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel $sce_libs \
-    "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.elf" --Map="$out/eboot.map" || fail "the stub does not link"
+    "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.linked.elf" --Map="$out/eboot.map" || fail "the stub does not link"
+python3 -I "$root/tools/orbis_stub_norelro.py" "$out/eboot.linked.elf" "$out/eboot.elf" > /dev/null ||
+    fail "the stub does not have the layout create-fself needs (tools/orbis_stub_norelro.py)"
+(cd "$out" && "$fself" -in=eboot.elf -out=eboot.check.oelf --eboot eboot.check.bin \
+    --paid 0x3800000000000011 > /dev/null) || fail "create-fself refused the stub"
+if llvm-readelf -lW "$out/eboot.check.oelf" | grep -q '0x61000010'; then
+    fail "the stub's eboot has a PT_SCE_RELRO: the module loader would re-protect it over Wine's program"
+fi
+rm -f "$out/eboot.check.oelf" "$out/eboot.check.bin"
 
 # The release reads module 0's segments through pw_prx_parse_module_info, which takes at most four.
 loads=$(llvm-readelf -lW "$out/eboot.elf" | grep -c '^ *LOAD ')

@@ -27,6 +27,8 @@ int __wine_ps5_munmap(void *address, size_t bytes);
 int __wine_ps5_mprotect(void *address, size_t bytes, int protection);
 unsigned int __wine_ps5_memory_stats(uint64_t *out, unsigned int count);
 void __wine_ps5_memory_budget(unsigned long long *total, unsigned long long *available);
+void __wine_ps5_prot_snapshot(const char *phase, const char *module);
+int __wine_ps5_prot_query(const void *address, uintptr_t *low, uintptr_t *high);
 
 enum { PAGE = 0x4000, PHYS_PAGES = 1024, COUNTERS = 10 };
 static int phys_fd, refuse_map, cpu_only_refused;
@@ -174,6 +176,159 @@ static uint8_t *space_for(size_t pages)
     aligned = (uint8_t *)(((uintptr_t)raw + PAGE - 1) & ~(uintptr_t)(PAGE - 1));
     munmap(raw, (pages + 1) * PAGE);
     return aligned;
+}
+
+/* The kernel's view, from the host's own: the mapping containing the address in /proc/self/maps,
+ * its protection as the console encodes it (read 1, write 2, execute 4). */
+typedef struct VqInfo {
+    void *start, *end;
+    int64_t offset;
+    int32_t protection, type;
+    uint32_t kind;
+    char name[32];
+} VqInfo;
+int sceKernelVirtualQuery(const void *address, int flags, VqInfo *info, size_t size)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    int rc = (int)0x80020016;
+
+    assert(flags == 0 && size == sizeof(*info) && maps);
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long low, high;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &low, &high, perms) != 3) continue;
+        if ((uintptr_t)address < low || (uintptr_t)address >= high) continue;
+        memset(info, 0, sizeof(*info));
+        info->start = (void *)low;
+        info->end = (void *)high;
+        info->protection = (perms[0] == 'r') | (perms[1] == 'w') << 1 | (perms[2] == 'x') << 2;
+        rc = 0;
+        break;
+    }
+    fclose(maps);
+    return rc;
+}
+
+/* stderr into a file; returns its descriptor. */
+static int capture_stderr(void)
+{
+    char name[] = "/tmp/pw_wine_dmem_trace_XXXXXX";
+    int fd = mkstemp(name);
+    assert(fd >= 0);
+    unlink(name);
+    fflush(stderr);
+    assert(dup2(fd, 2) == 2);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    return fd;
+}
+static char *captured(int fd)
+{
+    static char text[65536];
+    ssize_t n = pread(fd, text, sizeof(text) - 1, 0);
+    assert(n >= 0);
+    text[n] = 0;
+    return text;
+}
+/* A line beginning with start that names page with the change, and extra if given. */
+static int has_line_with(const char *text, const char *start, uintptr_t page, const char *change, const char *extra)
+{
+    char want[96];
+    const char *line = text;
+    snprintf(want, sizeof(want), "page=%#lx prot=%s ", (unsigned long)page, change);
+    while ((line = strstr(line, start))) {
+        const char *end = strchr(line, '\n');
+        const char *hit = strstr(line, want), *more = extra ? strstr(line, extra) : line;
+        if (hit && (!end || hit < end) && more && (!end || more < end)) return 1;
+        line++;
+    }
+    return 0;
+}
+static int has_line(const char *text, const char *start, uintptr_t page, const char *change)
+{
+    return has_line_with(text, start, page, change, NULL);
+}
+
+/* WINE_PS5_TRACE_PROT (ps4-wine milestone i): after each traced call the kernel's view of the
+ * traced pages; around a module load the same, with the contents' hashes; the watcher reports a
+ * change made behind the module's back. Each part in a child of its own (the trace state is read
+ * once per process). */
+static void test_trace(int watch)
+{
+    pid_t child = fork();
+    int status;
+
+    if (!child) {
+        uint8_t *base = space_for(8);
+        char range[64], *text;
+        int fd;
+
+        snprintf(range, sizeof(range), "%lx-%lx", (unsigned long)base, (unsigned long)(base + 4 * PAGE));
+        setenv("WINE_PS5_TRACE_PROT", range, 1);
+        setenv("WINE_PS5_TRACE_WATCH", watch ? "1" : "0", 1);
+        fd = capture_stderr();
+        assert(!sceKernelReserveVirtualRange((void **)&base, 8 * PAGE, 0x90, PAGE));
+        __wine_ps5_dmem_region(base, 8 * PAGE);
+        /* Five pages, four traced: the fifth is the neighbour whose calls move a traced page's edge. */
+        assert(__wine_ps5_mmap(base, 5 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                               -1, 0) == base);
+        assert(!__wine_ps5_mprotect(base + PAGE, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC));
+        {
+            uintptr_t low = 0, high = 0;
+            assert(__wine_ps5_prot_query(base + PAGE, &low, &high) == 7 && low <= (uintptr_t)base + PAGE &&
+                   high >= (uintptr_t)base + 2 * PAGE);
+        }
+        text = captured(fd);
+        /* Our own calls: the trace line, then the kernel's view after each. */
+        assert(strstr(text, "wine-ps5: trace mmap"));
+        assert(has_line(text, "wine-ps5: prot call mmap", (uintptr_t)base, "?->3"));
+        assert(has_line(text, "wine-ps5: prot call mprotect", (uintptr_t)base + PAGE, "3->7"));
+        if (!watch) {
+            /* A load that re-protects a page and writes into another, as the console's loader might. */
+            __wine_ps5_prot_snapshot("dl-before", "/app0/sce_module/mod.prx");
+            assert(!mprotect(base + PAGE, PAGE, PROT_READ));
+            base[2 * PAGE + 5] ^= 0x5a;
+            __wine_ps5_prot_snapshot("dl-after", "/app0/sce_module/mod.prx");
+            text = captured(fd);
+            assert(strstr(text, "wine-ps5: prot dl-before mod.prx t_us=") && strstr(text, " changed=0\n"));
+            assert(has_line(text, "wine-ps5: prot dl-after mod.prx", (uintptr_t)base + PAGE, "7->1"));
+            assert(has_line(text, "wine-ps5: prot dl-after mod.prx", (uintptr_t)base + 2 * PAGE, "3->3"));
+            assert(strstr(text, " contents=changed\n") && strstr(text, "dl-after mod.prx t_us=") &&
+                   strstr(text, " changed=2\n"));
+            assert(!strstr(text, "prot watch"));
+            /* A call beside the range (untraced itself) moves the last traced page's region edge:
+             * logged as that call's, the region alone. */
+            assert(!__wine_ps5_mprotect(base + 4 * PAGE, PAGE, PROT_READ));
+            text = captured(fd);
+            assert(!strstr(text, "trace mprotect 0x") || !strstr(strstr(text, "dl-after"), "trace mprotect"));
+            assert(has_line_with(text, "wine-ps5: prot call mprotect@", (uintptr_t)base + 3 * PAGE, "3->3",
+                                 " range-only"));
+        } else {
+            /* A change behind the module's back, seen by the watcher within a few milliseconds. */
+            assert(strstr(text, "wine-ps5: prot watcher on"));
+            assert(!mprotect(base + PAGE, PAGE, PROT_READ));
+            for (int i = 0; i < 200 && !has_line(captured(fd), "wine-ps5: prot watch", (uintptr_t)base + PAGE, "7->1"); i++)
+                usleep(5000);
+            assert(has_line(captured(fd), "wine-ps5: prot watch", (uintptr_t)base + PAGE, "7->1"));
+            /* And our own calls never show as the watcher's. */
+            assert(!__wine_ps5_mprotect(base + PAGE, PAGE, PROT_READ | PROT_WRITE));
+            usleep(20000);
+            assert(has_line(captured(fd), "wine-ps5: prot call mprotect", (uintptr_t)base + PAGE, "1->3"));
+            assert(!has_line(captured(fd), "wine-ps5: prot watch", (uintptr_t)base + PAGE, "1->3"));
+            /* During a load the watcher names it; the bracket then finds nothing left to report. */
+            __wine_ps5_prot_snapshot("dl-before", "/app0/sce_module/mod2.prx");
+            assert(!mprotect(base + PAGE, PAGE, PROT_READ));
+            for (int i = 0; i < 200 && !has_line(captured(fd), "wine-ps5: prot watch during=mod2.prx",
+                                                 (uintptr_t)base + PAGE, "3->1"); i++)
+                usleep(5000);
+            assert(has_line(captured(fd), "wine-ps5: prot watch during=mod2.prx", (uintptr_t)base + PAGE, "3->1"));
+            __wine_ps5_prot_snapshot("dl-after", "/app0/sce_module/mod2.prx");
+            assert(strstr(captured(fd), "wine-ps5: prot dl-after mod2.prx t_us=") &&
+                   strstr(strstr(captured(fd), "wine-ps5: prot dl-after mod2.prx t_us="), " changed=0\n"));
+        }
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
 }
 
 static void test_refused(void)
@@ -331,6 +486,8 @@ int main(void)
     test_memory_budget();
     phys_fd = memfd_create("pw_wine_dmem_ps5", 0);
     assert(phys_fd >= 0 && !ftruncate(phys_fd, (off_t)PHYS_PAGES * PAGE));
+    test_trace(0);
+    test_trace(1);
     test_refused();
     test_heap_defaults();
     setenv("WINE_PS5_HEAP_HEADROOM_MB", "4", 1);
@@ -447,6 +604,7 @@ int main(void)
     test_heap();
     printf("wine dmem ps5 glue passed: pass-through before and outside the regions, commit, protect, "
            "a mapping across the edge, private and shared file views, munmap, a region given back and taken again, "
-           "a refused self-check, and the heap's blocks in direct memory with headroom and spill\n");
+           "a refused self-check, the heap's blocks in direct memory with headroom and spill, and the protection trace "
+           "(after each call, around a load, the watcher)\n");
     return 0;
 }
