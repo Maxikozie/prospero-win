@@ -13,8 +13,8 @@
  *
  * Read-execute: the program interpreter's path first (the loader reads it at the start of the
  * text), then code, read-only data and the unwind tables, in one PT_LOAD (--no-rosegment).
- * Read-write, from a 16 KiB boundary: the process parameters first (create-fself starts the data
- * segment at the first .data* section), then everything else that is written. */
+ * Read-write, at 0x7fff0000: the process parameters first (create-fself starts the data segment at
+ * the first .data* section), then everything else that is written. */
 SECTIONS
 {
     .text : ALIGN(0x4000)
@@ -31,6 +31,14 @@ SECTIONS
     .eh_frame : { __eh_frame_start = .; KEEP(*(.eh_frame)) __eh_frame_end = .; }
     .eh_frame_hdr : { __eh_frame_hdr_start = .; KEEP(*(.eh_frame_hdr)) __eh_frame_hdr_end = .; }
 
+    /* The read-write segment at 0x7fff0000 (0x400000 + 0x7fbf0000), which the release keeps
+     * (pw_eboot_release.h, PW_EBOOT_KEEP_FROM): libkernel reads module 0's data afterwards. Above
+     * every 32-bit area Wine reserves (0x10000-0x7fff0000) and below the high area (0x1000000000);
+     * far from the app modules (0x800000000 and up); within 2 GiB of the code, which the SDK's
+     * libc.a and crt1.o reach through 32-bit relative relocations (at 1 TiB: R_X86_64_REX_GOTPCRELX
+     * out of range). On Windows 0x7fff0000-0x7fffffff is the 64 KiB no-access region at the top of a
+     * 32-bit program's 2 GiB. */
+    . = 0x7fbf0000;
     .data.sce_process_param : ALIGN(0x4000) { KEEP(*(.data.sce_process_param)) }
     .data.sce_module_param : { KEEP(*(.data.sce_module_param)) }
     .dynamic : { *(.dynamic) }

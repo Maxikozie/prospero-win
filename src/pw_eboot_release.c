@@ -10,15 +10,27 @@ int pw_eboot_release_plan(const PwPrxSegment *segments, uint32_t count, PwEbootR
 {
     PwEbootRange ranges[PW_PRX_MAX_SEGMENTS];
 
+    uint32_t all = count;
+
     if (!segments || !out || !count || count > PW_PRX_MAX_SEGMENTS) return PW_EBOOT_ERR_ARGUMENT;
-    for (uint32_t i = 0; i < count; i++)
+    out->kept = 0;
+    count = 0;
+    for (uint32_t i = 0; i < all; i++)
     {
         uintptr_t base = (uintptr_t)segments[i].address, size = segments[i].size;
 
         if (!base || !size || base >= PW_EBOOT_LIMIT || size > PW_EBOOT_LIMIT - base) return PW_EBOOT_ERR_RANGE;
-        ranges[i].base = page_down(base);
-        ranges[i].end = page_down(base + size + PW_EBOOT_PAGE - 1);
+        if (base >= PW_EBOOT_KEEP_FROM)
+        {
+            out->kept++;
+            continue;
+        }
+        if (base + size > PW_EBOOT_KEEP_FROM) return PW_EBOOT_ERR_RANGE;
+        ranges[count].base = page_down(base);
+        ranges[count].end = page_down(base + size + PW_EBOOT_PAGE - 1);
+        count++;
     }
+    if (!count) return PW_EBOOT_ERR_RANGE;
     /* Insertion sort by base, then merge ranges that overlap or touch. */
     for (uint32_t i = 1; i < count; i++)
         for (uint32_t j = i; j > 0 && ranges[j].base < ranges[j - 1].base; j--)

@@ -136,6 +136,21 @@ int main(void)
       setup(&fake, across, 1);
       assert(pw_eboot_release(&ops, &r) == PW_EBOOT_ERR_RANGE && fake.unmaps == 0); }
 
+    /* The stub laid out by tools/pw_stub_orbis.ld: code at 0x400000, data at 0x7fff0000, which is
+     * kept (libkernel reads module 0's data after the release). */
+    {
+        PwPrxSegment far[2] = { { (const void *)0x400000, 0x1788, 5 }, { (const void *)0x7fff0000, 0x580, 3 } };
+        PwPrxSegment across[1] = { { (const void *)0x7ffe8000, 0x10000, 3 } };
+        PwPrxSegment above[1] = { { (const void *)0x7fff0000, 0x580, 3 } };
+        assert(pw_eboot_release_plan(far, 2, &r) == PW_EBOOT_OK);
+        assert(r.range_count == 1 && r.ranges[0].base == 0x400000 && r.ranges[0].end == 0x404000);
+        assert(r.kept == 1 && r.low_base == 0x400000 && r.low_end == 0x404000);
+        assert(pw_eboot_release_plan(across, 1, &r) == PW_EBOOT_ERR_RANGE);
+        assert(pw_eboot_release_plan(above, 1, &r) == PW_EBOOT_ERR_RANGE);
+        setup(&fake, (const uint64_t (*)[3])(const uint64_t[2][3]){ { 0x400000, 0x1788, 5 }, { 0x7fff0000, 0x580, 3 } }, 2);
+        assert(pw_eboot_release(&ops, &r) == PW_EBOOT_OK && r.kept == 1 && fake.unmaps == 1);
+        assert(fake.seen[0].base == 0x400000 && fake.seen[0].end == 0x404000 && r.low_end == 0x404000);
+    }
     /* The planner alone: unsorted, overlapping, contained ranges merge. */
     {
         PwPrxSegment segments[3] = {

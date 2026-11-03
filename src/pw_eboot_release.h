@@ -21,12 +21,18 @@
 
 #define PW_EBOOT_PAGE ((uintptr_t)0x4000)
 #define PW_EBOOT_LIMIT ((uintptr_t)1 << 32)
+/* Segments from here up are kept: the top of Wine's 32-bit reservations (mmap_init reserves
+ * 0x10000-0x7fff0000). The stub's read-write segment lives there (tools/pw_stub_orbis.ld), so module
+ * 0's data stays mapped after the release: libkernel's sceKernelGetModuleList reads it (ps4-wine LOG,
+ * e at 05:33 on 2026-11-03: a fault when nothing backed it). */
+#define PW_EBOOT_KEEP_FROM ((uintptr_t)0x7fff0000)
 
 enum {
     PW_EBOOT_OK = 0,
     PW_EBOOT_ERR_ARGUMENT = -1,
     PW_EBOOT_ERR_MODULE_INFO = -2, /* module info unreadable or malformed */
-    PW_EBOOT_ERR_RANGE = -3,       /* a segment of size 0, address 0, or reaching past 4 GiB */
+    PW_EBOOT_ERR_RANGE = -3,       /* a segment of size 0, address 0, reaching past 4 GiB, across
+                                      PW_EBOOT_KEEP_FROM, or none below it */
     PW_EBOOT_ERR_UNMAP = -4,       /* an unmap returned nonzero; its rc is in unmap_rc */
 };
 
@@ -48,6 +54,7 @@ typedef struct PwEbootRelease {
     int info_rc;                      /* the eboot_info rc before the release */
     uint32_t segment_count;
     PwPrxSegment segments[PW_PRX_MAX_SEGMENTS];
+    uint32_t kept;                    /* segments at or above PW_EBOOT_KEEP_FROM, left mapped */
     uint32_t range_count;             /* merged, page-rounded ranges to unmap */
     PwEbootRange ranges[PW_PRX_MAX_SEGMENTS];
     uintptr_t low_base, low_end;      /* the lowest page and the end of the highest */
@@ -58,8 +65,9 @@ typedef struct PwEbootRelease {
     uint32_t after_count;             /* segments module 0's info still lists */
 } PwEbootRelease;
 
-/* Page-rounds every segment, merges overlapping or touching ranges (two
- * segments may share a 16 KiB page) and sorts them by address. */
+/* Page-rounds every segment below PW_EBOOT_KEEP_FROM (those above it are counted in kept and left
+ * alone), merges overlapping or touching ranges (two segments may share a 16 KiB page) and sorts
+ * them by address. */
 int pw_eboot_release_plan(const PwPrxSegment *segments, uint32_t count, PwEbootRelease *out);
 /* Reads module 0, plans, unmaps each range, stops at the first failure, then
  * re-reads module 0 to report what it still lists. */

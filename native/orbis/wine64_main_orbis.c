@@ -532,7 +532,8 @@ static int eboot_info(void *context, void *info) { (void)context; return sceKern
 static int eboot_unmap(void *context, void *address, size_t bytes) { (void)context; return sceKernelMunmap(address, bytes); }
 
 /* Everything that must happen while the eboot is mapped (a first VideoOut
- * open, the pad), then every segment of module 0 unmapped. 0 when Wine may
+ * open, the pad), then module 0's segments below 0x7fff0000 unmapped (its data
+ * segment above stays: pw_eboot_release.h). 0 when Wine may
  * start: released, or kept by PS4WINE_EBOOT_RELEASE=0. */
 static int release_eboot(void)
 {
@@ -563,8 +564,8 @@ static int release_eboot(void)
     default: snprintf(state, sizeof(state), "err%d", rc); break;
     }
     pw_ms_set_eboot_release(state, (uint64_t)r.low_end);
-    LOG("PW_WINE64 eboot release=%s low_end=0x%llx module0_after=%s:%u", state, (unsigned long long)r.low_end,
-        pw_eboot_release_after_name(r.after), r.after_count);
+    LOG("PW_WINE64 eboot release=%s low_end=0x%llx kept=%u module0_after=%s:%u", state, (unsigned long long)r.low_end,
+        r.kept, pw_eboot_release_after_name(r.after), r.after_count);
     return rc == PW_EBOOT_OK ? 0 : -1;
 }
 

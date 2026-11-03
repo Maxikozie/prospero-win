@@ -144,13 +144,19 @@ ld.lld -m elf_x86_64 -pie -z norelro --no-rosegment --script "$root/tools/pw_stu
     "$out/obj/pw_stub_orbis.o" "$out/obj/pw_wine_prx.o" \
     -L"$OO_PS4_TOOLCHAIN/lib" -lc -lkernel $sce_libs \
     "$OO_PS4_TOOLCHAIN/lib/crt1.o" -o "$out/eboot.linked.elf" --Map="$out/eboot.map" || fail "the stub does not link"
-python3 -I "$root/tools/orbis_stub_norelro.py" "$out/eboot.linked.elf" "$out/eboot.elf" > /dev/null ||
+# Where the segments land: code in the one page 0x400000-0x404000, which the release unmaps; data
+# in 0x7fff0000-0x80000000, which it keeps: Windows' 64 KiB no-access region at the top of a 32-bit
+# program's 2 GiB, above Wine's 32-bit reservations (from 0x80000000 up, large-address-aware
+# programs allocate). Checked on the linked ELF and on create-fself's output.
+stub_layout="0x404000 0x7fff0000 0x80000000"
+# shellcheck disable=SC2086
+python3 -I "$root/tools/orbis_stub_norelro.py" --layout $stub_layout "$out/eboot.linked.elf" "$out/eboot.elf" ||
     fail "the stub does not have the layout create-fself needs (tools/orbis_stub_norelro.py)"
 (cd "$out" && "$fself" -in=eboot.elf -out=eboot.check.oelf --eboot eboot.check.bin \
     --paid 0x3800000000000011 > /dev/null) || fail "create-fself refused the stub"
-if llvm-readelf -lW "$out/eboot.check.oelf" | grep -q '0x61000010'; then
-    fail "the stub's eboot has a PT_SCE_RELRO: the module loader would re-protect it over Wine's program"
-fi
+# shellcheck disable=SC2086
+python3 -I "$root/tools/orbis_stub_norelro.py" --check-oelf --layout $stub_layout "$out/eboot.check.oelf" ||
+    fail "create-fself's stub has a PT_SCE_RELRO or a segment outside its place"
 rm -f "$out/eboot.check.oelf" "$out/eboot.check.bin"
 
 # The release reads module 0's segments through pw_prx_parse_module_info, which takes at most four.
