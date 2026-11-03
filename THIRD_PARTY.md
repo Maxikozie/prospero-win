@@ -41,6 +41,11 @@ that the PRXs and the title link; `tools/gen_prx_descriptor.py --orbis` restates
 module parameter block (size, magic, SDK version: three numbers measured from the SDK's
 `crtlib.o`).
 
+`src/pw_eboot_release.c` follows the eboot release of
+[orbis-win](https://github.com/plastikman/orbis-win) `2610706` (`src/reloc-wine-app/app_entry.c`,
+LGPL-2.1-or-later): read module 0's segments and unmap each before Wine starts. It is rewritten on
+`pw_prx_parse_module_info`, and each ported block carries a `From:` line.
+
 `wine/orbis/include/` restates FreeBSD 9 amd64 ABI facts (signal numbers and flags,
 `mcontext_t`, selectors, trap numbers, socket and kevent layouts, cdio, sysctl and mount
 constants) from FreeBSD's `sys/` headers (BSD-2-Clause, the FreeBSD Project); the values are the
