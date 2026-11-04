@@ -117,6 +117,31 @@ static void emit_line(const char *line)
 
 static void log_line(const char *line) { LOG("%s", line); }
 
+/* Which package is running, from which launch: the packager's stamp (/app0/assets/stamp.txt, one token,
+ * "-" without one), the arguments as given and the pid, once at start on every sink. A host tool that
+ * installs and launches the title compares the stamp with the package it sent. */
+static void emit_start_stamp(int argc, char **argv)
+{
+    char stamp[96] = "-", args[512] = "", line[800];
+    size_t used = 0;
+    int fd = open("/app0/assets/stamp.txt", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, stamp, sizeof(stamp) - 1);
+        close(fd);
+        stamp[n > 0 ? n : 0] = 0;
+        for (char *p = stamp; *p; p++) if (*p <= ' ' || *p > '~') { *p = 0; break; }
+        if (!stamp[0]) snprintf(stamp, sizeof(stamp), "-");
+    }
+    for (int i = 0; i < argc && used + 2 < sizeof(args); i++) {
+        int n = snprintf(args + used, sizeof(args) - used, "%s%s", i ? "," : "", argv[i] ? argv[i] : "");
+        if (n < 0) break;
+        used += (size_t)n < sizeof(args) - used ? (size_t)n : sizeof(args) - used - 1;
+    }
+    for (char *p = args; *p; p++) if (*p <= ' ' || *p > '~') *p = '_';
+    snprintf(line, sizeof(line), "PW_MS pkg_stamp=%s argv=%s pid=%d", stamp, args[0] ? args : "-", (int)getpid());
+    emit_line(line);
+}
+
 /* Milestone c's line (in the d1 plan), every sink, once; then the plan's
  * Wine stage ends. */
 static void report(const char *exit_text, const char *kind)
@@ -666,6 +691,7 @@ __attribute__((visibility("default"), noreturn)) void pw_title_main(int stub_arg
     pw_diagnostics_open(PW_ROOT, PW_BUILD_ID, "hello", 0);
     LOG("PW_WINE64 start build=%s argc=%d argv0=%s netlog=%s:%u", PW_BUILD_ID, argc,
         argc > 0 && argv[0] ? argv[0] : "", logcfg.server, (unsigned)logcfg.port);
+    emit_start_stamp(argc, argv);
     start_submit_done();
 
     {
